@@ -5,9 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx --env-file=.env.local scripts/dev.ts",
-    "build:vercel": "tsc --project tsconfig.build.json",
-    "typecheck": "tsc --noEmit",
-    "start": "node dist/scripts/dev.js"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",

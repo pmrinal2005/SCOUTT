@@ -1,8 +1,8 @@
 // src/index.tsx
 // =====================================================================
-// Core Hono application — shared between local dev and Vercel serverless.
-// No Node.js-specific server code here; see scripts/dev.ts for local dev
-// and api/index.ts for the Vercel entry point.
+// Core Hono application — shared between local dev (scripts/dev.ts)
+// and Vercel serverless (api/index.ts).
+// No Node.js server code lives here.
 // =====================================================================
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
@@ -52,7 +52,9 @@ app.get('/onboarding', (c) => c.html(onboardingPage()))
 app.get('/dashboard', (c) => c.html(dashboardPage()))
 app.get('/threat-index', (c) => c.html(dashboardPage(true)))
 
-// Health check
+// =====================================================================
+// HEALTH CHECK
+// =====================================================================
 app.get('/api/health', (c) =>
   c.json({
     ok: true,
@@ -123,7 +125,7 @@ app.get('/api/transparency', async (c) => {
 })
 
 // =====================================================================
-// API: Ask RealityPulse chat — NVIDIA meta/llama-3.2-3b-instruct
+// API: Ask RealityPulse — NVIDIA meta/llama-3.2-3b-instruct
 // =====================================================================
 app.post('/api/ask', async (c) => {
   const { question } = await c.req.json<{ question: string }>()
@@ -250,7 +252,7 @@ app.post('/api/scenario', async (c) => {
 })
 
 // =====================================================================
-// API: Generate email / Slack draft for an action (cached, free)
+// API: Generate email / Slack draft
 // =====================================================================
 app.post('/api/action/draft', async (c) => {
   const { action_id, kind } = await c.req.json<{

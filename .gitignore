@@ -27,12 +27,9 @@ Thumbs.db
 !.vscode/launch.json
 .idea/
 
-node_modules
-.vercel
-dist
-.env
+node_modules/
+dist/
 .env.local
-.env.*.local
-*.log
-.DS_Store
-.cache
+.env
+.vercel/
+*.tsbuildinfo

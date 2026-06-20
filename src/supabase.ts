@@ -1,7 +1,6 @@
+// src/supabase.ts
 // =====================================================================
-// Supabase data layer. Reads from real DB when SUPABASE_URL is set;
-// silently falls back to in-memory DEMO data otherwise (so the judge
-// demo never breaks even if no env vars are configured).
+// Supabase data layer. Falls back to DEMO data when env vars are absent.
 // =====================================================================
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import {
@@ -11,20 +10,17 @@ import {
   DEMO_CREDIT_LEDGER,
 } from './demo-data.js'
 
-// ⚠️ FIXED: renamed from `URL` (which shadowed the global URL constructor)
-// to `SUPABASE_URL`, `SUPABASE_ANON`, `SUPABASE_SERVICE` to avoid strict-mode
-// TypeScript errors and runtime confusion.
+// FIX: renamed from `URL` (shadowed the global URL constructor → strict TS error)
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_ANON = process.env.SUPABASE_ANON_KEY
 const SUPABASE_SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY
 const DEMO_TENANT_ID =
-  process.env.DEMO_TENANT_ID || '00000000-0000-0000-0000-000000000001'
+  process.env.DEMO_TENANT_ID ?? '00000000-0000-0000-0000-000000000001'
 
 export const supabaseEnabled: boolean = Boolean(
   SUPABASE_URL && (SUPABASE_ANON || SUPABASE_SERVICE),
 )
 
-// Read client (RLS-safe, anon)
 export const supabase: SupabaseClient | null =
   SUPABASE_URL && SUPABASE_ANON
     ? createClient(SUPABASE_URL, SUPABASE_ANON, {
@@ -32,7 +28,6 @@ export const supabase: SupabaseClient | null =
       })
     : null
 
-// Write client (bypasses RLS — only used server-side for cron/seed routes)
 export const supabaseAdmin: SupabaseClient | null =
   SUPABASE_URL && SUPABASE_SERVICE
     ? createClient(SUPABASE_URL, SUPABASE_SERVICE, {
@@ -40,9 +35,6 @@ export const supabaseAdmin: SupabaseClient | null =
       })
     : null
 
-// ---------------------------------------------------------------------
-// Types we expose to the app (kept narrow so the dashboard never breaks)
-// ---------------------------------------------------------------------
 export type TenantRow = typeof DEMO_TENANT
 export type BriefingShape = typeof DEMO_BRIEFING
 export type TimelineRow = (typeof DEMO_TIMELINE)[number]
@@ -61,9 +53,6 @@ interface EventDBRow {
   detected_at: string
 }
 
-// ---------------------------------------------------------------------
-// TENANT
-// ---------------------------------------------------------------------
 export async function getTenant(
   tenantId: string = DEMO_TENANT_ID,
 ): Promise<TenantRow> {
@@ -77,9 +66,6 @@ export async function getTenant(
   return data as unknown as TenantRow
 }
 
-// ---------------------------------------------------------------------
-// TODAY'S BRIEFING
-// ---------------------------------------------------------------------
 export async function getTodayBriefing(
   tenantId: string = DEMO_TENANT_ID,
 ): Promise<BriefingShape> {
@@ -98,9 +84,6 @@ export async function getTodayBriefing(
   ) as BriefingShape
 }
 
-// ---------------------------------------------------------------------
-// 7-DAY TIMELINE (left rail)
-// ---------------------------------------------------------------------
 export async function getTimeline(
   tenantId: string = DEMO_TENANT_ID,
 ): Promise<TimelineRow[]> {
@@ -127,9 +110,6 @@ export async function getTimeline(
   )
 }
 
-// ---------------------------------------------------------------------
-// CREDIT LEDGER (top-right Credit Meter widget)
-// ---------------------------------------------------------------------
 export async function getCreditLedger(
   tenantId: string = DEMO_TENANT_ID,
 ): Promise<CreditLedger> {
@@ -172,9 +152,6 @@ export async function getCreditLedger(
   }
 }
 
-// ---------------------------------------------------------------------
-// WRITE: log a credit usage row (called whenever we hit Anakin/NVIDIA)
-// ---------------------------------------------------------------------
 export async function logCredit(opts: {
   tenantId?: string
   endpoint: string
@@ -183,16 +160,13 @@ export async function logCredit(opts: {
 }): Promise<void> {
   if (!supabaseAdmin) return
   await supabaseAdmin.from('credit_ledger').insert({
-    tenant_id: opts.tenantId || DEMO_TENANT_ID,
+    tenant_id: opts.tenantId ?? DEMO_TENANT_ID,
     endpoint: opts.endpoint,
     credits_used: opts.creditsUsed,
     job_id: opts.jobId,
   })
 }
 
-// ---------------------------------------------------------------------
-// WRITE: insert a fresh briefing (called by daily cron / Anakin worker)
-// ---------------------------------------------------------------------
 export async function insertBriefing(opts: {
   tenantId?: string
   briefingDate: string
@@ -205,7 +179,7 @@ export async function insertBriefing(opts: {
     .from('briefings')
     .upsert(
       {
-        tenant_id: opts.tenantId || DEMO_TENANT_ID,
+        tenant_id: opts.tenantId ?? DEMO_TENANT_ID,
         briefing_date: opts.briefingDate,
         generated_json: opts.generatedJson,
         anakin_job_id: opts.anakinJobId,
@@ -222,10 +196,6 @@ export async function insertBriefing(opts: {
   return data
 }
 
-// ---------------------------------------------------------------------
-// WRITE: push demo seed into Supabase from the app (one-shot)
-// Hit POST /api/sync/seed to populate a freshly-migrated DB.
-// ---------------------------------------------------------------------
 export async function seedDemoTenant(): Promise<{
   ok: boolean
   reason?: string
@@ -236,7 +206,6 @@ export async function seedDemoTenant(): Promise<{
     return { ok: false, reason: 'SUPABASE_SERVICE_ROLE_KEY not set' }
   }
 
-  // 1) Tenant
   await supabaseAdmin.from('tenants').upsert(
     {
       id: DEMO_TENANT_ID,
@@ -249,7 +218,6 @@ export async function seedDemoTenant(): Promise<{
     { onConflict: 'id' },
   )
 
-  // 2) Today's briefing
   const today: string = new Date().toISOString().slice(0, 10)
   await supabaseAdmin.from('briefings').upsert(
     {
@@ -262,7 +230,6 @@ export async function seedDemoTenant(): Promise<{
     { onConflict: 'tenant_id,briefing_date' },
   )
 
-  // 3) Events (one row per item in DEMO_BRIEFING.events)
   const eventRows = DEMO_BRIEFING.events.map((e) => ({
     tenant_id: DEMO_TENANT_ID,
     pillar: e.pillar,
@@ -274,7 +241,6 @@ export async function seedDemoTenant(): Promise<{
   }))
   await supabaseAdmin.from('events').insert(eventRows)
 
-  // 4) Credit ledger
   for (const row of DEMO_CREDIT_LEDGER.breakdown) {
     await supabaseAdmin.from('credit_ledger').insert({
       tenant_id: DEMO_TENANT_ID,

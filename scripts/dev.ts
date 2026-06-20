@@ -1,12 +1,9 @@
 // scripts/dev.ts
 // =====================================================================
-// Local dev server (Windows + macOS + Linux).
-// Env loaded via tsx --env-file=.env.local (see package.json scripts).
-// This file is ONLY used locally — never deployed to Vercel.
+// Local dev server ONLY — never deployed to Vercel.
+// Run: npm run dev
 // =====================================================================
 
-// Ambient module declaration to satisfy strict TypeScript when
-// @hono/node-server's type definitions don't expose /serve-static.
 declare module '@hono/node-server/serve-static' {
   import type { MiddlewareHandler } from 'hono'
   export function serveStatic(options: {
@@ -30,9 +27,7 @@ serve(
   (info: { address: string; port: number; family: string }): void => {
     console.log(`\n🛰️  RealityPulse running at http://localhost:${info.port}`)
     console.log(`   Landing:   http://localhost:${info.port}/`)
-    console.log(
-      `   Dashboard: http://localhost:${info.port}/dashboard?demo=true`,
-    )
+    console.log(`   Dashboard: http://localhost:${info.port}/dashboard?demo=true`)
     console.log(
       `   Supabase:  ${process.env.SUPABASE_URL ? '✅ connected' : '⚠️  using demo data'}`,
     )
@@ -42,5 +37,4 @@ serve(
   },
 )
 
-// Silence "ServerType imported but unused" if the user customizes later
 export type { ServerType }
