@@ -1,6 +1,12 @@
 import express, { Request, Response, NextFunction } from 'express'
+import path from 'path'
 
-// ✅ FIXED: Named imports — supabase.ts has NO default export. Default import = undefined = CRASH
+// ─── Page renderers (HTML strings) ────────────────────────────────────────────
+import { landingPage } from '../src/pages/landing'
+import { dashboardPage } from '../src/pages/dashboard'
+import { onboardingPage } from '../src/pages/onboarding'
+
+// ─── Supabase + data helpers (named imports — supabase.ts has NO default) ────
 import {
   supabase,
   supabaseAdmin,
@@ -31,20 +37,56 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next()
 })
 
-// ─── Health check ─────────────────────────────────────────────────────────────
-app.get('/', (_req: Request, res: Response) => {
-  res.status(200).json({
-    status: 'ok',
-    message: 'SCOUTT API is running',
-    supabaseEnabled,   // ✅ tells you at a glance if DB is wired up
-    timestamp: new Date().toISOString(),
-  })
+// ─── Static assets (Vercel ships /public alongside /api in the lambda) ───────
+// Works both locally (cwd = project root) and on Vercel (cwd = /var/task)
+const PUBLIC_DIR = path.join(process.cwd(), 'public')
+app.use('/static', express.static(path.join(PUBLIC_DIR, 'static'), {
+  maxAge: '1h',
+  fallthrough: true,
+}))
+
+// ─── Favicon (browsers auto-request /favicon.ico and /favicon.png) ───────────
+app.get(['/favicon.ico', '/favicon.png'], (_req: Request, res: Response) => {
+  res.redirect(301, '/static/favicon.svg')
 })
 
-// ─── /api/health ──────────────────────────────────────────────────────────────
+// =============================================================================
+// FRONTEND HTML ROUTES  ←  THIS IS THE FIX FOR THE "BLACK SCREEN WITH JSON" BUG
+// =============================================================================
+
+// ─── Landing page ('/') ──────────────────────────────────────────────────────
+app.get('/', (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.status(200).send(landingPage())
+})
+
+// ─── Dashboard (private, tenant view) ─────────────────────────────────────────
+app.get('/dashboard', (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.status(200).send(dashboardPage(false))
+})
+
+// ─── Public Threat Index ──────────────────────────────────────────────────────
+app.get('/threat-index', (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.status(200).send(dashboardPage(true))
+})
+
+// ─── Onboarding ───────────────────────────────────────────────────────────────
+app.get('/onboarding', (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8')
+  res.status(200).send(onboardingPage())
+})
+
+// =============================================================================
+// API ROUTES  (unchanged from your previous code — all preserved)
+// =============================================================================
+
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (_req: Request, res: Response) => {
   res.status(200).json({
     status: 'ok',
+    message: 'SCOUTT API is running',
     supabaseEnabled,
     timestamp: new Date().toISOString(),
   })
@@ -63,7 +105,7 @@ app.get('/api/tenant', async (req: Request, res: Response) => {
   }
 })
 
-// ─── /api/briefing ────────────────────────────────────────────────────────────
+// ─── /api/briefing (GET) ──────────────────────────────────────────────────────
 app.get('/api/briefing', async (req: Request, res: Response) => {
   try {
     const tenantId = req.query.tenantId as string | undefined
@@ -105,7 +147,6 @@ app.get('/api/credits', async (req: Request, res: Response) => {
 // ─── /api/seed ────────────────────────────────────────────────────────────────
 app.post('/api/seed', async (_req: Request, res: Response) => {
   try {
-    // ✅ null guard — supabaseAdmin can be null if SERVICE_ROLE_KEY is not set
     if (!supabaseAdmin) {
       res.status(503).json({
         ok: false,
@@ -144,7 +185,7 @@ app.post('/api/log-credit', async (req: Request, res: Response) => {
   }
 })
 
-// ─── /api/briefing (POST - insert) ───────────────────────────────────────────
+// ─── /api/briefing (POST - insert) ────────────────────────────────────────────
 app.post('/api/briefing', async (req: Request, res: Response) => {
   try {
     if (!supabaseAdmin) {
@@ -195,3 +236,11 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 })
 
 export default app
+
+// Local dev only — Vercel imports the default export above
+if (process.env.NODE_ENV !== 'production' && require.main === module) {
+  const PORT = Number(process.env.PORT) || 3000
+  app.listen(PORT, () => {
+    console.log(`[SCOUTT] Server running on http://localhost:${PORT}`)
+  })
+}

@@ -4,3 +4,4 @@ scripts/
 node_modules/
 dist/
 tsconfig.build.json
+.wrangler/

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "ts-node scripts/dev.ts",
     "build": "tsc",
-    "start": "node dist/api/index.js"
+    "start": "node dist/api/index.js",
+    "vercel-build": "echo 'Vercel @vercel/node compiles api/index.ts automatically — no manual build step required.'"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",

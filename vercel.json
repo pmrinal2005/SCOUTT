@@ -3,13 +3,15 @@
   "builds": [
     {
       "src": "api/index.ts",
-      "use": "@vercel/node"
+      "use": "@vercel/node",
+      "config": {
+        "includeFiles": ["src/**", "public/**"]
+      }
     }
   ],
   "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "api/index.ts"
-    }
+    { "src": "/static/(.*)", "dest": "/public/static/$1" },
+    { "src": "/favicon.svg", "dest": "/public/static/favicon.svg" },
+    { "src": "/(.*)",        "dest": "/api/index.ts" }
   ]
 }
