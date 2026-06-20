@@ -1,36 +1,31 @@
-// scripts/dev.ts — LOCAL DEV ONLY, never deployed to Vercel
+/// <reference types="node" />  // ✅ FIXED: makes __dirname, process, require available in TS
 
-declare module '@hono/node-server/serve-static' {
-  import type { MiddlewareHandler } from 'hono'
-  export function serveStatic(options: {
-    root?: string
-    path?: string
-    rewriteRequestPath?: (path: string) => string
-  }): MiddlewareHandler
+import { execSync } from 'child_process'
+import * as path from 'path'
+
+const rootDir: string = path.resolve(__dirname, '..')  // ✅ __dirname now recognized
+
+function runDev(): void {
+  console.log('[SCOUTT] Starting development server...')
+  console.log(`[SCOUTT] Root directory: ${rootDir}`)
+
+  try {
+    execSync(
+      'npx ts-node --project tsconfig.json api/index.ts',  // ✅ FIXED: runs backend, not React frontend
+      {
+        cwd: rootDir,
+        stdio: 'inherit',
+        env: {
+          ...process.env,
+          NODE_ENV: 'development',
+          NODE_PATH: rootDir,        // ✅ ensures module resolution works from project root
+        },
+      },
+    )
+  } catch (error) {
+    console.error('[SCOUTT] Dev server failed to start:', error)
+    process.exit(1)
+  }
 }
 
-import { serve, type ServerType } from '@hono/node-server'
-import { serveStatic } from '@hono/node-server/serve-static'
-import app from '../src/index.js'
-
-app.use('/static/*', serveStatic({ root: './public' }))
-app.use('/favicon.ico', serveStatic({ path: './public/static/favicon.svg' }))
-
-const port: number = Number(process.env.PORT ?? 3000)
-
-serve(
-  { fetch: app.fetch, port },
-  (info: { address: string; port: number; family: string }): void => {
-    console.log(`\n🛰️  RealityPulse running at http://localhost:${info.port}`)
-    console.log(`   Landing:   http://localhost:${info.port}/`)
-    console.log(`   Dashboard: http://localhost:${info.port}/dashboard?demo=true`)
-    console.log(
-      `   Supabase:  ${process.env.SUPABASE_URL ? '✅ connected' : '⚠️  using demo data'}`,
-    )
-    console.log(
-      `   NVIDIA:    ${process.env.NVIDIA_API_KEY ? '✅ live' : '⚠️  mock answers'}\n`,
-    )
-  },
-)
-
-export type { ServerType }
+runDev()

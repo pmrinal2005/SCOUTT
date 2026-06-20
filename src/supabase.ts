@@ -5,7 +5,7 @@ import {
   DEMO_BRIEFING,
   DEMO_TIMELINE,
   DEMO_CREDIT_LEDGER,
-} from './demo-data.js'
+} from './demo-data'   // ✅ FIXED: removed .js extension (invalid in TS with moduleResolution:node)
 
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_ANON = process.env.SUPABASE_ANON_KEY
