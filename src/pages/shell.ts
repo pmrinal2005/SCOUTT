@@ -15,7 +15,7 @@ export const htmlShell = (opts: {
 <title>${opts.title}</title>
 <meta name="description" content="RealityPulse — Bloomberg-Terminal-for-SMBs. Daily Battle Brief on policy, competitors, and sentiment." />
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-<link rel="alternate icon" href="/static/favicon.svg" />
+
 
 <!-- Geist Sans + Mono from Vercel CDN -->
 <link rel="preconnect" href="https://fonts.googleapis.com" />

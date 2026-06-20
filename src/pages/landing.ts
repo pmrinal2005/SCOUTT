@@ -201,7 +201,7 @@ export const landingPage = () =>
       <span class="flex items-center gap-2"><i class="fa-solid fa-magnifying-glass-chart text-policy"></i> Anakin Agentic Search</span>
       <span class="flex items-center gap-2"><i class="fa-solid fa-microchip text-emerald-400"></i> NVIDIA meta/llama-3.2-3b-instruct</span>
       <span class="flex items-center gap-2"><i class="fa-solid fa-database text-competitor"></i> Supabase + pgvector</span>
-      <span class="flex items-center gap-2"><i class="fa-brands fa-cloudflare text-orange-400"></i> Cloudflare Pages</span>
+      <span class="flex items-center gap-2"><i class="fa-brands fa-vercel text-white"></i> Vercel</span>
       <span class="flex items-center gap-2"><i class="fa-solid fa-bolt text-yellow-400"></i> Inngest + Vercel Cron</span>
     </div>
   </div>
@@ -217,7 +217,7 @@ export const landingPage = () =>
 </section>
 
 <footer class="border-t border-ink-700/40 py-8 text-center text-xs text-gray-500">
-  RealityPulse · Built with Hono · Cloudflare Pages · Anakin · NVIDIA NIM · Supabase
+  SCOUTT · Built with Hono · Vercel · Anakin · NVIDIA NIM · Supabase
 </footer>
 `,
   })
