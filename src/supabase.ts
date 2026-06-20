@@ -1,7 +1,4 @@
 // src/supabase.ts
-// =====================================================================
-// Supabase data layer. Falls back to DEMO data when env vars are absent.
-// =====================================================================
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import {
   DEMO_TENANT,
@@ -10,7 +7,6 @@ import {
   DEMO_CREDIT_LEDGER,
 } from './demo-data.js'
 
-// FIX: renamed from `URL` (shadowed the global URL constructor → strict TS error)
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_ANON = process.env.SUPABASE_ANON_KEY
 const SUPABASE_SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY

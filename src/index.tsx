@@ -1,8 +1,10 @@
+/** @jsxImportSource hono/jsx */
 // src/index.tsx
 // =====================================================================
-// Core Hono application — shared between local dev (scripts/dev.ts)
-// and Vercel serverless (api/index.ts).
-// No Node.js server code lives here.
+// Core Hono application.
+// The @jsxImportSource pragma above ensures esbuild (used by Vercel's
+// Edge bundler) correctly applies the hono/jsx transform without
+// needing to read tsconfig.json.
 // =====================================================================
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
@@ -286,7 +288,11 @@ function synthesizeMockAnswer(question: string, threat: number): string {
   if (q.includes('eu ai act') || q.includes('regulation')) {
     return `The EU AI Act Article 6 enforcement window opened today (00:00 CET). Your underwriting models likely fall under Annex III high-risk classification — conformity assessment and CE marking are now required. Penalties reach 7% of global turnover [1]. Recommended action: audit model inventory by end of week and loop legal in immediately. The CFPB also issued a related circular on BNPL pay-in-4 products [6] which may stack with this.`
   }
-  if (q.includes('stripe') || q.includes('competitor') || q.includes('price')) {
+  if (
+    q.includes('stripe') ||
+    q.includes('competitor') ||
+    q.includes('price')
+  ) {
     return `Stripe raised ACH transaction fees from $0.80 to $0.90 effective today — a 12.5% hike with no public announcement, detected via our hourly pricing-page diff [2]. For a typical $5M-volume customer this is ~$14k/year incremental cost. Meanwhile Adyen launched their Embedded Finance API targeting your exact SMB segment [3]. The window to counter-market is roughly 5 days while buyers are actively evaluating.`
   }
   if (q.includes('churn') || q.includes('sentiment')) {

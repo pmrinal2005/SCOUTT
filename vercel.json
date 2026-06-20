@@ -6,7 +6,7 @@
   ],
   "functions": {
     "api/index.ts": {
-      "maxDuration": 30,
+      "runtime": "edge",
       "includeFiles": "src/**"
     }
   }

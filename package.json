@@ -2,7 +2,6 @@
   "name": "scoutt",
   "version": "1.0.0",
   "description": "SCOUTT — RealityPulse competitive intelligence dashboard",
-  "type": "module",
   "scripts": {
     "dev": "tsx --env-file=.env.local scripts/dev.ts",
     "typecheck": "tsc --noEmit"

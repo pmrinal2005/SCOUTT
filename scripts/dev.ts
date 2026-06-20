@@ -1,8 +1,4 @@
-// scripts/dev.ts
-// =====================================================================
-// Local dev server ONLY — never deployed to Vercel.
-// Run: npm run dev
-// =====================================================================
+// scripts/dev.ts — LOCAL DEV ONLY, never deployed to Vercel
 
 declare module '@hono/node-server/serve-static' {
   import type { MiddlewareHandler } from 'hono'
