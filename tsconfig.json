@@ -7,14 +7,17 @@
     "skipLibCheck": true,
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
+    "allowImportingTsExtensions": false,
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
     "lib": ["ES2022", "DOM"],
     "types": ["node"],
     "jsx": "react-jsx",
-    "jsxImportSource": "hono/jsx"
+    "jsxImportSource": "hono/jsx",
+    "noImplicitAny": true,
+    "forceConsistentCasingInFileNames": true
   },
   "include": ["src/**/*", "api/**/*", "scripts/**/*"],
-  "exclude": ["node_modules", "dist", ".vercel"]
+  "exclude": ["node_modules", "dist", ".vercel", "vite.config.ts"]
 }

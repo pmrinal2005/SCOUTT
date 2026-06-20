@@ -26,3 +26,13 @@ Thumbs.db
 .vscode/*
 !.vscode/launch.json
 .idea/
+
+node_modules
+.vercel
+dist
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+.cache

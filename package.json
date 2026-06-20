@@ -3,13 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "RealityPulse — Bloomberg Terminal for SMBs. Anakin Agentic Search + NVIDIA NIM + Supabase.",
+  "description": "RealityPulse (SCOUTT) — Bloomberg Terminal for SMBs. Anakin Agentic Search + NVIDIA NIM + Supabase. Vercel + Hono.",
   "scripts": {
     "dev": "tsx watch --env-file=.env.local scripts/dev.ts",
+    "start": "tsx --env-file=.env.local scripts/dev.ts",
     "build": "echo \"Vercel handles build via api/index.ts — nothing to compile.\"",
     "vercel-build": "echo \"No build step needed.\"",
-    "start": "tsx --env-file=.env.local scripts/dev.ts",
-    "supabase:push": "tsx scripts/push-seed.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

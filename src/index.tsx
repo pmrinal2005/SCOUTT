@@ -3,7 +3,6 @@ import { cors } from 'hono/cors'
 import {
   DEMO_TENANT,
   DEMO_BRIEFING,
-  DEMO_TIMELINE,
   DEMO_PRICING_RACE,
   DEMO_SENTIMENT_VOLUME,
   DEMO_TOPIC_BUBBLES,
@@ -11,7 +10,6 @@ import {
   DEMO_FEATURE_MATRIX,
   DEMO_POLICY_REGIONS,
   DEMO_GLOBE_DOTS,
-  DEMO_CREDIT_LEDGER,
 } from './demo-data.js'
 import {
   DAILY_BRIEFING_SYSTEM_PROMPT,
@@ -33,19 +31,22 @@ import {
   seedDemoTenant,
 } from './supabase.js'
 
+type BriefingEvent = (typeof DEMO_BRIEFING)['events'][number]
+type BriefingAction = (typeof DEMO_BRIEFING)['actions'][number]
+
 const app = new Hono()
 
 app.use('/api/*', cors())
 
 // =====================================================================
-// PAGE ROUTES (server-rendered HTML strings)
+// PAGE ROUTES
 // =====================================================================
 app.get('/', (c) => c.html(landingPage()))
 app.get('/onboarding', (c) => c.html(onboardingPage()))
 app.get('/dashboard', (c) => c.html(dashboardPage()))
-app.get('/threat-index', (c) => c.html(dashboardPage(true))) // public viral page
+app.get('/threat-index', (c) => c.html(dashboardPage(true)))
 
-// Health check (used by Vercel / uptime monitors)
+// Health check
 app.get('/api/health', (c) =>
   c.json({
     ok: true,
@@ -57,7 +58,7 @@ app.get('/api/health', (c) =>
 )
 
 // =====================================================================
-// API: tenant + briefing — reads Supabase, falls back to demo data
+// API: tenant + briefing
 // =====================================================================
 app.get('/api/tenant/demo', async (c) => c.json(await getTenant()))
 app.get('/api/briefing/today', async (c) => c.json(await getTodayBriefing()))
@@ -65,7 +66,7 @@ app.get('/api/timeline', async (c) => c.json(await getTimeline()))
 app.get('/api/credit-ledger', async (c) => c.json(await getCreditLedger()))
 
 // =====================================================================
-// API: charts data (deterministic — same shape live or demo)
+// API: charts
 // =====================================================================
 app.get('/api/charts/pricing-race', (c) => c.json(DEMO_PRICING_RACE))
 app.get('/api/charts/sentiment-volume', (c) => c.json(DEMO_SENTIMENT_VOLUME))
@@ -76,7 +77,7 @@ app.get('/api/charts/policy-regions', (c) => c.json(DEMO_POLICY_REGIONS))
 app.get('/api/charts/globe-dots', (c) => c.json(DEMO_GLOBE_DOTS))
 
 // =====================================================================
-// API: Anakin Transparency Drawer — exact prompts + schema
+// API: Anakin Transparency Drawer
 // =====================================================================
 app.get('/api/transparency', async (c) => {
   const tenant = await getTenant()
@@ -107,7 +108,7 @@ app.get('/api/transparency', async (c) => {
       endpoint: 'POST https://api.anakin.io/v1/agentic-search',
       prompt_template: ASK_FRESH_SEARCH_PROMPT('{user_question}', '{industry}'),
       credits_per_call: 3,
-      rag_layer: 'pgvector cosine over embeddings table (free, NVIDIA NV-Embed-v2)',
+      rag_layer: 'pgvector cosine over embeddings table (NVIDIA NV-Embed-v2)',
     },
     raw_response_sample: DEMO_BRIEFING,
   })
@@ -122,9 +123,9 @@ app.post('/api/ask', async (c) => {
   const briefing = await getTodayBriefing()
   const tenant = await getTenant()
 
-  const context = briefing.events
+  const context: string = briefing.events
     .map(
-      (e, i) =>
+      (e: BriefingEvent, i: number) =>
         `[${i + 1}] (${e.pillar}) ${e.title} — ${e.summary} — ${e.source_url}`,
     )
     .join('\n')
@@ -137,11 +138,10 @@ decisive, boardroom-ready. If evidence is insufficient, say so plainly.
 EVIDENCE (today's briefing for ${tenant.industry} in ${tenant.region}):
 ${context}`
 
-  // No key → deterministic mock answer (judges' WiFi safety)
   if (!apiKey) {
     return c.json({
       answer: synthesizeMockAnswer(question, briefing.threat_level),
-      citations: briefing.events.slice(0, 3).map((e, i) => ({
+      citations: briefing.events.slice(0, 3).map((e: BriefingEvent, i: number) => ({
         ref: `[${i + 1}]`,
         title: e.title,
         url: e.source_url,
@@ -152,7 +152,6 @@ ${context}`
     })
   }
 
-  // Real NVIDIA NIM call — meta/llama-3.2-3b-instruct
   try {
     const resp = await fetch(
       'https://integrate.api.nvidia.com/v1/chat/completions',
@@ -175,10 +174,12 @@ ${context}`
         }),
       },
     )
-    const data = (await resp.json()) as any
-    const answer = data?.choices?.[0]?.message?.content ?? 'No response.'
+    const data = (await resp.json()) as {
+      choices?: Array<{ message?: { content?: string } }>
+    }
+    const answer: string =
+      data?.choices?.[0]?.message?.content ?? 'No response.'
 
-    // Log credit usage (best-effort, ignored if Supabase not configured)
     await logCredit({
       endpoint: 'agentic-search (Ask RealityPulse)',
       creditsUsed: 3,
@@ -187,7 +188,7 @@ ${context}`
 
     return c.json({
       answer,
-      citations: briefing.events.slice(0, 3).map((e, i) => ({
+      citations: briefing.events.slice(0, 3).map((e: BriefingEvent, i: number) => ({
         ref: `[${i + 1}]`,
         title: e.title,
         url: e.source_url,
@@ -196,7 +197,7 @@ ${context}`
       model: 'meta/llama-3.2-3b-instruct',
       credits_used: 3,
     })
-  } catch (err: any) {
+  } catch (err: unknown) {
     return c.json(
       { error: String(err), answer: 'Error reaching NVIDIA API.' },
       500,
@@ -205,15 +206,15 @@ ${context}`
 })
 
 // =====================================================================
-// API: Scenario Simulator — re-uses cached briefings (0 new credits)
+// API: Scenario Simulator
 // =====================================================================
 app.post('/api/scenario', async (c) => {
   const { scenario } = await c.req.json<{ scenario: string }>()
   const briefing = await getTodayBriefing()
   const matchPolicy = /ai act|gdpr|cfpb|regulation/i.test(scenario)
   const matchCompetitor = /stripe|adyen|checkout|price|fee/i.test(scenario)
-  const baseThreat = briefing.threat_level
-  const newThreat = Math.min(
+  const baseThreat: number = briefing.threat_level
+  const newThreat: number = Math.min(
     100,
     baseThreat + (matchPolicy ? 14 : 0) + (matchCompetitor ? 9 : 0),
   )
@@ -224,7 +225,7 @@ app.post('/api/scenario', async (c) => {
     delta_threats: matchPolicy ? 4 : 2,
     delta_actions: matchPolicy ? 2 : 1,
     impacted_events: briefing.events
-      .filter((e) =>
+      .filter((e: BriefingEvent) =>
         matchPolicy
           ? e.pillar === 'policy'
           : matchCompetitor
@@ -245,7 +246,7 @@ app.post('/api/action/draft', async (c) => {
     kind: 'email' | 'slack'
   }>()
   const briefing = await getTodayBriefing()
-  const action = briefing.actions[action_id]
+  const action: BriefingAction | undefined = briefing.actions[action_id]
   if (!action) return c.json({ error: 'Action not found' }, 404)
   return c.json({
     kind,
@@ -256,9 +257,7 @@ app.post('/api/action/draft', async (c) => {
 })
 
 // =====================================================================
-// API: One-shot seed — push demo tenant + briefing into Supabase.
-// Hit this once after running the SQL migrations.
-//   curl -X POST https://your-app.vercel.app/api/sync/seed
+// API: One-shot seed
 // =====================================================================
 app.post('/api/sync/seed', async (c) => {
   const out = await seedDemoTenant()

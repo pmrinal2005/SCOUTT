@@ -17,7 +17,7 @@ const SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY
 const DEMO_TENANT_ID =
   process.env.DEMO_TENANT_ID || '00000000-0000-0000-0000-000000000001'
 
-export const supabaseEnabled = Boolean(URL && (ANON || SERVICE))
+export const supabaseEnabled: boolean = Boolean(URL && (ANON || SERVICE))
 
 // Read client (RLS-safe, anon)
 export const supabase: SupabaseClient | null =
@@ -30,9 +30,30 @@ export const supabaseAdmin: SupabaseClient | null =
     : null
 
 // ---------------------------------------------------------------------
+// Types we expose to the app (kept narrow so the dashboard never breaks)
+// ---------------------------------------------------------------------
+export type TenantRow = typeof DEMO_TENANT
+export type BriefingShape = typeof DEMO_BRIEFING
+export type TimelineRow = (typeof DEMO_TIMELINE)[number]
+export type CreditLedger = typeof DEMO_CREDIT_LEDGER
+
+interface CreditLedgerDBRow {
+  endpoint: string
+  credits_used: number
+  ts: string
+}
+
+interface EventDBRow {
+  pillar: string
+  payload: { title?: string } | null
+  severity: number
+  detected_at: string
+}
+
+// ---------------------------------------------------------------------
 // TENANT
 // ---------------------------------------------------------------------
-export async function getTenant(tenantId = DEMO_TENANT_ID) {
+export async function getTenant(tenantId: string = DEMO_TENANT_ID): Promise<TenantRow> {
   if (!supabase) return DEMO_TENANT
   const { data, error } = await supabase
     .from('tenants')
@@ -40,13 +61,13 @@ export async function getTenant(tenantId = DEMO_TENANT_ID) {
     .eq('id', tenantId)
     .maybeSingle()
   if (error || !data) return DEMO_TENANT
-  return data
+  return data as unknown as TenantRow
 }
 
 // ---------------------------------------------------------------------
 // TODAY'S BRIEFING
 // ---------------------------------------------------------------------
-export async function getTodayBriefing(tenantId = DEMO_TENANT_ID) {
+export async function getTodayBriefing(tenantId: string = DEMO_TENANT_ID): Promise<BriefingShape> {
   if (!supabase) return DEMO_BRIEFING
   const { data, error } = await supabase
     .from('briefings')
@@ -56,14 +77,14 @@ export async function getTodayBriefing(tenantId = DEMO_TENANT_ID) {
     .limit(1)
     .maybeSingle()
   if (error || !data) return DEMO_BRIEFING
-  // generated_json is a jsonb column that contains the full briefing shape
-  return (data.generated_json as typeof DEMO_BRIEFING) || DEMO_BRIEFING
+  return ((data as { generated_json: BriefingShape | null }).generated_json ??
+    DEMO_BRIEFING) as BriefingShape
 }
 
 // ---------------------------------------------------------------------
 // 7-DAY TIMELINE (left rail)
 // ---------------------------------------------------------------------
-export async function getTimeline(tenantId = DEMO_TENANT_ID) {
+export async function getTimeline(tenantId: string = DEMO_TENANT_ID): Promise<TimelineRow[]> {
   if (!supabase) return DEMO_TIMELINE
   const { data, error } = await supabase
     .from('events')
@@ -76,10 +97,11 @@ export async function getTimeline(tenantId = DEMO_TENANT_ID) {
     .order('detected_at', { ascending: false })
     .limit(40)
   if (error || !data || data.length === 0) return DEMO_TIMELINE
-  return data.map((e) => ({
-    date: (e.detected_at as string).slice(0, 10),
+  const rows = data as unknown as EventDBRow[]
+  return rows.map((e): TimelineRow => ({
+    date: e.detected_at.slice(0, 10),
     pillar: e.pillar,
-    title: (e.payload as any)?.title ?? '(untitled event)',
+    title: e.payload?.title ?? '(untitled event)',
     severity: e.severity,
   }))
 }
@@ -87,7 +109,9 @@ export async function getTimeline(tenantId = DEMO_TENANT_ID) {
 // ---------------------------------------------------------------------
 // CREDIT LEDGER (top-right Credit Meter widget)
 // ---------------------------------------------------------------------
-export async function getCreditLedger(tenantId = DEMO_TENANT_ID) {
+export async function getCreditLedger(
+  tenantId: string = DEMO_TENANT_ID,
+): Promise<CreditLedger> {
   if (!supabase) return DEMO_CREDIT_LEDGER
   const { data, error } = await supabase
     .from('credit_ledger')
@@ -96,15 +120,22 @@ export async function getCreditLedger(tenantId = DEMO_TENANT_ID) {
     .order('ts', { ascending: false })
     .limit(100)
   if (error || !data) return DEMO_CREDIT_LEDGER
-  const used = data.reduce((s, r) => s + (r.credits_used as number), 0)
-  const byEndpoint = new Map<string, { credits: number; count: number; ts: string }>()
-  for (const r of data) {
-    const k = r.endpoint as string
-    const cur = byEndpoint.get(k) || { credits: 0, count: 0, ts: r.ts as string }
-    cur.credits += r.credits_used as number
+
+  const rows = data as unknown as CreditLedgerDBRow[]
+  const used: number = rows.reduce<number>((s, r) => s + (r.credits_used ?? 0), 0)
+
+  const byEndpoint = new Map<
+    string,
+    { credits: number; count: number; ts: string }
+  >()
+  for (const r of rows) {
+    const k: string = r.endpoint
+    const cur = byEndpoint.get(k) ?? { credits: 0, count: 0, ts: r.ts }
+    cur.credits += r.credits_used ?? 0
     cur.count += 1
     byEndpoint.set(k, cur)
   }
+
   return {
     budget: 150,
     used,
@@ -125,7 +156,7 @@ export async function logCredit(opts: {
   endpoint: string
   creditsUsed: number
   jobId?: string
-}) {
+}): Promise<void> {
   if (!supabaseAdmin) return
   await supabaseAdmin.from('credit_ledger').insert({
     tenant_id: opts.tenantId || DEMO_TENANT_ID,
@@ -140,7 +171,7 @@ export async function logCredit(opts: {
 // ---------------------------------------------------------------------
 export async function insertBriefing(opts: {
   tenantId?: string
-  briefingDate: string // 'YYYY-MM-DD'
+  briefingDate: string
   generatedJson: unknown
   anakinJobId?: string
   creditsSpent?: number
@@ -171,7 +202,12 @@ export async function insertBriefing(opts: {
 // WRITE: push demo seed into Supabase from the app (one-shot)
 // Hit POST /api/sync/seed to populate a freshly-migrated DB.
 // ---------------------------------------------------------------------
-export async function seedDemoTenant() {
+export async function seedDemoTenant(): Promise<{
+  ok: boolean
+  reason?: string
+  tenant_id?: string
+  briefing_date?: string
+}> {
   if (!supabaseAdmin) {
     return { ok: false, reason: 'SUPABASE_SERVICE_ROLE_KEY not set' }
   }
@@ -190,7 +226,7 @@ export async function seedDemoTenant() {
   )
 
   // 2) Today's briefing
-  const today = new Date().toISOString().slice(0, 10)
+  const today: string = new Date().toISOString().slice(0, 10)
   await supabaseAdmin.from('briefings').upsert(
     {
       tenant_id: DEMO_TENANT_ID,
