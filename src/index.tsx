@@ -1,3 +1,9 @@
+// src/index.tsx
+// =====================================================================
+// Core Hono application — shared between local dev and Vercel serverless.
+// No Node.js-specific server code here; see scripts/dev.ts for local dev
+// and api/index.ts for the Vercel entry point.
+// =====================================================================
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import {
@@ -94,7 +100,8 @@ app.get('/api/transparency', async (c) => {
       json_schema: BRIEFING_JSON_SCHEMA,
       anakin_job_id: 'demo-job-0001',
       credits_spent: 15,
-      poll_endpoint: 'GET https://api.anakin.io/v1/agentic-search/demo-job-0001',
+      poll_endpoint:
+        'GET https://api.anakin.io/v1/agentic-search/demo-job-0001',
       poll_interval_ms: 10000,
       cache_hours: 24,
     },
@@ -108,7 +115,8 @@ app.get('/api/transparency', async (c) => {
       endpoint: 'POST https://api.anakin.io/v1/agentic-search',
       prompt_template: ASK_FRESH_SEARCH_PROMPT('{user_question}', '{industry}'),
       credits_per_call: 3,
-      rag_layer: 'pgvector cosine over embeddings table (NVIDIA NV-Embed-v2)',
+      rag_layer:
+        'pgvector cosine over embeddings table (NVIDIA NV-Embed-v2)',
     },
     raw_response_sample: DEMO_BRIEFING,
   })
@@ -141,12 +149,14 @@ ${context}`
   if (!apiKey) {
     return c.json({
       answer: synthesizeMockAnswer(question, briefing.threat_level),
-      citations: briefing.events.slice(0, 3).map((e: BriefingEvent, i: number) => ({
-        ref: `[${i + 1}]`,
-        title: e.title,
-        url: e.source_url,
-        pillar: e.pillar,
-      })),
+      citations: briefing.events
+        .slice(0, 3)
+        .map((e: BriefingEvent, i: number) => ({
+          ref: `[${i + 1}]`,
+          title: e.title,
+          url: e.source_url,
+          pillar: e.pillar,
+        })),
       model: 'mock (NVIDIA_API_KEY not configured)',
       credits_used: 0,
     })
@@ -188,12 +198,14 @@ ${context}`
 
     return c.json({
       answer,
-      citations: briefing.events.slice(0, 3).map((e: BriefingEvent, i: number) => ({
-        ref: `[${i + 1}]`,
-        title: e.title,
-        url: e.source_url,
-        pillar: e.pillar,
-      })),
+      citations: briefing.events
+        .slice(0, 3)
+        .map((e: BriefingEvent, i: number) => ({
+          ref: `[${i + 1}]`,
+          title: e.title,
+          url: e.source_url,
+          pillar: e.pillar,
+        })),
       model: 'meta/llama-3.2-3b-instruct',
       credits_used: 3,
     })

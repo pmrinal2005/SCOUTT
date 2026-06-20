@@ -1,13 +1,24 @@
+// api/index.ts
 // =====================================================================
-// Vercel serverless entry. Every non-static request hits this function.
-// Hono runs on Node inside Vercel. Static files in /public are served
-// directly by Vercel's CDN (see vercel.json rewrites).
-//
-// IMPORTANT: Do NOT export `config = { runtime: 'nodejs20.x' }` here.
-// Vercel's `config` export only accepts "edge" or "experimental-edge".
-// The Node runtime is selected via vercel.json -> functions.runtime.
+// Vercel Serverless Entry Point for Hono.
+// Vercel's @vercel/node runtime picks this up automatically.
+// We use hono/vercel's `handle` adapter to bridge Hono ↔ Vercel.
 // =====================================================================
 import { handle } from 'hono/vercel'
 import app from '../src/index.js'
 
-export default handle(app)
+// Tell Vercel to use the Node.js runtime (not Edge).
+// Required when using Supabase, Node crypto, etc.
+export const config = {
+  runtime: 'nodejs20.x',
+}
+
+// Vercel calls these exports for each HTTP method.
+// `handle` wraps the Hono app's fetch handler into a Vercel-compatible handler.
+export const GET = handle(app)
+export const POST = handle(app)
+export const PUT = handle(app)
+export const PATCH = handle(app)
+export const DELETE = handle(app)
+export const HEAD = handle(app)
+export const OPTIONS = handle(app)

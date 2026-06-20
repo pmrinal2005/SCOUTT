@@ -1,27 +1,26 @@
 {
-  "name": "realitypulse",
+  "name": "scoutt",
   "version": "1.0.0",
-  "private": true,
+  "description": "SCOUTT — RealityPulse competitive intelligence dashboard",
   "type": "module",
-  "description": "RealityPulse (SCOUTT) — Bloomberg Terminal for SMBs. Anakin Agentic Search + NVIDIA NIM + Supabase. Vercel + Hono.",
   "scripts": {
-    "dev": "tsx watch --env-file=.env.local scripts/dev.ts",
-    "start": "tsx --env-file=.env.local scripts/dev.ts",
-    "build": "echo \"Vercel handles build via api/index.ts — nothing to compile.\"",
-    "vercel-build": "echo \"No build step needed.\"",
-    "typecheck": "tsc --noEmit"
+    "dev": "tsx --env-file=.env.local scripts/dev.ts",
+    "build:vercel": "tsc --project tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/scripts/dev.js"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",
-    "@supabase/supabase-js": "^2.45.4",
-    "hono": "^4.6.14"
+    "@supabase/supabase-js": "^2.49.4",
+    "hono": "^4.7.11"
   },
   "devDependencies": {
-    "@types/node": "^22.10.2",
+    "@types/node": "^22.15.21",
+    "@vercel/node": "^5.1.9",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.8.3"
   },
   "engines": {
-    "node": ">=18.18.0"
+    "node": ">=20.0.0"
   }
 }

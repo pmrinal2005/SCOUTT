@@ -11,22 +11,33 @@ import {
   DEMO_CREDIT_LEDGER,
 } from './demo-data.js'
 
-const URL = process.env.SUPABASE_URL
-const ANON = process.env.SUPABASE_ANON_KEY
-const SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY
+// ⚠️ FIXED: renamed from `URL` (which shadowed the global URL constructor)
+// to `SUPABASE_URL`, `SUPABASE_ANON`, `SUPABASE_SERVICE` to avoid strict-mode
+// TypeScript errors and runtime confusion.
+const SUPABASE_URL = process.env.SUPABASE_URL
+const SUPABASE_ANON = process.env.SUPABASE_ANON_KEY
+const SUPABASE_SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY
 const DEMO_TENANT_ID =
   process.env.DEMO_TENANT_ID || '00000000-0000-0000-0000-000000000001'
 
-export const supabaseEnabled: boolean = Boolean(URL && (ANON || SERVICE))
+export const supabaseEnabled: boolean = Boolean(
+  SUPABASE_URL && (SUPABASE_ANON || SUPABASE_SERVICE),
+)
 
 // Read client (RLS-safe, anon)
 export const supabase: SupabaseClient | null =
-  URL && ANON ? createClient(URL, ANON, { auth: { persistSession: false } }) : null
+  SUPABASE_URL && SUPABASE_ANON
+    ? createClient(SUPABASE_URL, SUPABASE_ANON, {
+        auth: { persistSession: false },
+      })
+    : null
 
 // Write client (bypasses RLS — only used server-side for cron/seed routes)
 export const supabaseAdmin: SupabaseClient | null =
-  URL && SERVICE
-    ? createClient(URL, SERVICE, { auth: { persistSession: false } })
+  SUPABASE_URL && SUPABASE_SERVICE
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE, {
+        auth: { persistSession: false },
+      })
     : null
 
 // ---------------------------------------------------------------------
@@ -53,7 +64,9 @@ interface EventDBRow {
 // ---------------------------------------------------------------------
 // TENANT
 // ---------------------------------------------------------------------
-export async function getTenant(tenantId: string = DEMO_TENANT_ID): Promise<TenantRow> {
+export async function getTenant(
+  tenantId: string = DEMO_TENANT_ID,
+): Promise<TenantRow> {
   if (!supabase) return DEMO_TENANT
   const { data, error } = await supabase
     .from('tenants')
@@ -67,7 +80,9 @@ export async function getTenant(tenantId: string = DEMO_TENANT_ID): Promise<Tena
 // ---------------------------------------------------------------------
 // TODAY'S BRIEFING
 // ---------------------------------------------------------------------
-export async function getTodayBriefing(tenantId: string = DEMO_TENANT_ID): Promise<BriefingShape> {
+export async function getTodayBriefing(
+  tenantId: string = DEMO_TENANT_ID,
+): Promise<BriefingShape> {
   if (!supabase) return DEMO_BRIEFING
   const { data, error } = await supabase
     .from('briefings')
@@ -77,14 +92,18 @@ export async function getTodayBriefing(tenantId: string = DEMO_TENANT_ID): Promi
     .limit(1)
     .maybeSingle()
   if (error || !data) return DEMO_BRIEFING
-  return ((data as { generated_json: BriefingShape | null }).generated_json ??
-    DEMO_BRIEFING) as BriefingShape
+  return (
+    (data as { generated_json: BriefingShape | null }).generated_json ??
+    DEMO_BRIEFING
+  ) as BriefingShape
 }
 
 // ---------------------------------------------------------------------
 // 7-DAY TIMELINE (left rail)
 // ---------------------------------------------------------------------
-export async function getTimeline(tenantId: string = DEMO_TENANT_ID): Promise<TimelineRow[]> {
+export async function getTimeline(
+  tenantId: string = DEMO_TENANT_ID,
+): Promise<TimelineRow[]> {
   if (!supabase) return DEMO_TIMELINE
   const { data, error } = await supabase
     .from('events')
@@ -98,12 +117,14 @@ export async function getTimeline(tenantId: string = DEMO_TENANT_ID): Promise<Ti
     .limit(40)
   if (error || !data || data.length === 0) return DEMO_TIMELINE
   const rows = data as unknown as EventDBRow[]
-  return rows.map((e): TimelineRow => ({
-    date: e.detected_at.slice(0, 10),
-    pillar: e.pillar,
-    title: e.payload?.title ?? '(untitled event)',
-    severity: e.severity,
-  }))
+  return rows.map(
+    (e): TimelineRow => ({
+      date: e.detected_at.slice(0, 10),
+      pillar: e.pillar,
+      title: e.payload?.title ?? '(untitled event)',
+      severity: e.severity,
+    }),
+  )
 }
 
 // ---------------------------------------------------------------------
@@ -122,7 +143,10 @@ export async function getCreditLedger(
   if (error || !data) return DEMO_CREDIT_LEDGER
 
   const rows = data as unknown as CreditLedgerDBRow[]
-  const used: number = rows.reduce<number>((s, r) => s + (r.credits_used ?? 0), 0)
+  const used: number = rows.reduce<number>(
+    (s, r) => s + (r.credits_used ?? 0),
+    0,
+  )
 
   const byEndpoint = new Map<
     string,
