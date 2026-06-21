@@ -1,6 +1,7 @@
 // api/index.ts
 import express, { Request, Response, NextFunction } from 'express'
 import path from 'path'
+import fs from 'fs'
 
 import { landingPage } from '../src/pages/landing'
 import { dashboardPage } from '../src/pages/dashboard'
@@ -30,13 +31,65 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next()
 })
 
-// ─── Static ───
+// =============================================================================
+// STATIC ASSET SERVING — works on Vercel because vercel.json routes
+// /static/(.*) → /api/index.ts so this Express handler is reached.
+// =============================================================================
 const PUBLIC_DIR = path.join(process.cwd(), 'public')
-app.use('/static', express.static(path.join(PUBLIC_DIR, 'static'), { maxAge: '1h', fallthrough: true }))
-app.get(['/favicon.ico', '/favicon.png'], (_req, res) => res.redirect(301, '/static/scoutt_logo.png'))
+const STATIC_DIR = path.join(PUBLIC_DIR, 'static')
+
+const MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.webp': 'image/webp',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.map': 'application/json; charset=utf-8',
+}
+
+// Express.static first (fast path on local dev where layout matches).
+app.use('/static', express.static(STATIC_DIR, { maxAge: '1h', fallthrough: true }))
+
+// Manual fallback for Vercel — explicitly read file off disk. This is what
+// makes /static/dashboard.js and /static/scoutt_logo.png work in production.
+app.get('/static/*', (req: Request, res: Response) => {
+  const rel = req.path.replace(/^\/static\//, '')
+  // Prevent path traversal
+  if (rel.includes('..')) return res.status(400).end()
+  const candidates = [
+    path.join(STATIC_DIR, rel),
+    path.join(process.cwd(), 'public', 'static', rel),
+    path.join(__dirname, '..', 'public', 'static', rel),
+    path.join(__dirname, '..', '..', 'public', 'static', rel),
+  ]
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+        const ext = path.extname(p).toLowerCase()
+        res.setHeader('Content-Type', MIME[ext] || 'application/octet-stream')
+        res.setHeader('Cache-Control', 'public, max-age=3600')
+        return fs.createReadStream(p).pipe(res)
+      }
+    } catch { /* try next */ }
+  }
+  res.status(404).type('text/plain').send(`Static file not found: ${rel}`)
+})
+
+app.get(['/favicon.ico', '/favicon.png', '/favicon.svg'], (_req, res) =>
+  res.redirect(301, '/static/scoutt_logo.png'),
+)
 
 // ============================================================
-// ANAKIN HELPERS (per https://anakin.io/docs/api-reference/agentic-search)
+// ANAKIN HELPERS — per https://anakin.io/docs/api-reference/agentic-search
 // ============================================================
 function anakinKey(req: Request): string | null {
   return (req.header('x-anakin-key') as string) || process.env.ANAKIN_API_KEY || null
@@ -62,12 +115,12 @@ async function anakinPoll(key: string, jobId: string, timeoutMs = 120_000): Prom
     const j: any = await r.json()
     if (j.status === 'completed') return j.generatedJson
     if (j.status === 'failed') throw new Error('Anakin job failed: ' + (j?.message || 'unknown'))
-    await new Promise(res => setTimeout(res, 10_000))
+    await new Promise(res => setTimeout(res, 10_000)) // 10s poll per docs
   }
   throw new Error('Anakin poll timed out')
 }
 
-// In-memory cache keyed by Anakin key + scope
+// Per-key in-memory cache
 const cache = new Map<string, { ts: number; data: any }>()
 const TTL = 10 * 60 * 1000
 function cacheGet(k: string) { const v = cache.get(k); return v && (Date.now() - v.ts < TTL) ? v.data : null }
@@ -158,7 +211,7 @@ app.get('/api/timeline', async (req, res) => {
   try {
     const brief = await getLiveBriefing(key)
     const today = new Date()
-    const timeline = brief.events.map((e: any, i: number) => ({
+    const timeline = (brief.events || []).map((e: any, i: number) => ({
       date: new Date(today.getTime() - i * 86400000).toISOString().slice(5, 10),
       title: e.title, pillar: e.pillar, severity: e.severity,
     }))
@@ -166,10 +219,17 @@ app.get('/api/timeline', async (req, res) => {
   } catch { res.json(DEMO_TIMELINE) }
 })
 
+// Today's 3 actions — derived from briefing (live or demo)
+app.get('/api/actions/today', async (req, res) => {
+  const key = anakinKey(req)
+  const brief: any = key ? await getLiveBriefing(key).catch(() => DEMO_BRIEFING) : DEMO_BRIEFING
+  res.json(brief.actions || [])
+})
+
 app.get('/api/credit-ledger', (_req, res) => res.json(DEMO_CREDIT_LEDGER))
 
 // =============================================================================
-// CHART DATA — demo first, can be swapped per-key later
+// CHART DATA — demo first, swappable per-key
 // =============================================================================
 app.get('/api/charts/pricing-race', (_req, res) => res.json(DEMO_PRICING_RACE))
 app.get('/api/charts/sentiment-volume', (_req, res) => res.json(DEMO_SENTIMENT_VOLUME))
@@ -236,7 +296,6 @@ app.get('/api/search-index', async (req, res) => {
       tab: 'command', actionId: i,
     })
   })
-  // Brief overnight headline
   index.push({
     section: 'Overnight Brief', pillar: 'policy', type: 'brief',
     title: brief.headline || 'Daily briefing',
@@ -247,7 +306,7 @@ app.get('/api/search-index', async (req, res) => {
 })
 
 // =============================================================================
-// ASK SCOUTT (Anakin agentic-search OR mock)
+// ASK SCOUTT (Anakin agentic-search OR mock fallback)
 // =============================================================================
 app.post('/api/ask', async (req, res) => {
   const { question } = (req.body || {}) as { question: string }
@@ -311,7 +370,7 @@ app.post('/api/scenario', async (req, res) => {
     threat_level_before: baseThreat, threat_level_after: newThreat,
     delta_threats: matchPolicy ? 4 : 2, delta_actions: matchPolicy ? 2 : 1,
     impacted_events: (brief.events || []).filter((e: any) =>
-      matchPolicy ? e.pillar === 'policy' : matchCompetitor ? e.pillar === 'competitor' : true
+      matchPolicy ? e.pillar === 'policy' : matchCompetitor ? e.pillar === 'competitor' : true,
     ).slice(0, 4),
     credits_used: 0,
   })
@@ -364,7 +423,9 @@ app.get('/api/transparency', (_req, res) => {
 })
 
 // =============================================================================
-// ELEVENLABS TTS PROXY  (per https://elevenlabs.io/docs/eleven-api/guides/cookbooks/text-to-speech)
+// ELEVENLABS TTS PROXY
+// Docs: https://elevenlabs.io/docs/eleven-api/guides/cookbooks/text-to-speech
+// Returns audio/mpeg bytes. Frontend wraps the request in a loader.
 // =============================================================================
 app.post('/api/tts', async (req, res) => {
   const { text, voice_id } = (req.body || {}) as { text: string; voice_id?: string }
@@ -372,7 +433,7 @@ app.post('/api/tts', async (req, res) => {
   if (!apiKey) return res.status(503).json({ error: 'ELEVENLABS_API_KEY not configured. Falling back to browser TTS.' })
   if (!text || !text.trim()) return res.status(400).json({ error: 'text required' })
 
-  const voice = voice_id || 'JBFqnCBsd6RMkjVDRZzb' // "George" default
+  const voice = voice_id || process.env.ELEVENLABS_VOICE_ID || 'JBFqnCBsd6RMkjVDRZzb' // "George" default
 
   try {
     const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voice}?output_format=mp3_44100_128`, {

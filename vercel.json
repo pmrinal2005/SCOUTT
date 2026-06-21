@@ -10,8 +10,10 @@
     }
   ],
   "routes": [
-    { "src": "/static/(.*)", "dest": "/public/static/$1" },
-    { "src": "/favicon.svg", "dest": "/public/static/favicon.svg" },
-    { "src": "/(.*)",        "dest": "/api/index.ts" }
+    { "src": "/static/(.*)", "dest": "/api/index.ts" },
+    { "src": "/favicon.ico", "dest": "/api/index.ts" },
+    { "src": "/favicon.svg", "dest": "/api/index.ts" },
+    { "src": "/favicon.png", "dest": "/api/index.ts" },
+    { "src": "/(.*)", "dest": "/api/index.ts" }
   ]
 }

@@ -10,10 +10,10 @@ export const dashboardPage = (isPublicThreatIndex = false) =>
   <div class="max-w-[1500px] mx-auto px-6 py-3 flex items-center gap-4">
     <a href="/" class="flex items-center gap-2.5 group shrink-0">
       <img src="/static/scoutt_logo.png" alt="SCOUTT"
-           class="w-8 h-8 rounded-md object-cover ring-1 ring-policy/40 shadow-glow-cyan"
-           onerror="this.onerror=null;this.style.display='none';document.getElementById('logo-fallback').style.display='flex';" />
-      <span id="logo-fallback" class="w-8 h-8 rounded-md bg-policy/15 border border-policy/40 items-center justify-center text-policy font-black text-xs" style="display:none;">S</span>
-      <span class="font-bold tracking-tight">SCOUTT</span>
+           class="w-9 h-9 rounded-md object-cover ring-1 ring-policy/40 shadow-glow-cyan"
+           onerror="this.onerror=null;this.style.display='none';var fb=document.getElementById('logo-fallback');if(fb){fb.style.display='flex'}" />
+      <span id="logo-fallback" class="w-9 h-9 rounded-md bg-policy/15 border border-policy/40 items-center justify-center text-policy font-black text-xs" style="display:none;">S</span>
+      <span class="font-bold tracking-tight text-lg">SCOUTT</span>
     </a>
 
     <div class="flex-1 flex items-center justify-center">
@@ -25,16 +25,16 @@ export const dashboardPage = (isPublicThreatIndex = false) =>
       </button>
     </div>
 
-    <button id="apikey-btn" class="card-hover card px-3 py-1.5 text-xs flex items-center gap-1.5">
+    <button id="apikey-btn" type="button" class="card-hover card px-3 py-1.5 text-xs flex items-center gap-1.5 cursor-pointer">
       <i id="apikey-icon" class="fa-solid fa-key text-policy"></i>
       <span id="apikey-label">Enter API Key</span>
     </button>
 
-    <button id="transparency-trigger" class="card-hover card px-3 py-1.5 text-xs flex items-center gap-1.5">
+    <button id="transparency-trigger" type="button" class="card-hover card px-3 py-1.5 text-xs flex items-center gap-1.5">
       <i class="fa-solid fa-eye text-policy"></i> How we know this
     </button>
 
-    <button id="theme-toggle" class="card-hover card w-8 h-8 flex items-center justify-center" title="Toggle theme">
+    <button id="theme-toggle" type="button" class="card-hover card w-8 h-8 flex items-center justify-center" title="Toggle theme">
       <i class="fa-solid fa-moon text-xs"></i>
     </button>
   </div>
@@ -49,7 +49,7 @@ export const dashboardPage = (isPublicThreatIndex = false) =>
       ['scenario', 'fa-flask', 'Scenario'],
       ['archetype', 'fa-people-arrows', 'Archetype'],
     ].map(([id, ic, label], i) => `
-      <button data-tab="${id}" class="tab-btn px-4 py-3 text-sm flex items-center gap-2 hover:text-white transition ${i === 0 ? 'tab-active' : 'text-gray-400'}">
+      <button type="button" data-tab="${id}" class="tab-btn px-4 py-3 text-sm flex items-center gap-2 hover:text-white transition cursor-pointer ${i === 0 ? 'tab-active' : 'text-gray-400'}">
         <i class="fa-solid ${ic} text-xs"></i> ${label}
       </button>
     `).join('')}
@@ -69,6 +69,7 @@ ${cmdkPalette()}
 ${transparencyDrawer()}
 ${audioBriefToast()}
 ${apiKeyModal()}
+${briefModal()}
 
 <script src="/static/dashboard.js"></script>
 `,
@@ -90,17 +91,20 @@ function commandCenterTab() {
       </div>
     </div>
     <div class="flex flex-wrap items-center gap-2 shrink-0">
-      <button id="play-audio" class="card-hover card px-3 py-2 text-sm flex items-center gap-2">
-        <i class="fa-solid fa-headphones text-policy"></i> Listen
+      <button id="play-audio" type="button" class="card-hover card px-3 py-2 text-sm flex items-center gap-2 cursor-pointer">
+        <span id="play-audio-icon" class="inline-flex items-center justify-center w-4 h-4">
+          <i class="fa-solid fa-headphones text-policy"></i>
+        </span>
+        <span id="play-audio-label">Listen</span>
         <span class="text-[10px] mono text-gray-500">ELEVENLABS</span>
       </button>
-      <button id="read-full-brief" class="bg-policy text-ink-950 font-semibold px-4 py-2 rounded-lg hover:shadow-glow-cyan text-sm">Read full brief <i class="fa-solid fa-arrow-right ml-1"></i></button>
+      <button id="read-full-brief" type="button" class="bg-policy text-ink-950 font-semibold px-4 py-2 rounded-lg hover:shadow-glow-cyan text-sm cursor-pointer">Read full brief <i class="fa-solid fa-arrow-right ml-1"></i></button>
     </div>
   </div>
 
   <!-- TIME MACHINE -->
   <div class="card p-3 mb-5 flex items-center gap-4 slide-up">
-    <button id="time-machine-reset" title="Reset to today" class="card-hover w-8 h-8 rounded-md border border-ink-600 flex items-center justify-center hover:border-policy">
+    <button id="time-machine-reset" type="button" title="Reset to today" class="card-hover w-8 h-8 rounded-md border border-ink-600 flex items-center justify-center hover:border-policy cursor-pointer">
       <i class="fa-solid fa-clock-rotate-left text-policy"></i>
     </button>
     <span class="text-xs text-gray-400 shrink-0 mono">Time Machine</span>
@@ -144,10 +148,10 @@ function commandCenterTab() {
     </aside>
 
     <div class="col-span-12 grid grid-cols-2 md:grid-cols-4 gap-4 mt-1">
-      ${kpiCard('Threats Detected', '12', '+3', 'text-policy', 'fa-shield-halved')}
-      ${kpiCard('Opportunities', '4', '+1', 'text-action', 'fa-bullseye')}
-      ${kpiCard('Action Items', '3', '0', 'text-competitor', 'fa-list-check')}
-      ${kpiCard('Avg. Response', '47m', '-12m', 'text-sentiment', 'fa-stopwatch')}
+      ${kpiCard('Threats Detected', '12', '+3', 'text-policy', 'fa-shield-halved', 'threats')}
+      ${kpiCard('Opportunities', '4', '+1', 'text-action', 'fa-bullseye', 'opps')}
+      ${kpiCard('Action Items', '3', '0', 'text-competitor', 'fa-list-check', 'actions-kpi')}
+      ${kpiCard('Avg. Response', '47m', '-12m', 'text-sentiment', 'fa-stopwatch', 'response')}
     </div>
 
     <div class="col-span-12 md:col-span-6 lg:col-span-4 card p-5 slide-up">
@@ -163,7 +167,9 @@ function commandCenterTab() {
         <h3 class="font-semibold text-sm">Sentiment Volume — 14d</h3>
         <span class="text-[10px] mono text-sentiment uppercase">+/- /neutral</span>
       </div>
-      <canvas id="chart-sentiment-volume" height="180"></canvas>
+      <div class="relative" style="height:200px">
+        <canvas id="chart-sentiment-volume"></canvas>
+      </div>
     </div>
 
     <div class="col-span-12 lg:col-span-4 card p-5 slide-up">
@@ -307,7 +313,9 @@ function policyTab() {
         <h3 class="font-semibold text-sm">Quarter-over-quarter</h3>
         <span class="text-[10px] mono text-policy uppercase">+34% vs Q1</span>
       </div>
-      <canvas id="chart-policy-trend" height="200"></canvas>
+      <div class="relative" style="height:220px">
+        <canvas id="chart-policy-trend"></canvas>
+      </div>
     </div>
 
     <div class="col-span-12">
@@ -379,7 +387,9 @@ function competitorTab() {
         <h3 class="font-semibold text-sm">Pricing Race — 30d</h3>
         <span class="text-[10px] mono text-gray-500 uppercase">ACH per-txn</span>
       </div>
-      <canvas id="chart-pricing-race" height="240"></canvas>
+      <div class="relative" style="height:260px">
+        <canvas id="chart-pricing-race"></canvas>
+      </div>
     </div>
 
     <div class="col-span-12 card p-5">
@@ -419,7 +429,9 @@ function sentimentTab() {
         <h3 class="font-semibold text-sm">Sentiment Δ vs Competitors</h3>
         <span class="text-[10px] mono text-sentiment uppercase">7d</span>
       </div>
-      <canvas id="chart-diverging" height="320"></canvas>
+      <div class="relative" style="height:340px">
+        <canvas id="chart-diverging"></canvas>
+      </div>
     </div>
     <div class="col-span-12 lg:col-span-6 card p-5">
       <div class="flex items-center justify-between mb-3">
@@ -435,8 +447,8 @@ function sentimentTab() {
       </div>
       <div id="quotes-carousel" class="min-h-[200px] flex items-center"></div>
       <div class="flex items-center justify-between mt-3">
-        <button id="quote-prev" class="text-gray-400 hover:text-white text-sm"><i class="fa-solid fa-arrow-left"></i> Prev</button>
-        <button id="quote-next" class="text-gray-400 hover:text-white text-sm">Next <i class="fa-solid fa-arrow-right"></i></button>
+        <button id="quote-prev" type="button" class="text-gray-400 hover:text-white text-sm cursor-pointer"><i class="fa-solid fa-arrow-left"></i> Prev</button>
+        <button id="quote-next" type="button" class="text-gray-400 hover:text-white text-sm cursor-pointer">Next <i class="fa-solid fa-arrow-right"></i></button>
       </div>
     </div>
     <div class="col-span-12 card p-5">
@@ -464,7 +476,7 @@ function scenarioTab() {
       </div>
     </div>
     <textarea id="scenario-input" rows="3" placeholder='Try: "What if EU AI Act enforcement is delayed 6 months?" or "What if Stripe drops ACH back to $0.70?"' class="w-full bg-ink-900 border border-ink-600 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-action"></textarea>
-    <button id="scenario-run" class="mt-3 bg-action text-ink-950 font-semibold px-5 py-2.5 rounded-lg hover:shadow-glow-emerald transition flex items-center gap-2"><i class="fa-solid fa-play"></i> Run scenario</button>
+    <button id="scenario-run" type="button" class="mt-3 bg-action text-ink-950 font-semibold px-5 py-2.5 rounded-lg hover:shadow-glow-emerald transition flex items-center gap-2 cursor-pointer"><i class="fa-solid fa-play"></i> Run scenario</button>
     <div id="scenario-result" class="hidden mt-6 space-y-4">
       <div class="grid grid-cols-3 gap-3">
         <div class="card p-4 text-center"><div class="text-[10px] mono uppercase text-gray-500 mb-1">Threat Level</div><div class="mono"><span id="s-before" class="text-gray-500 line-through">73</span> → <span id="s-after" class="text-action text-2xl font-bold">--</span></div></div>
@@ -483,7 +495,9 @@ function archetypeTab() {
   <div class="card p-6">
     <h2 class="text-xl font-bold mb-1">Industry Archetype Comparison</h2>
     <p class="text-sm text-gray-400 mb-6">Your <span id="archetype-industry" class="text-policy mono">B2B SaaS Fintech</span> profile vs the synthetic industry baseline.</p>
-    <canvas id="chart-radar" height="320"></canvas>
+    <div class="relative" style="height:360px">
+      <canvas id="chart-radar"></canvas>
+    </div>
     <div class="mt-6 grid md:grid-cols-3 gap-3">
       <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">You score higher on</div><div class="mt-1 text-sm">Compliance, Onboarding speed</div></div>
       <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">Industry beats you on</div><div class="mt-1 text-sm">Embedded Finance breadth</div></div>
@@ -509,10 +523,10 @@ function cmdkPalette() {
     <div id="cmdk-suggestions" class="px-4 py-3 text-xs text-gray-400">
       <div class="mb-2 mono uppercase tracking-widest">Try</div>
       <div class="space-y-1">
-        <button class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700">EU AI Act</button>
-        <button class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700">Stripe pricing</button>
-        <button class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700">fraud sentiment</button>
-        <button class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700 ask">→ Ask SCOUTT: "Should I match Stripe's price hike?"</button>
+        <button type="button" class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700">EU AI Act</button>
+        <button type="button" class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700">Stripe pricing</button>
+        <button type="button" class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700">fraud sentiment</button>
+        <button type="button" class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700 ask">→ Ask SCOUTT: "Should I match Stripe's price hike?"</button>
       </div>
     </div>
 
@@ -530,7 +544,7 @@ function transparencyDrawer() {
       <div class="text-xs mono uppercase text-policy">SCOUTT Transparency Drawer</div>
       <h2 class="text-lg font-bold mt-0.5">How we know this</h2>
     </div>
-    <button id="transparency-close" class="text-gray-400 hover:text-white text-xl"><i class="fa-solid fa-xmark"></i></button>
+    <button id="transparency-close" type="button" class="text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
   </div>
   <div id="transparency-body" class="p-5 space-y-6 text-sm"></div>
 </aside>`
@@ -544,7 +558,7 @@ function audioBriefToast() {
     <div class="text-sm font-medium" id="audio-toast-title">Reading your brief</div>
     <div class="text-[10px] mono text-gray-500" id="audio-toast-sub">ElevenLabs • streaming</div>
   </div>
-  <button id="audio-stop" class="ml-3 text-gray-400 hover:text-white"><i class="fa-solid fa-stop"></i></button>
+  <button id="audio-stop" type="button" class="ml-3 text-gray-400 hover:text-white cursor-pointer"><i class="fa-solid fa-stop"></i></button>
 </div>
 <audio id="audio-el" class="hidden"></audio>`
 }
@@ -558,38 +572,57 @@ function apiKeyModal() {
         <div class="w-9 h-9 rounded-lg bg-policy/15 border border-policy/40 flex items-center justify-center"><i class="fa-solid fa-key text-policy"></i></div>
         <h3 class="font-semibold text-lg">Connect your Anakin API key</h3>
       </div>
-      <button id="apikey-close" class="text-gray-400 hover:text-white text-xl"><i class="fa-solid fa-xmark"></i></button>
+      <button id="apikey-close" type="button" class="text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
     </div>
-    <p class="text-sm text-gray-400 mb-4">Paste your Anakin API key to switch from demo data to live briefings generated from real Agentic Search calls. All dashboard sections will become dynamic.</p>
+    <p class="text-sm text-gray-400 mb-4">Paste your Anakin API key to switch from demo data to live briefings generated from real Agentic Search calls. All dashboard sections become dynamic.</p>
     <label class="block text-xs mono uppercase text-gray-500 mb-1">Anakin API Key</label>
-    <input id="apikey-input" type="password" placeholder="anakin-live-…" class="w-full bg-ink-900 border border-ink-600 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-policy mono" />
+    <input id="apikey-input" type="password" placeholder="anakin-live-…" class="w-full bg-ink-900 border border-ink-600 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-policy mono" autocomplete="off" />
     <div class="mt-3 text-[11px] text-gray-500 leading-relaxed">
       Stored only in your browser (localStorage). Sent to our server as the <code class="mono text-policy">X-Anakin-Key</code> header.
-      <a href="https://anakin.io/docs/integrations" target="_blank" class="text-policy hover:underline">Where do I find this?</a>
+      <a href="https://anakin.io/docs/integrations" target="_blank" rel="noopener" class="text-policy hover:underline">Where do I find this?</a>
     </div>
     <div id="apikey-status" class="hidden mt-3 text-xs"></div>
     <div class="flex justify-between items-center mt-5">
-      <button id="apikey-clear" class="text-xs text-gray-400 hover:text-red-400">Clear stored key</button>
+      <button id="apikey-clear" type="button" class="text-xs text-gray-400 hover:text-red-400 cursor-pointer">Clear stored key</button>
       <div class="flex gap-2">
-        <button id="apikey-cancel" class="text-gray-400 hover:text-white px-4 py-2 text-sm">Cancel</button>
-        <button id="apikey-save" class="bg-policy text-ink-950 font-semibold px-4 py-2 rounded-lg text-sm hover:shadow-glow-cyan">Save &amp; go live</button>
+        <button id="apikey-cancel" type="button" class="text-gray-400 hover:text-white px-4 py-2 text-sm cursor-pointer">Cancel</button>
+        <button id="apikey-save" type="button" class="bg-policy text-ink-950 font-semibold px-4 py-2 rounded-lg text-sm hover:shadow-glow-cyan cursor-pointer">Save &amp; go live</button>
       </div>
     </div>
   </div>
 </div>`
 }
 
-function kpiCard(label: string, value: string, delta: string, deltaClass: string, icon: string) {
+function briefModal() {
+  return `
+<div id="brief-modal" class="hidden fixed inset-0 z-[55] cmdk-backdrop flex items-center justify-center px-4">
+  <div class="card w-full max-w-3xl p-6 slide-up max-h-[85vh] overflow-y-auto">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-lg bg-policy/15 border border-policy/40 flex items-center justify-center"><i class="fa-solid fa-newspaper text-policy"></i></div>
+        <div>
+          <div class="text-xs mono uppercase text-policy">Daily Battle Brief</div>
+          <h3 class="font-semibold text-lg" id="brief-modal-title">Loading…</h3>
+        </div>
+      </div>
+      <button id="brief-modal-close" type="button" class="text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div id="brief-modal-body" class="text-sm leading-relaxed text-gray-300 space-y-4"></div>
+  </div>
+</div>`
+}
+
+function kpiCard(label: string, value: string, delta: string, deltaClass: string, icon: string, key: string) {
   const positive = delta.startsWith('+') || (delta.startsWith('-') && /response/i.test(label))
   return `
-  <div class="card step-card p-4 slide-up">
+  <div class="card step-card p-4 slide-up" data-kpi="${key}">
       <div class="flex items-start justify-between mb-2">
         <span class="text-xs text-gray-500 uppercase tracking-wide">${label}</span>
         <i class="fa-solid ${icon} ${deltaClass} text-xs"></i>
       </div>
       <div class="flex items-end justify-between">
-        <div class="mono text-2xl font-bold">${value}</div>
-        <div class="mono text-xs ${positive ? 'text-emerald-400' : 'text-gray-500'}">${delta}</div>
+        <div class="mono text-2xl font-bold kpi-value">${value}</div>
+        <div class="mono text-xs ${positive ? 'text-emerald-400' : 'text-gray-500'} kpi-delta">${delta}</div>
       </div>
       <canvas class="kpi-spark mt-2" height="22"></canvas>
   </div>`
