@@ -1,4 +1,6 @@
 // src/pages/dashboard.ts
+// All hardcoded chart HTML removed — everything is rendered by dashboard.js
+// from /api/dashboard?day=N payload.
 import { htmlShell } from './shell'
 
 export const dashboardPage = (isPublicThreatIndex = false) =>
@@ -17,7 +19,7 @@ export const dashboardPage = (isPublicThreatIndex = false) =>
     </a>
 
     <div class="flex-1 flex items-center justify-center">
-      <button id="cmdk-trigger"
+      <button id="cmdk-trigger" type="button"
               class="flex items-center gap-2 bg-ink-800/70 hover:bg-ink-700 border border-ink-600 rounded-lg px-3 py-1.5 text-sm text-gray-400 transition w-full max-w-md">
         <i class="fa-solid fa-magnifying-glass text-xs"></i>
         <span class="flex-1 text-left">Ask SCOUTT</span>
@@ -39,7 +41,6 @@ export const dashboardPage = (isPublicThreatIndex = false) =>
     </button>
   </div>
 
-  <!-- TAB BAR -->
   <div class="max-w-[1500px] mx-auto px-6 flex items-center gap-1 overflow-x-auto">
     ${[
       ['command', 'fa-house-signal', 'Command Center'],
@@ -70,31 +71,34 @@ ${transparencyDrawer()}
 ${audioBriefToast()}
 ${apiKeyModal()}
 ${briefModal()}
+${liveLoadingOverlay()}
 
 <script src="/static/dashboard.js"></script>
 `,
   })
 
+// ════════════════════════════════════════════════════════════════════
+// COMMAND CENTER
+// ════════════════════════════════════════════════════════════════════
 function commandCenterTab() {
   return `
 <section data-pane="command" class="tab-pane">
-
   <div class="card p-5 mb-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 slide-up">
     <div class="flex items-start gap-4">
       <div class="w-12 h-12 rounded-lg bg-policy/15 border border-policy/40 flex items-center justify-center shrink-0">
-        <i class="fa-solid fa-sun text-policy text-xl"></i>
+        <i id="greeting-icon" class="fa-solid fa-sun text-policy text-xl"></i>
       </div>
       <div>
-        <div class="text-xs mono text-gray-500 uppercase mb-1">Good morning — brief generated <span id="brief-time">06:00 UTC</span></div>
-        <h1 class="text-xl md:text-2xl font-bold"><span id="banner-events">4</span> high-impact events overnight. Threat level <span class="text-policy mono"><span id="banner-threat">73</span>/100</span>.</h1>
-        <p id="banner-summary" class="text-sm text-gray-400 mt-1">EU AI Act enforcement begins; Stripe raises ACH fees 12%; sentiment around fraud tools sours.</p>
+        <div class="text-xs mono text-gray-500 uppercase mb-1">
+          <span id="greeting-text">Good morning</span> — brief generated <span id="brief-time">--:-- UTC</span>
+        </div>
+        <h1 class="text-xl md:text-2xl font-bold"><span id="banner-events">--</span> high-impact events overnight. Threat level <span class="text-policy mono"><span id="banner-threat">--</span>/100</span>.</h1>
+        <p id="banner-summary" class="text-sm text-gray-400 mt-1">Loading live briefing…</p>
       </div>
     </div>
     <div class="flex flex-wrap items-center gap-2 shrink-0">
       <button id="play-audio" type="button" class="card-hover card px-3 py-2 text-sm flex items-center gap-2 cursor-pointer">
-        <span id="play-audio-icon" class="inline-flex items-center justify-center w-4 h-4">
-          <i class="fa-solid fa-headphones text-policy"></i>
-        </span>
+        <span id="play-audio-icon" class="inline-flex items-center justify-center w-4 h-4"><i class="fa-solid fa-headphones text-policy"></i></span>
         <span id="play-audio-label">Listen</span>
         <span class="text-[10px] mono text-gray-500">ELEVENLABS</span>
       </button>
@@ -130,9 +134,7 @@ function commandCenterTab() {
         <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-competitor"></span> Competitor</span>
         <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-sentiment"></span> Sentiment</span>
       </div>
-      <div id="pulse-wheel-container" class="aspect-square max-w-[460px] mx-auto pt-6 pb-2">
-        ${pulseWheelSVG()}
-      </div>
+      <div id="pulse-wheel-container" class="aspect-square max-w-[460px] mx-auto pt-6 pb-2"></div>
       <div id="wheel-tooltip" class="absolute bg-ink-950 border border-policy/50 rounded-lg p-3 text-xs pointer-events-none opacity-0 transition-opacity shadow-glow-cyan max-w-[240px]"></div>
     </div>
 
@@ -148,10 +150,10 @@ function commandCenterTab() {
     </aside>
 
     <div class="col-span-12 grid grid-cols-2 md:grid-cols-4 gap-4 mt-1">
-      ${kpiCard('Threats Detected', '12', '+3', 'text-policy', 'fa-shield-halved', 'threats')}
-      ${kpiCard('Opportunities', '4', '+1', 'text-action', 'fa-bullseye', 'opps')}
-      ${kpiCard('Action Items', '3', '0', 'text-competitor', 'fa-list-check', 'actions-kpi')}
-      ${kpiCard('Avg. Response', '47m', '-12m', 'text-sentiment', 'fa-stopwatch', 'response')}
+      ${kpiCard('Threats Detected', 'threats', 'text-policy', 'fa-shield-halved')}
+      ${kpiCard('Opportunities', 'opps', 'text-action', 'fa-bullseye')}
+      ${kpiCard('Action Items', 'actions-kpi', 'text-competitor', 'fa-list-check')}
+      ${kpiCard('Avg. Response', 'response', 'text-sentiment', 'fa-stopwatch')}
     </div>
 
     <div class="col-span-12 md:col-span-6 lg:col-span-4 card p-5 slide-up">
@@ -159,7 +161,7 @@ function commandCenterTab() {
         <h3 class="font-semibold text-sm">Threat-Level Meter</h3>
         <span class="text-[10px] mono text-gray-500 uppercase">Bloomberg style</span>
       </div>
-      ${threatMeterSVG(73)}
+      <div id="threat-meter-container"></div>
     </div>
 
     <div class="col-span-12 md:col-span-6 lg:col-span-4 card p-5 slide-up">
@@ -167,9 +169,7 @@ function commandCenterTab() {
         <h3 class="font-semibold text-sm">Sentiment Volume — 14d</h3>
         <span class="text-[10px] mono text-sentiment uppercase">+/- /neutral</span>
       </div>
-      <div class="relative" style="height:200px">
-        <canvas id="chart-sentiment-volume"></canvas>
-      </div>
+      <div class="relative" style="height:200px"><canvas id="chart-sentiment-volume"></canvas></div>
     </div>
 
     <div class="col-span-12 lg:col-span-4 card p-5 slide-up">
@@ -177,122 +177,15 @@ function commandCenterTab() {
         <h3 class="font-semibold text-sm">Threats → Actions Flow</h3>
         <span class="text-[10px] mono text-gray-500 uppercase">Sankey</span>
       </div>
-      ${sankeySVG()}
+      <div id="sankey-container"></div>
     </div>
   </div>
 </section>`
 }
 
-function pulseWheelSVG() {
-  const events = [
-    { ring: 0, hour: 0.23, sev: 92, title: 'EU AI Act enforcement', color: '#06b6d4', url: 'https://eur-lex.europa.eu' },
-    { ring: 0, hour: 4.92, sev: 68, title: 'CFPB BNPL circular', color: '#06b6d4', url: 'https://consumerfinance.gov' },
-    { ring: 0, hour: 7.0, sev: 41, title: 'UK FCA stablecoin consult', color: '#06b6d4', url: 'https://fca.org.uk' },
-    { ring: 1, hour: 1.33, sev: 54, title: 'Checkout.com hires 4 ML', color: '#f97316', url: 'https://checkout.com' },
-    { ring: 1, hour: 3.7, sev: 81, title: 'Stripe ACH +12.5%', color: '#f97316', url: 'https://stripe.com' },
-    { ring: 1, hour: 6.18, sev: 76, title: 'Adyen Embedded Finance launch', color: '#f97316', url: 'https://adyen.com' },
-    { ring: 2, hour: 2.5, sev: 71, title: 'Reddit fraud-tool sentiment -18', color: '#ec4899', url: 'https://reddit.com' },
-    { ring: 2, hour: 5.03, sev: 48, title: 'G2 onboarding-friction +31%', color: '#ec4899', url: 'https://g2.com' },
-  ]
-  const radii = [165, 130, 95]
-  const ringNames = ['POLICY', 'COMPETITOR', 'SENTIMENT']
-  const ringColors = ['#06b6d4', '#f97316', '#ec4899']
-
-  const ticks = events.map((e) => {
-    const angle = (e.hour / 24) * 360 - 90
-    const rad = (angle * Math.PI) / 180
-    const r = radii[e.ring]
-    const len = 8 + (e.sev / 100) * 16
-    const x1 = 200 + Math.cos(rad) * (r - len / 2), y1 = 200 + Math.sin(rad) * (r - len / 2)
-    const x2 = 200 + Math.cos(rad) * (r + len / 2), y2 = 200 + Math.sin(rad) * (r + len / 2)
-    const dotX = 200 + Math.cos(rad) * r, dotY = 200 + Math.sin(rad) * r
-    return `<g class="wheel-tick cursor-pointer" data-title="${e.title}" data-sev="${e.sev}" data-url="${e.url}" data-color="${e.color}">
-      <line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${e.color}" stroke-width="2.4" stroke-linecap="round" />
-      <circle cx="${dotX}" cy="${dotY}" r="${4 + e.sev / 40}" fill="${e.color}" opacity="0.95" />
-      <circle cx="${dotX}" cy="${dotY}" r="${10 + e.sev / 20}" fill="${e.color}" opacity="0.18">
-        <animate attributeName="r" from="${4 + e.sev / 40}" to="${18 + e.sev / 12}" dur="2.4s" repeatCount="indefinite" />
-        <animate attributeName="opacity" from="0.4" to="0" dur="2.4s" repeatCount="indefinite" />
-      </circle>
-    </g>`
-  }).join('')
-
-  const hourLabels = [0, 6, 12, 18].map((h) => {
-    const angle = (h / 24) * 360 - 90
-    const rad = (angle * Math.PI) / 180
-    const x = 200 + Math.cos(rad) * 188, y = 200 + Math.sin(rad) * 188 + 4
-    return `<text x="${x}" y="${y}" fill="#3a4055" font-family="JetBrains Mono" font-size="11" text-anchor="middle">${h.toString().padStart(2, '0')}h</text>`
-  }).join('')
-
-  return `
-    <svg viewBox="0 0 400 400" class="w-full h-full">
-      <defs>
-        <radialGradient id="wheelGlow" cx="50%" cy="50%">
-          <stop offset="60%" stop-color="#0a0c14" /><stop offset="100%" stop-color="#11141d" />
-        </radialGradient>
-      </defs>
-      <circle cx="200" cy="200" r="185" fill="url(#wheelGlow)" />
-      ${radii.map((r, i) =>
-        `<circle cx="200" cy="200" r="${r}" fill="none" stroke="${ringColors[i]}" stroke-opacity="0.15" stroke-width="22" />` +
-        `<circle cx="200" cy="200" r="${r}" fill="none" stroke="${ringColors[i]}" stroke-opacity="0.5" stroke-width="0.8" />`
-      ).join('')}
-      ${hourLabels}
-      ${ticks}
-      <circle cx="200" cy="200" r="34" fill="#05060a" stroke="#06b6d4" stroke-width="1" />
-      <text x="200" y="196" fill="#e7eaf3" font-family="JetBrains Mono" font-size="18" font-weight="700" text-anchor="middle">73</text>
-      <text x="200" y="212" fill="#3a4055" font-family="JetBrains Mono" font-size="8" text-anchor="middle" letter-spacing="1.5">THREAT</text>
-      ${radii.map((r, i) =>
-        `<text x="200" y="${200 - r - 4}" fill="${ringColors[i]}" font-family="JetBrains Mono" font-size="9" font-weight="600" text-anchor="middle" letter-spacing="1.5">${ringNames[i]}</text>`
-      ).join('')}
-    </svg>`
-}
-
-function threatMeterSVG(value: number) {
-  const angle = -90 + (value / 100) * 180
-  return `
-  <div class="relative">
-    <svg viewBox="0 0 240 140" class="w-full">
-      <defs>
-        <linearGradient id="threatGrad" x1="0" x2="1">
-          <stop offset="0%" stop-color="#10b981" /><stop offset="50%" stop-color="#f97316" /><stop offset="100%" stop-color="#ef4444" />
-        </linearGradient>
-      </defs>
-      <path d="M 30 120 A 90 90 0 0 1 210 120" fill="none" stroke="#1a1e2a" stroke-width="18" stroke-linecap="round" />
-      <path d="M 30 120 A 90 90 0 0 1 210 120" fill="none" stroke="url(#threatGrad)" stroke-width="18" stroke-linecap="round" stroke-dasharray="${(value / 100) * 283}, 283" />
-      <g style="transform-origin:120px 120px; transform: rotate(${angle - 90}deg);" class="needle">
-        <line x1="120" y1="120" x2="120" y2="40" stroke="#e7eaf3" stroke-width="2.5" stroke-linecap="round" />
-        <circle cx="120" cy="40" r="4" fill="#06b6d4" />
-      </g>
-      <circle cx="120" cy="120" r="8" fill="#0a0c14" stroke="#06b6d4" stroke-width="1.5" />
-    </svg>
-    <div class="text-center mt-2">
-      <div class="mono text-3xl font-semibold text-white" id="threat-meter-value">${value}<span class="text-base text-gray-500">/100</span></div>
-      <div class="text-[10px] mono uppercase text-gray-500 tracking-widest">Elevated</div>
-    </div>
-  </div>`
-}
-
-function sankeySVG() {
-  return `
-  <svg viewBox="0 0 320 200" class="w-full">
-    ${[{ y: 30, label: 'Policy', color: '#06b6d4', count: 4 },
-       { y: 95, label: 'Competitor', color: '#f97316', count: 5 },
-       { y: 160, label: 'Sentiment', color: '#ec4899', count: 3 }]
-      .map((n) => `<rect x="10" y="${n.y - 18}" width="14" height="36" fill="${n.color}" rx="2" />
-        <text x="32" y="${n.y - 2}" fill="#e7eaf3" font-family="Inter" font-size="11" font-weight="500">${n.label}</text>
-        <text x="32" y="${n.y + 12}" fill="${n.color}" font-family="JetBrains Mono" font-size="10">${n.count} threats</text>`).join('')}
-    ${[{ y: 50, label: 'Audit', color: '#10b981' },
-       { y: 100, label: 'Counter-market', color: '#10b981' },
-       { y: 150, label: 'Ship landing', color: '#10b981' }]
-      .map((n) => `<rect x="280" y="${n.y - 14}" width="14" height="28" fill="${n.color}" rx="2" />
-        <text x="275" y="${n.y - 2}" fill="#e7eaf3" font-family="Inter" font-size="11" font-weight="500" text-anchor="end">${n.label}</text>`).join('')}
-    <path d="M 24 30 C 150 30 150 50 280 50" stroke="#06b6d4" stroke-width="3" fill="none" opacity="0.5" />
-    <path d="M 24 30 C 150 30 150 100 280 100" stroke="#06b6d4" stroke-width="2" fill="none" opacity="0.35" />
-    <path d="M 24 95 C 150 95 150 100 280 100" stroke="#f97316" stroke-width="3" fill="none" opacity="0.5" />
-    <path d="M 24 95 C 150 95 150 150 280 150" stroke="#f97316" stroke-width="2" fill="none" opacity="0.4" />
-    <path d="M 24 160 C 150 160 150 150 280 150" stroke="#ec4899" stroke-width="3" fill="none" opacity="0.5" />
-  </svg>`
-}
-
+// ════════════════════════════════════════════════════════════════════
+// POLICY RADAR
+// ════════════════════════════════════════════════════════════════════
 function policyTab() {
   return `
 <section data-pane="policy" class="tab-pane hidden">
@@ -300,22 +193,18 @@ function policyTab() {
     <div class="col-span-12 lg:col-span-8 card p-5 relative">
       <div class="flex items-center justify-between mb-3">
         <h3 class="font-semibold">Global Regulatory Heatmap</h3>
-        <span class="text-[10px] mono text-gray-500 uppercase">Hover a region</span>
+        <span class="text-[10px] mono text-gray-500 uppercase">Hover a pin</span>
       </div>
-      <div id="world-map" class="relative aspect-[2/1] rounded-lg bg-ink-900 overflow-hidden border border-ink-700">
-        <svg viewBox="0 0 1000 500" class="w-full h-full opacity-50"><rect width="1000" height="500" fill="none" stroke="#1a1e2a"/></svg>
-        <div id="map-pins" class="absolute inset-0"></div>
-      </div>
+      <div id="world-map" class="relative w-full rounded-lg bg-gradient-to-br from-ink-900 to-ink-950 overflow-hidden border border-ink-700" style="aspect-ratio:2/1; min-height:340px;"></div>
+      <div id="map-tooltip" class="absolute bg-ink-950 border border-policy/50 rounded-lg p-3 text-xs pointer-events-none opacity-0 transition-opacity shadow-glow-cyan max-w-[240px] z-10"></div>
     </div>
 
     <div class="col-span-12 lg:col-span-4 card p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="font-semibold text-sm">Quarter-over-quarter</h3>
-        <span class="text-[10px] mono text-policy uppercase">+34% vs Q1</span>
+        <span id="policy-qoq-delta" class="text-[10px] mono text-policy uppercase">+34% vs Q1</span>
       </div>
-      <div class="relative" style="height:220px">
-        <canvas id="chart-policy-trend"></canvas>
-      </div>
+      <div class="relative" style="height:280px"><canvas id="chart-policy-trend"></canvas></div>
     </div>
 
     <div class="col-span-12">
@@ -334,6 +223,9 @@ function policyTab() {
 </section>`
 }
 
+// ════════════════════════════════════════════════════════════════════
+// COMPETITOR PULSE
+// ════════════════════════════════════════════════════════════════════
 function competitorTab() {
   return `
 <section data-pane="competitor" class="tab-pane hidden">
@@ -348,36 +240,30 @@ function competitorTab() {
 
     <div class="col-span-12 lg:col-span-8 card p-5">
       <div class="flex items-center justify-between mb-3">
-        <h3 class="font-semibold" id="diff-title">Pricing Diff — stripe.com/pricing</h3>
+        <h3 class="font-semibold" id="diff-title">Pricing Diff — loading…</h3>
         <div class="flex items-center gap-2 text-xs mono">
-          <span class="text-gray-500" id="diff-before-time">2026-06-19 14:00</span>
+          <span class="text-gray-500" id="diff-before-time">--</span>
           <i class="fa-solid fa-arrow-right text-policy"></i>
-          <span class="text-policy" id="diff-after-time">2026-06-20 03:42</span>
+          <span class="text-policy" id="diff-after-time">--</span>
         </div>
       </div>
-      <div class="grid md:grid-cols-2 gap-3" id="diff-pane">
+      <div class="grid md:grid-cols-2 gap-3">
         <div class="border border-ink-700 rounded-lg overflow-hidden">
-          <div class="bg-ink-900 px-3 py-2 text-xs mono text-gray-400 flex items-center justify-between border-b border-ink-700"><span>BEFORE — cached snapshot</span><span class="text-[10px] text-gray-500">html_hash: a3f2</span></div>
-          <div class="p-4 font-mono text-xs leading-relaxed space-y-1">
-            <div>ACH payments</div>
-            <div class="bg-red-500/15 text-red-400 px-2 py-1 rounded">- $0.80 per transaction</div>
-            <div>+ 0.8% capped at $5</div>
-            <div>Plan: Standard</div>
+          <div class="bg-ink-900 px-3 py-2 text-xs mono text-gray-400 flex items-center justify-between border-b border-ink-700">
+            <span>BEFORE — cached snapshot</span><span class="text-[10px] text-gray-500">html_hash: a3f2</span>
           </div>
+          <div id="diff-before" class="p-4 font-mono text-xs leading-relaxed space-y-1"></div>
         </div>
         <div class="border border-ink-700 rounded-lg overflow-hidden">
-          <div class="bg-ink-900 px-3 py-2 text-xs mono text-gray-400 flex items-center justify-between border-b border-ink-700"><span class="text-policy">AFTER — current</span><span class="text-[10px] text-gray-500">html_hash: b9e1</span></div>
-          <div class="p-4 font-mono text-xs leading-relaxed space-y-1">
-            <div>ACH payments</div>
-            <div class="bg-emerald-500/15 text-emerald-400 px-2 py-1 rounded">+ $0.90 per transaction</div>
-            <div>+ 0.8% capped at $5</div>
-            <div>Plan: Standard</div>
+          <div class="bg-ink-900 px-3 py-2 text-xs mono text-gray-400 flex items-center justify-between border-b border-ink-700">
+            <span class="text-policy">AFTER — current</span><span class="text-[10px] text-gray-500">html_hash: b9e1</span>
           </div>
+          <div id="diff-after" class="p-4 font-mono text-xs leading-relaxed space-y-1"></div>
         </div>
       </div>
       <div class="mt-4 flex items-center gap-3 text-xs">
-        <span class="px-2 py-1 rounded bg-competitor/15 text-competitor border border-competitor/40 mono">+12.5% fee</span>
-        <span class="text-gray-400">Threat level: <strong class="text-white mono">81</strong></span>
+        <span id="diff-fee-pct" class="px-2 py-1 rounded bg-competitor/15 text-competitor border border-competitor/40 mono">--%</span>
+        <span class="text-gray-400">Threat level: <strong id="diff-threat" class="text-white mono">--</strong></span>
         <button class="ml-auto text-policy hover:underline">Generate counter-email →</button>
       </div>
     </div>
@@ -387,9 +273,7 @@ function competitorTab() {
         <h3 class="font-semibold text-sm">Pricing Race — 30d</h3>
         <span class="text-[10px] mono text-gray-500 uppercase">ACH per-txn</span>
       </div>
-      <div class="relative" style="height:260px">
-        <canvas id="chart-pricing-race"></canvas>
-      </div>
+      <div class="relative" style="height:260px"><canvas id="chart-pricing-race"></canvas></div>
     </div>
 
     <div class="col-span-12 card p-5">
@@ -413,6 +297,9 @@ function competitorTab() {
 </section>`
 }
 
+// ════════════════════════════════════════════════════════════════════
+// SENTIMENT STORM
+// ════════════════════════════════════════════════════════════════════
 function sentimentTab() {
   return `
 <section data-pane="sentiment" class="tab-pane hidden">
@@ -429,9 +316,7 @@ function sentimentTab() {
         <h3 class="font-semibold text-sm">Sentiment Δ vs Competitors</h3>
         <span class="text-[10px] mono text-sentiment uppercase">7d</span>
       </div>
-      <div class="relative" style="height:340px">
-        <canvas id="chart-diverging"></canvas>
-      </div>
+      <div class="relative" style="height:340px"><canvas id="chart-diverging"></canvas></div>
     </div>
     <div class="col-span-12 lg:col-span-6 card p-5">
       <div class="flex items-center justify-between mb-3">
@@ -443,7 +328,7 @@ function sentimentTab() {
     <div class="col-span-12 lg:col-span-6 card p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="font-semibold">Verbatim quotes</h3>
-        <span id="quote-counter" class="text-[10px] mono text-gray-500 uppercase">1 / 5</span>
+        <span id="quote-counter" class="text-[10px] mono text-gray-500 uppercase">--</span>
       </div>
       <div id="quotes-carousel" class="min-h-[200px] flex items-center"></div>
       <div class="flex items-center justify-between mt-3">
@@ -464,6 +349,9 @@ function sentimentTab() {
 </section>`
 }
 
+// ════════════════════════════════════════════════════════════════════
+// SCENARIO
+// ════════════════════════════════════════════════════════════════════
 function scenarioTab() {
   return `
 <section data-pane="scenario" class="tab-pane hidden">
@@ -472,41 +360,49 @@ function scenarioTab() {
       <div class="w-12 h-12 rounded-lg bg-action/15 border border-action/40 flex items-center justify-center shrink-0"><i class="fa-solid fa-flask text-action text-xl"></i></div>
       <div>
         <h2 class="text-xl font-bold mb-1">"What if?" Scenario Simulator</h2>
-        <p class="text-sm text-gray-400">Re-runs over your existing briefings. <span class="text-action mono">Zero new credits.</span></p>
+        <p class="text-sm text-gray-400">Re-runs over the current cached briefing. <span class="text-action mono">Zero new credits.</span></p>
       </div>
     </div>
     <textarea id="scenario-input" rows="3" placeholder='Try: "What if EU AI Act enforcement is delayed 6 months?" or "What if Stripe drops ACH back to $0.70?"' class="w-full bg-ink-900 border border-ink-600 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-action"></textarea>
     <button id="scenario-run" type="button" class="mt-3 bg-action text-ink-950 font-semibold px-5 py-2.5 rounded-lg hover:shadow-glow-emerald transition flex items-center gap-2 cursor-pointer"><i class="fa-solid fa-play"></i> Run scenario</button>
+
+    <div id="scenario-error" class="hidden mt-4 border border-red-500/40 bg-red-500/10 text-red-300 text-sm rounded-lg px-4 py-3"></div>
+
     <div id="scenario-result" class="hidden mt-6 space-y-4">
       <div class="grid grid-cols-3 gap-3">
-        <div class="card p-4 text-center"><div class="text-[10px] mono uppercase text-gray-500 mb-1">Threat Level</div><div class="mono"><span id="s-before" class="text-gray-500 line-through">73</span> → <span id="s-after" class="text-action text-2xl font-bold">--</span></div></div>
+        <div class="card p-4 text-center"><div class="text-[10px] mono uppercase text-gray-500 mb-1">Threat Level</div><div class="mono"><span id="s-before" class="text-gray-500 line-through">--</span> → <span id="s-after" class="text-action text-2xl font-bold">--</span></div></div>
         <div class="card p-4 text-center"><div class="text-[10px] mono uppercase text-gray-500 mb-1">New Threats</div><div id="s-threats" class="mono text-2xl font-bold text-competitor">--</div></div>
         <div class="card p-4 text-center"><div class="text-[10px] mono uppercase text-gray-500 mb-1">New Actions</div><div id="s-actions" class="mono text-2xl font-bold text-policy">--</div></div>
       </div>
+      <div id="s-narrative" class="card p-3 text-sm text-gray-300"></div>
       <div id="s-events" class="space-y-2"></div>
     </div>
   </div>
 </section>`
 }
 
+// ════════════════════════════════════════════════════════════════════
+// ARCHETYPE
+// ════════════════════════════════════════════════════════════════════
 function archetypeTab() {
   return `
 <section data-pane="archetype" class="tab-pane hidden">
   <div class="card p-6">
     <h2 class="text-xl font-bold mb-1">Industry Archetype Comparison</h2>
-    <p class="text-sm text-gray-400 mb-6">Your <span id="archetype-industry" class="text-policy mono">B2B SaaS Fintech</span> profile vs the synthetic industry baseline.</p>
-    <div class="relative" style="height:360px">
-      <canvas id="chart-radar"></canvas>
-    </div>
+    <p class="text-sm text-gray-400 mb-6">Your <span id="archetype-industry" class="text-policy mono">--</span> profile vs the synthetic industry baseline.</p>
+    <div class="relative" style="height:360px"><canvas id="chart-radar"></canvas></div>
     <div class="mt-6 grid md:grid-cols-3 gap-3">
-      <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">You score higher on</div><div class="mt-1 text-sm">Compliance, Onboarding speed</div></div>
-      <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">Industry beats you on</div><div class="mt-1 text-sm">Embedded Finance breadth</div></div>
-      <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">Coin-flip</div><div class="mt-1 text-sm">Sentiment, Pricing</div></div>
+      <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">You score higher on</div><div id="archetype-higher" class="mt-1 text-sm">--</div></div>
+      <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">Industry beats you on</div><div id="archetype-lower" class="mt-1 text-sm">--</div></div>
+      <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">Coin-flip</div><div id="archetype-neutral" class="mt-1 text-sm">--</div></div>
     </div>
   </div>
 </section>`
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Modals / overlays
+// ════════════════════════════════════════════════════════════════════
 function cmdkPalette() {
   return `
 <div id="cmdk" class="hidden fixed inset-0 z-50 cmdk-backdrop flex items-start justify-center pt-24 px-4">
@@ -516,10 +412,7 @@ function cmdkPalette() {
       <input id="cmdk-input" placeholder="Search policy, competitors, sentiment, actions… or ask anything" class="flex-1 bg-transparent focus:outline-none text-base" />
       <kbd class="mono text-[10px] bg-ink-700 px-1.5 py-0.5 rounded border border-ink-600">esc</kbd>
     </div>
-
-    <!-- LIVE SEARCH RESULTS (categorized) -->
     <div id="cmdk-results" class="hidden max-h-[440px] overflow-y-auto"></div>
-
     <div id="cmdk-suggestions" class="px-4 py-3 text-xs text-gray-400">
       <div class="mb-2 mono uppercase tracking-widest">Try</div>
       <div class="space-y-1">
@@ -529,7 +422,6 @@ function cmdkPalette() {
         <button type="button" class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700 ask">→ Ask SCOUTT: "Should I match Stripe's price hike?"</button>
       </div>
     </div>
-
     <div id="cmdk-output" class="hidden px-4 py-4 border-t border-ink-700 max-h-[440px] overflow-y-auto"></div>
   </div>
 </div>`
@@ -574,7 +466,7 @@ function apiKeyModal() {
       </div>
       <button id="apikey-close" type="button" class="text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
     </div>
-    <p class="text-sm text-gray-400 mb-4">Paste your Anakin API key to switch from demo data to live briefings generated from real Agentic Search calls. All dashboard sections become dynamic.</p>
+    <p class="text-sm text-gray-400 mb-4">Paste your Anakin API key to switch from demo data to live briefings generated from real Agentic-Search calls. Every card in every tab becomes dynamic.</p>
     <label class="block text-xs mono uppercase text-gray-500 mb-1">Anakin API Key</label>
     <input id="apikey-input" type="password" placeholder="anakin-live-…" class="w-full bg-ink-900 border border-ink-600 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-policy mono" autocomplete="off" />
     <div class="mt-3 text-[11px] text-gray-500 leading-relaxed">
@@ -612,8 +504,20 @@ function briefModal() {
 </div>`
 }
 
-function kpiCard(label: string, value: string, delta: string, deltaClass: string, icon: string, key: string) {
-  const positive = delta.startsWith('+') || (delta.startsWith('-') && /response/i.test(label))
+function liveLoadingOverlay() {
+  return `
+<div id="live-loading" class="hidden fixed inset-0 z-[70] bg-ink-950/80 backdrop-blur-sm flex items-center justify-center">
+  <div class="card p-6 flex items-center gap-4 max-w-md">
+    <div class="w-8 h-8 border-4 border-policy border-t-transparent rounded-full animate-spin"></div>
+    <div>
+      <div class="font-semibold text-sm" id="live-loading-title">Generating live briefing…</div>
+      <div class="text-[11px] mono text-gray-500 mt-1" id="live-loading-sub">Anakin Agentic Search → NVIDIA reshape. Up to 60s.</div>
+    </div>
+  </div>
+</div>`
+}
+
+function kpiCard(label: string, key: string, deltaClass: string, icon: string) {
   return `
   <div class="card step-card p-4 slide-up" data-kpi="${key}">
       <div class="flex items-start justify-between mb-2">
@@ -621,8 +525,8 @@ function kpiCard(label: string, value: string, delta: string, deltaClass: string
         <i class="fa-solid ${icon} ${deltaClass} text-xs"></i>
       </div>
       <div class="flex items-end justify-between">
-        <div class="mono text-2xl font-bold kpi-value">${value}</div>
-        <div class="mono text-xs ${positive ? 'text-emerald-400' : 'text-gray-500'} kpi-delta">${delta}</div>
+        <div class="mono text-2xl font-bold kpi-value">--</div>
+        <div class="mono text-xs text-gray-500 kpi-delta">--</div>
       </div>
       <canvas class="kpi-spark mt-2" height="22"></canvas>
   </div>`

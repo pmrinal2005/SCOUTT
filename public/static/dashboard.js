@@ -1,12 +1,12 @@
-// =====================================================================
-// SCOUTT — Dashboard interactivity (FULL REWRITE — fixes tab switching,
-// API key modal, Listen/Read brief, Time Machine, logo, ⌘K search, TTS.)
-// =====================================================================
+/* =====================================================================
+   SCOUTT — dashboard.js (full rewrite)
+   Drives every tile from /api/dashboard?day=N. Demo when no Anakin key,
+   live Anakin → NVIDIA-reshaped JSON when key is set.
+   ===================================================================== */
 
 const $  = (s, p = document) => p.querySelector(s)
 const $$ = (s, p = document) => Array.from(p.querySelectorAll(s))
 
-// ─── API KEY STATE ───────────────────────────────────────────────────
 const SCOUTT = {
   apiKey: '',
   init() { try { this.apiKey = localStorage.getItem('scoutt_anakin_key') || '' } catch { this.apiKey = '' } },
@@ -17,163 +17,137 @@ const SCOUTT = {
       ...opts,
       headers: { 'Content-Type': 'application/json', ...this.headers(), ...(opts.headers || {}) },
     })
-    if (!res.ok) throw new Error(`${url} → ${res.status}`)
+    if (!res.ok) {
+      let body = ''; try { body = await res.text() } catch {}
+      throw new Error(`${url} → ${res.status}${body ? ' · ' + body.slice(0, 200) : ''}`)
+    }
     const ct = res.headers.get('content-type') || ''
     return ct.includes('application/json') ? res.json() : res.text()
   },
-  async post(url, body) {
-    return this.fetch(url, { method: 'POST', body: JSON.stringify(body || {}) })
-  },
+  async post(url, body) { return this.fetch(url, { method: 'POST', body: JSON.stringify(body || {}) }) },
 }
 SCOUTT.init()
 
-// ─── Cached datasets used by global search ───────────────────────────
+const STATE = { payload: null, day: 0, quoteIdx: 0, charts: {} }
 let GLOBAL_INDEX = []
-const STATE = { briefing: null, timeline: null, actions: null, sentimentVolume: null }
 
-// =====================================================================
-// API KEY UI
-// =====================================================================
-function refreshKeyUI() {
-  const label = $('#apikey-label'), icon = $('#apikey-icon')
-  if (!label || !icon) return
-  if (SCOUTT.hasKey) {
-    label.textContent = 'Live • Anakin'
-    icon.classList.remove('text-policy'); icon.classList.add('text-emerald-400')
-  } else {
-    label.textContent = 'Enter API Key'
-    icon.classList.add('text-policy'); icon.classList.remove('text-emerald-400')
-  }
+/* ═════════════════════════ UTILITIES ═════════════════════════ */
+function escapeHTML(s) {
+  return String(s ?? '').replace(/[&<>"']/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 }
-
-function openKeyModal() {
-  const m = $('#apikey-modal'); if (!m) return
-  m.classList.remove('hidden')
-  const inp = $('#apikey-input')
-  if (inp) inp.value = SCOUTT.apiKey
-  $('#apikey-status')?.classList.add('hidden')
-  setTimeout(() => $('#apikey-input')?.focus(), 50)
-}
-function closeKeyModal() { $('#apikey-modal')?.classList.add('hidden') }
-
-function showStatus(msg, ok = true) {
-  const el = $('#apikey-status'); if (!el) return
-  el.classList.remove('hidden')
-  el.className = `mt-3 text-xs ${ok ? 'text-emerald-400' : 'text-red-400'}`
-  el.textContent = msg
-}
-
-function showToast(text = 'Live mode active. Regenerating briefing from Anakin…', kind = 'info') {
+function showToast(text, kind = 'info') {
   const color = kind === 'error' ? 'bg-red-500' : 'bg-emerald-400'
   const t = document.createElement('div')
   t.className = 'fixed top-20 right-6 z-[70] card p-4 shadow-glow-cyan flex items-center gap-3 slide-up max-w-sm'
-  t.innerHTML = `<div class="w-3 h-3 rounded-full ${color} pulse-ring shrink-0"></div><div class="text-sm">${text}</div>`
-  document.body.appendChild(t)
-  setTimeout(() => t.remove(), 4500)
+  t.innerHTML = `<div class="w-3 h-3 rounded-full ${color} pulse-ring shrink-0"></div><div class="text-sm">${escapeHTML(text)}</div>`
+  document.body.appendChild(t); setTimeout(() => t.remove(), 4500)
+}
+function setLiveLoading(on, title, sub) {
+  const el = $('#live-loading'); if (!el) return
+  if (title) { const t = $('#live-loading-title'); if (t) t.textContent = title }
+  if (sub)   { const s = $('#live-loading-sub');   if (s) s.textContent = sub }
+  el.classList.toggle('hidden', !on)
 }
 
-// =====================================================================
-// TAB SWITCHING  (fixes Issue #1 + #a + #f)
-// =====================================================================
-function activateTab(target) {
-  if (!target) return
-  $$('.tab-btn').forEach(b => {
-    if (b.dataset.tab === target) { b.classList.add('tab-active'); b.classList.remove('text-gray-400') }
-    else { b.classList.remove('tab-active'); b.classList.add('text-gray-400') }
-  })
-  $$('.tab-pane').forEach(p => p.classList.add('hidden'))
-  const pane = document.querySelector(`[data-pane="${target}"]`)
-  if (pane) pane.classList.remove('hidden')
-  // Charts inside a hidden container don't size correctly — force re-layout.
-  window.dispatchEvent(new Event('resize'))
-  if (target === 'policy')     ensurePolicyLoaded()
-  if (target === 'competitor') ensureCompetitorLoaded()
-  if (target === 'sentiment')  ensureSentimentLoaded()
-  if (target === 'archetype')  ensureArchetypeLoaded()
-  if (target === 'command')    { /* command center always pre-loaded */ }
+/* ═════════════════════ GREETING (time-aware) ════════════════════ */
+function applyTimeGreeting() {
+  const h = new Date().getHours()
+  let label = 'Good evening', icon = 'fa-moon', color = 'text-sentiment'
+  if (h >= 5  && h < 12)       { label = 'Good morning';   icon = 'fa-sun';        color = 'text-policy' }
+  else if (h >= 12 && h < 17)  { label = 'Good afternoon'; icon = 'fa-cloud-sun';  color = 'text-competitor' }
+  else if (h >= 17 && h < 21)  { label = 'Good evening';   icon = 'fa-cloud-moon'; color = 'text-sentiment' }
+  else                         { label = 'Good night';     icon = 'fa-moon';       color = 'text-sentiment' }
+  const lbl = $('#greeting-text'); if (lbl) lbl.textContent = label
+  const ic  = $('#greeting-icon'); if (ic) ic.className = `fa-solid ${icon} ${color} text-xl`
+  const t   = $('#brief-time')
+  if (t) {
+    const now = new Date()
+    const hh = String(now.getUTCHours()).padStart(2, '0')
+    const mm = String(now.getUTCMinutes()).padStart(2, '0')
+    t.textContent = `${hh}:${mm} UTC`
+  }
 }
 
-// =====================================================================
-// BRIEFING / TIMELINE / ACTIONS  (fills Last 7 days + Today's actions)
-// =====================================================================
-async function loadBriefing() {
+/* ═════════════════════════ FETCH PAYLOAD ═════════════════════════ */
+async function fetchPayload(day = 0) {
+  const isLiveFirstLoad = SCOUTT.hasKey && (!STATE.payload || STATE.payload.source !== 'anakin-live')
+  if (isLiveFirstLoad) setLiveLoading(true, 'Generating live briefing…',
+    'Anakin Agentic Search → NVIDIA reshape. May take up to 60s.')
   try {
-    const data = await SCOUTT.fetch('/api/briefing/today')
-    STATE.briefing = data
-    const hi = (data.events || []).filter(e => e.high_impact).length || (data.events || []).length || 4
-    const be = $('#banner-events'); if (be) be.textContent = hi
-    const bt = $('#banner-threat'); if (bt) bt.textContent = data.threat_level ?? 73
-    const bs = $('#banner-summary'); if (bs && data.headline) bs.textContent = data.headline
-    // Update KPI cards from briefing when available
-    const k = data.kpis
-    if (k) {
-      const setKpi = (key, v) => { const card = document.querySelector(`[data-kpi="${key}"] .kpi-value`); if (card) card.textContent = v }
-      if (k.threats_detected != null) setKpi('threats', String(k.threats_detected))
-      if (k.opportunities    != null) setKpi('opps',     String(k.opportunities))
-      if (k.action_items     != null) setKpi('actions-kpi', String(k.action_items))
-      if (k.avg_response_time_minutes != null) setKpi('response', `${k.avg_response_time_minutes}m`)
+    const data = await SCOUTT.fetch(`/api/dashboard?day=${day}`)
+    STATE.payload = data; STATE.day = day
+    if (data.source === 'demo-fallback' && SCOUTT.hasKey) {
+      showToast('Live call failed — showing demo. ' + (data.error || ''), 'error')
+    } else if (data.source === 'anakin-live') {
+      showToast(day === 0 ? 'Live briefing loaded.' : `Day-${day} snapshot ready.`)
     }
     return data
-  } catch (e) {
-    console.warn('loadBriefing failed', e); return null
-  }
+  } finally { setLiveLoading(false) }
 }
 
-async function loadTimeline() {
+/* ═════════════════════════ RENDER ROOT ════════════════════════ */
+async function renderAll(payload) {
+  if (!payload) return
+  applyTimeGreeting()
+  renderBanner(payload); renderTimeline(payload); renderActions(payload)
+  renderPulseWheel(payload); renderKPIs(payload); renderThreatMeter(payload)
+  renderSankey(payload); renderSentimentVolume(payload)
+  renderPolicy(payload); renderCompetitor(payload); renderSentiment(payload); renderArchetype(payload)
+  refreshSearchIndex()
+}
+
+/* ─── Command Center ──────────────────────────────────────────── */
+function renderBanner(p) {
+  const b = p.briefing
+  const ev = $('#banner-events'); if (ev) ev.textContent = String(b.high_impact_count ?? 0)
+  const th = $('#banner-threat'); if (th) th.textContent = String(b.threat_level ?? 0)
+  const su = $('#banner-summary'); if (su) su.textContent = b.headline || b.summary || ''
+}
+
+function renderTimeline(p) {
   const list = $('#timeline-list'); if (!list) return
-  try {
-    const data = await SCOUTT.fetch('/api/timeline')
-    STATE.timeline = data
-    const colors = { policy: '#06b6d4', competitor: '#f97316', sentiment: '#ec4899' }
-    const rgb    = { policy: '6,182,212', competitor: '249,115,22', sentiment: '236,72,153' }
-    if (!data || !data.length) { list.innerHTML = '<li class="text-xs text-gray-500">No events.</li>'; return }
-    list.innerHTML = data.map((e, i) => `
-      <li class="relative" style="animation-delay:${i * 40}ms">
-        <span class="absolute -left-[1.4rem] top-1 w-2.5 h-2.5 rounded-full"
-              style="background:${colors[e.pillar] || '#a1a8bd'};box-shadow:0 0 0 3px rgba(${rgb[e.pillar] || '161,168,189'},0.18)"></span>
-        <div class="text-[10px] mono text-gray-500 mb-0.5">${e.date} • sev ${e.severity}</div>
-        <div class="text-xs leading-snug">${escapeHTML(e.title)}</div>
-      </li>`).join('')
-  } catch (e) {
-    list.innerHTML = '<li class="text-xs text-red-400">Failed to load timeline.</li>'
-  }
+  const data = p.timeline || []
+  if (!data.length) { list.innerHTML = '<li class="text-xs text-gray-500">No events.</li>'; return }
+  const colors = { policy: '#06b6d4', competitor: '#f97316', sentiment: '#ec4899' }
+  const rgb    = { policy: '6,182,212', competitor: '249,115,22', sentiment: '236,72,153' }
+  list.innerHTML = data.map((e, i) => `
+    <li class="relative" style="animation-delay:${i * 40}ms">
+      <span class="absolute -left-[1.4rem] top-1 w-2.5 h-2.5 rounded-full"
+            style="background:${colors[e.pillar] || '#a1a8bd'};box-shadow:0 0 0 3px rgba(${rgb[e.pillar] || '161,168,189'},0.18)"></span>
+      <div class="text-[10px] mono text-gray-500 mb-0.5">${escapeHTML(e.date)} • sev ${e.severity}</div>
+      <div class="text-xs leading-snug">${escapeHTML(e.title)}</div>
+    </li>`).join('')
 }
 
-async function loadActions() {
+function renderActions(p) {
   const wrap = $('#actions-list'); if (!wrap) return
-  try {
-    // Always pull from the dedicated endpoint — works in both demo & live mode.
-    const acts = await SCOUTT.fetch('/api/actions/today')
-    STATE.actions = acts
-    if (!acts || !acts.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">No actions today.</div>'; return }
-    const colors = { high: 'action', medium: 'competitor', low: 'gray-500' }
-    wrap.innerHTML = acts.map((a, i) => `
-      <div class="card step-card p-3" data-action="${i}">
-        <div class="flex items-start gap-2 mb-2">
-          <input type="checkbox" class="mt-1 accent-emerald-500" />
-          <div class="flex-1">
-            <div class="text-sm font-medium leading-snug">${escapeHTML(a.title)}</div>
-            <div class="text-[11px] text-gray-500 mt-0.5">${escapeHTML(a.why_now || '')}</div>
-          </div>
+  const acts = p.briefing.actions || []
+  if (!acts.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">No actions today.</div>'; return }
+  const colors = { high: 'action', medium: 'competitor', low: 'gray-500' }
+  wrap.innerHTML = acts.map((a, i) => `
+    <div class="card step-card p-3" data-action="${i}">
+      <div class="flex items-start gap-2 mb-2">
+        <input type="checkbox" class="mt-1 accent-emerald-500" />
+        <div class="flex-1">
+          <div class="text-sm font-medium leading-snug">${escapeHTML(a.title)}</div>
+          <div class="text-[11px] text-gray-500 mt-0.5">${escapeHTML(a.why_now || '')}</div>
         </div>
-        <div class="flex items-center gap-2 mt-2">
-          <span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-${colors[a.impact] || 'gray-500'}/15 text-${colors[a.impact] || 'gray-500'} border border-${colors[a.impact] || 'gray-500'}/40">${a.impact || 'medium'} impact</span>
-          <button type="button" class="action-draft-btn ml-auto text-[11px] text-policy hover:underline cursor-pointer" data-action="${i}" data-kind="email"><i class="fa-solid fa-envelope text-[10px]"></i> Email</button>
-          <button type="button" class="action-draft-btn text-[11px] text-policy hover:underline cursor-pointer" data-action="${i}" data-kind="slack"><i class="fa-brands fa-slack text-[10px]"></i> Slack</button>
-        </div>
-      </div>`).join('')
+      </div>
+      <div class="flex items-center gap-2 mt-2">
+        <span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-${colors[a.impact] || 'gray-500'}/15 text-${colors[a.impact] || 'gray-500'} border border-${colors[a.impact] || 'gray-500'}/40">${escapeHTML(a.impact || 'medium')} impact</span>
+        <button type="button" class="action-draft-btn ml-auto text-[11px] text-policy hover:underline cursor-pointer" data-idx="${i}" data-kind="email"><i class="fa-solid fa-envelope text-[10px]"></i> Email</button>
+        <button type="button" class="action-draft-btn text-[11px] text-policy hover:underline cursor-pointer" data-idx="${i}" data-kind="slack"><i class="fa-brands fa-slack text-[10px]"></i> Slack</button>
+      </div>
+    </div>`).join('')
 
-    $$('.action-draft-btn').forEach(b => b.addEventListener('click', async () => {
-      try {
-        const data = await SCOUTT.post('/api/action/draft', { action_id: +b.dataset.action, kind: b.dataset.kind })
-        showDraftModal(data)
-      } catch (e) { showToast('Draft failed: ' + e.message, 'error') }
-    }))
-  } catch (e) {
-    wrap.innerHTML = '<div class="text-xs text-red-400">Could not load actions.</div>'
-  }
+  $$('.action-draft-btn').forEach(b => b.addEventListener('click', async () => {
+    try {
+      const data = await SCOUTT.post('/api/action/draft', { action_id: +b.dataset.idx, kind: b.dataset.kind })
+      showDraftModal(data)
+    } catch (e) { showToast('Draft failed: ' + e.message, 'error') }
+  }))
 }
-
 function showDraftModal(data) {
   const m = document.createElement('div')
   m.className = 'fixed inset-0 z-[70] cmdk-backdrop flex items-center justify-center px-4'
@@ -198,172 +172,287 @@ function showDraftModal(data) {
   m.addEventListener('click', e => { if (e.target === m) m.remove() })
 }
 
-// =====================================================================
-// READ FULL BRIEF modal  (fixes Issue #4 — Read brief button)
-// =====================================================================
-function openBriefModal() {
-  const m = $('#brief-modal'); if (!m) return
-  m.classList.remove('hidden')
-  const b = STATE.briefing
-  $('#brief-modal-title').textContent = b?.headline || 'Daily briefing'
-  const events = b?.events || []
-  const actions = b?.actions || STATE.actions || []
-  $('#brief-modal-body').innerHTML = `
-    <div class="flex items-center gap-3 text-xs">
-      <span class="px-2 py-1 rounded bg-policy/15 text-policy border border-policy/40 mono">Threat ${b?.threat_level ?? 73}/100</span>
-      <span class="text-gray-500">${events.length} events • ${actions.length} actions</span>
-      <span class="ml-auto text-[10px] mono text-gray-500 uppercase">${SCOUTT.hasKey ? 'Anakin live' : 'Demo data'}</span>
-    </div>
-    <div>
-      <h4 class="font-semibold text-base mb-2">Overnight events</h4>
-      <ul class="space-y-2">
-        ${events.slice(0, 12).map(e => `
-          <li class="border-l-2 pl-3 ${e.pillar === 'policy' ? 'border-policy' : e.pillar === 'competitor' ? 'border-competitor' : 'border-sentiment'}">
-            <div class="text-sm font-medium">${escapeHTML(e.title)}</div>
-            <div class="text-xs text-gray-400 mt-0.5">${escapeHTML(e.summary || '')}</div>
-            <div class="text-[10px] mono text-gray-500 mt-1">sev ${e.severity} • <a href="${e.source_url || '#'}" target="_blank" rel="noopener" class="text-policy hover:underline">source ↗</a></div>
-          </li>`).join('')}
-      </ul>
-    </div>
-    <div>
-      <h4 class="font-semibold text-base mb-2">Today's 3 actions</h4>
-      <ol class="space-y-2 list-decimal list-inside">
-        ${actions.map(a => `
-          <li>
-            <span class="font-medium">${escapeHTML(a.title)}</span>
-            <div class="text-xs text-gray-400 ml-5">${escapeHTML(a.why_now || '')}</div>
-          </li>`).join('')}
-      </ol>
-    </div>`
-}
-function closeBriefModal() { $('#brief-modal')?.classList.add('hidden') }
+/* ─── Pulse Wheel (DATA-DRIVEN) ───────────────────────────────── */
+function renderPulseWheel(p) {
+  const host = $('#pulse-wheel-container'); if (!host) return
+  const points = (p.pulse_wheel && p.pulse_wheel.length) ? p.pulse_wheel : []
+  const PILLAR = { policy: { ring: 0, color: '#06b6d4' }, competitor: { ring: 1, color: '#f97316' }, sentiment: { ring: 2, color: '#ec4899' } }
+  const radii = [165, 130, 95]
+  const ringNames = ['POLICY', 'COMPETITOR', 'SENTIMENT']
+  const ringColors = ['#06b6d4', '#f97316', '#ec4899']
 
-// =====================================================================
-// KPI SPARKLINES + helpers
-// =====================================================================
-function drawSparklines() {
-  $$('.kpi-spark').forEach((cv, idx) => {
-    const ctx = cv.getContext('2d')
-    cv.width = cv.offsetWidth || 100; cv.height = 22
-    const colors = ['#06b6d4', '#10b981', '#f97316', '#ec4899']
-    const c = colors[idx % 4]
-    const data = Array.from({ length: 14 }, () => Math.random() * 0.6 + 0.2)
-    const grad = ctx.createLinearGradient(0, 0, 0, 22)
-    grad.addColorStop(0, c + '66'); grad.addColorStop(1, c + '00')
-    ctx.beginPath()
-    data.forEach((v, i) => { const x = (i / (data.length - 1)) * cv.width; const y = 22 - v * 22; i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y) })
-    ctx.lineTo(cv.width, 22); ctx.lineTo(0, 22); ctx.closePath()
-    ctx.fillStyle = grad; ctx.fill()
-    ctx.beginPath()
-    data.forEach((v, i) => { const x = (i / (data.length - 1)) * cv.width; const y = 22 - v * 22; i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y) })
-    ctx.strokeStyle = c; ctx.lineWidth = 1.5; ctx.stroke()
+  const ticks = points.map(e => {
+    const meta = PILLAR[e.pillar] || PILLAR.policy
+    const angle = (Number(e.hour || 0) / 24) * 360 - 90
+    const rad = (angle * Math.PI) / 180
+    const r = radii[meta.ring]
+    const sev = Math.max(20, Math.min(100, Number(e.severity || 50)))
+    const len = 8 + (sev / 100) * 16
+    const x1 = 200 + Math.cos(rad) * (r - len / 2), y1 = 200 + Math.sin(rad) * (r - len / 2)
+    const x2 = 200 + Math.cos(rad) * (r + len / 2), y2 = 200 + Math.sin(rad) * (r + len / 2)
+    const dotX = 200 + Math.cos(rad) * r, dotY = 200 + Math.sin(rad) * r
+    return `<g class="wheel-tick cursor-pointer" data-title="${escapeHTML(e.title)}" data-sev="${sev}" data-url="${escapeHTML(e.source_url || '#')}">
+      <line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${meta.color}" stroke-width="2.4" stroke-linecap="round" />
+      <circle cx="${dotX}" cy="${dotY}" r="${4 + sev / 40}" fill="${meta.color}" opacity="0.95" />
+      <circle cx="${dotX}" cy="${dotY}" r="${10 + sev / 20}" fill="${meta.color}" opacity="0.18">
+        <animate attributeName="r" from="${4 + sev / 40}" to="${18 + sev / 12}" dur="2.4s" repeatCount="indefinite" />
+        <animate attributeName="opacity" from="0.4" to="0" dur="2.4s" repeatCount="indefinite" />
+      </circle>
+    </g>`
+  }).join('')
+
+  const hourLabels = [0, 6, 12, 18].map(h => {
+    const angle = (h / 24) * 360 - 90, rad = (angle * Math.PI) / 180
+    const x = 200 + Math.cos(rad) * 188, y = 200 + Math.sin(rad) * 188 + 4
+    return `<text x="${x}" y="${y}" fill="#3a4055" font-family="JetBrains Mono" font-size="11" text-anchor="middle">${String(h).padStart(2, '0')}h</text>`
+  }).join('')
+
+  host.innerHTML = `
+    <svg viewBox="0 0 400 400" class="w-full h-full">
+      <defs><radialGradient id="wheelGlow" cx="50%" cy="50%"><stop offset="60%" stop-color="#0a0c14" /><stop offset="100%" stop-color="#11141d" /></radialGradient></defs>
+      <circle cx="200" cy="200" r="185" fill="url(#wheelGlow)" />
+      ${radii.map((r, i) =>
+        `<circle cx="200" cy="200" r="${r}" fill="none" stroke="${ringColors[i]}" stroke-opacity="0.15" stroke-width="22" />` +
+        `<circle cx="200" cy="200" r="${r}" fill="none" stroke="${ringColors[i]}" stroke-opacity="0.5" stroke-width="0.8" />`
+      ).join('')}
+      ${hourLabels}${ticks}
+      <circle cx="200" cy="200" r="34" fill="#05060a" stroke="#06b6d4" stroke-width="1" />
+      <text x="200" y="196" fill="#e7eaf3" font-family="JetBrains Mono" font-size="18" font-weight="700" text-anchor="middle">${p.briefing.threat_level || 0}</text>
+      <text x="200" y="212" fill="#3a4055" font-family="JetBrains Mono" font-size="8" text-anchor="middle" letter-spacing="1.5">THREAT</text>
+      ${radii.map((r, i) =>
+        `<text x="200" y="${200 - r - 4}" fill="${ringColors[i]}" font-family="JetBrains Mono" font-size="9" font-weight="600" text-anchor="middle" letter-spacing="1.5">${ringNames[i]}</text>`
+      ).join('')}
+    </svg>`
+
+  const tooltip = $('#wheel-tooltip')
+  $$('.wheel-tick').forEach(g => {
+    g.addEventListener('mouseenter', () => {
+      if (!tooltip) return
+      tooltip.innerHTML = `<div class="font-semibold text-white">${escapeHTML(g.dataset.title)}</div><div class="text-[10px] mono text-gray-400 mt-1">severity ${g.dataset.sev}</div>`
+      tooltip.style.opacity = '1'
+    })
+    g.addEventListener('mousemove', e => {
+      if (!tooltip) return
+      const c = host.getBoundingClientRect()
+      tooltip.style.left = (e.clientX - c.left + 10) + 'px'
+      tooltip.style.top  = (e.clientY - c.top + 10) + 'px'
+    })
+    g.addEventListener('mouseleave', () => { if (tooltip) tooltip.style.opacity = '0' })
+    g.addEventListener('click', () => { const u = g.dataset.url; if (u && u !== '#') window.open(u, '_blank') })
   })
 }
 
-function escapeHTML(s) {
-  return String(s || '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]))
+/* ─── KPIs ────────────────────────────────────────────────────── */
+function renderKPIs(p) {
+  const k = p.briefing.kpis || {}
+  const set = (key, v) => { const el = document.querySelector(`[data-kpi="${key}"] .kpi-value`); if (el) el.textContent = v }
+  set('threats',     String(k.threats_detected ?? '--'))
+  set('opps',        String(k.opportunities ?? '--'))
+  set('actions-kpi', String(k.action_items ?? '--'))
+  set('response',    k.avg_response_time_minutes != null ? `${k.avg_response_time_minutes}m` : '--')
+
+  const series = p.kpi_sparklines || {}
+  const map = { threats: series.threats, opps: series.opps, 'actions-kpi': series.actions, response: series.response }
+  Object.entries(map).forEach(([key, data], idx) => {
+    const card = document.querySelector(`[data-kpi="${key}"] .kpi-spark`); if (!card || !data) return
+    drawSparkline(card, data, ['#06b6d4', '#10b981', '#f97316', '#ec4899'][idx % 4])
+  })
+}
+function drawSparkline(cv, data, color) {
+  const ctx = cv.getContext('2d')
+  cv.width = cv.offsetWidth || 100; cv.height = 22
+  ctx.clearRect(0, 0, cv.width, cv.height)
+  const grad = ctx.createLinearGradient(0, 0, 0, 22)
+  grad.addColorStop(0, color + '66'); grad.addColorStop(1, color + '00')
+  ctx.beginPath()
+  data.forEach((v, i) => { const x = (i / (data.length - 1)) * cv.width; const y = 22 - v * 22; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y) })
+  ctx.lineTo(cv.width, 22); ctx.lineTo(0, 22); ctx.closePath(); ctx.fillStyle = grad; ctx.fill()
+  ctx.beginPath()
+  data.forEach((v, i) => { const x = (i / (data.length - 1)) * cv.width; const y = 22 - v * 22; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y) })
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke()
 }
 
-// =====================================================================
-// CHARTS
-// =====================================================================
-const CHART_REGISTRY = {}
+/* ─── Threat meter (DATA-DRIVEN) ─────────────────────────────── */
+function renderThreatMeter(p) {
+  const host = $('#threat-meter-container'); if (!host) return
+  const v = Math.max(0, Math.min(100, p.threat_meter?.value ?? p.briefing.threat_level ?? 0))
+  const label = p.threat_meter?.label || 'Elevated'
+  const angle = -90 + (v / 100) * 180
+  host.innerHTML = `
+  <div class="relative">
+    <svg viewBox="0 0 240 140" class="w-full">
+      <defs>
+        <linearGradient id="threatGrad" x1="0" x2="1">
+          <stop offset="0%" stop-color="#10b981" /><stop offset="50%" stop-color="#f97316" /><stop offset="100%" stop-color="#ef4444" />
+        </linearGradient>
+      </defs>
+      <path d="M 30 120 A 90 90 0 0 1 210 120" fill="none" stroke="#1a1e2a" stroke-width="18" stroke-linecap="round" />
+      <path d="M 30 120 A 90 90 0 0 1 210 120" fill="none" stroke="url(#threatGrad)" stroke-width="18" stroke-linecap="round" stroke-dasharray="${(v / 100) * 283}, 283" />
+      <g style="transform-origin:120px 120px; transform: rotate(${angle - 90}deg);">
+        <line x1="120" y1="120" x2="120" y2="40" stroke="#e7eaf3" stroke-width="2.5" stroke-linecap="round" />
+        <circle cx="120" cy="40" r="4" fill="#06b6d4" />
+      </g>
+      <circle cx="120" cy="120" r="8" fill="#0a0c14" stroke="#06b6d4" stroke-width="1.5" />
+    </svg>
+    <div class="text-center mt-2">
+      <div class="mono text-3xl font-semibold text-white">${v}<span class="text-base text-gray-500">/100</span></div>
+      <div class="text-[10px] mono uppercase text-gray-500 tracking-widest">${escapeHTML(label)}</div>
+    </div>
+  </div>`
+}
 
-async function chartSentimentVolume() {
+/* ─── Sankey (DATA-DRIVEN) ───────────────────────────────────── */
+function renderSankey(p) {
+  const host = $('#sankey-container'); if (!host) return
+  const t = p.threats_to_actions || { sources: [], targets: [], links: [] }
+  const srcColors = ['#06b6d4', '#f97316', '#ec4899', '#10b981']
+  const srcY = t.sources.map((_, i, a) => 30 + (i * (160 / Math.max(a.length, 1))))
+  const tgtY = t.targets.map((_, i, a) => 40 + (i * (140 / Math.max(a.length, 1))))
+
+  const srcRects = t.sources.map((n, i) => `
+    <rect x="10" y="${srcY[i] - 18}" width="14" height="36" fill="${srcColors[i % 4]}" rx="2" />
+    <text x="32" y="${srcY[i] - 2}" fill="#e7eaf3" font-family="Inter" font-size="11" font-weight="500">${escapeHTML(n.label)}</text>
+    <text x="32" y="${srcY[i] + 12}" fill="${srcColors[i % 4]}" font-family="JetBrains Mono" font-size="10">${n.count} threats</text>`).join('')
+
+  const tgtRects = t.targets.map((n, i) => `
+    <rect x="280" y="${tgtY[i] - 14}" width="14" height="28" fill="#10b981" rx="2" />
+    <text x="275" y="${tgtY[i] - 2}" fill="#e7eaf3" font-family="Inter" font-size="11" font-weight="500" text-anchor="end">${escapeHTML(n.label)}</text>`).join('')
+
+  const flows = (t.links || []).map(l => {
+    const y1 = srcY[l.from] || 30, y2 = tgtY[l.to] || 50
+    const w = Math.max(1.5, Math.min(6, Number(l.value) || 2))
+    return `<path d="M 24 ${y1} C 150 ${y1} 150 ${y2} 280 ${y2}" stroke="${srcColors[l.from % 4]}" stroke-width="${w}" fill="none" opacity="0.45" />`
+  }).join('')
+
+  host.innerHTML = `<svg viewBox="0 0 320 200" class="w-full">${flows}${srcRects}${tgtRects}</svg>`
+}
+
+/* ─── Sentiment Volume chart ─────────────────────────────────── */
+function renderSentimentVolume(p) {
   const ctx = $('#chart-sentiment-volume'); if (!ctx) return
-  try {
-    const data = await SCOUTT.fetch('/api/charts/sentiment-volume')
-    STATE.sentimentVolume = data
-    if (CHART_REGISTRY.sv) CHART_REGISTRY.sv.destroy()
-    CHART_REGISTRY.sv = new Chart(ctx, {
-      type: 'line',
+  const data = p.sentiment_volume_14d || []
+  if (STATE.charts.sv) STATE.charts.sv.destroy()
+  STATE.charts.sv = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => (d.date || '').slice(5)),
+      datasets: [
+        { label: 'Positive', data: data.map(d => d.positive), backgroundColor: 'rgba(16,185,129,0.45)', borderColor: '#10b981', fill: true, tension: 0.35, pointRadius: 0 },
+        { label: 'Neutral',  data: data.map(d => d.neutral),  backgroundColor: 'rgba(58,64,85,0.45)',  borderColor: '#3a4055', fill: true, tension: 0.35, pointRadius: 0 },
+        { label: 'Negative', data: data.map(d => d.negative), backgroundColor: 'rgba(236,72,153,0.45)', borderColor: '#ec4899', fill: true, tension: 0.35, pointRadius: 0 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#a1a8bd', font: { size: 10 } } } },
+      scales: {
+        x: { stacked: true, ticks: { color: '#3a4055', font: { size: 9 } }, grid: { color: 'rgba(58,64,85,0.15)' } },
+        y: { stacked: true, ticks: { color: '#3a4055', font: { size: 9 } }, grid: { color: 'rgba(58,64,85,0.15)' } },
+      },
+    },
+  })
+}
+
+/* ═══════════════ POLICY (heatmap + QoQ + cards) ══════════════ */
+function renderPolicy(p) {
+  const wmap = $('#world-map'); if (!wmap) return
+  const regions = p.policy?.regions || []
+  const W = 1000, H = 500
+  const pins = regions.map(r => {
+    const x = ((r.lng + 180) / 360) * W
+    const y = ((90 - r.lat)  / 180) * H
+    const color = r.activity > 70 ? '#06b6d4' : r.activity > 45 ? '#f97316' : '#ec4899'
+    const size = 6 + (r.activity / 100) * 14
+    return `
+      <g class="map-pin-g" data-country="${escapeHTML(r.country)}" data-count="${r.count}" data-activity="${r.activity}" style="cursor:pointer">
+        <circle cx="${x}" cy="${y}" r="${size + 14}" fill="${color}" opacity="0.10">
+          <animate attributeName="r" from="${size + 8}" to="${size + 22}" dur="2.6s" repeatCount="indefinite" />
+          <animate attributeName="opacity" from="0.30" to="0" dur="2.6s" repeatCount="indefinite" />
+        </circle>
+        <circle cx="${x}" cy="${y}" r="${size}" fill="${color}" opacity="0.90" stroke="#fff" stroke-opacity="0.25" stroke-width="0.8"/>
+        <text x="${x}" y="${y - size - 6}" fill="#e7eaf3" font-family="JetBrains Mono" font-size="11" text-anchor="middle">${escapeHTML(r.country)}</text>
+      </g>`
+  }).join('')
+
+  // Stylised low-poly continents — visually grounds the pins
+  wmap.innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="absolute inset-0 w-full h-full">
+      <defs>
+        <radialGradient id="mapGlow" cx="50%" cy="50%" r="65%">
+          <stop offset="0%" stop-color="#0d1320" stop-opacity="0.6"/>
+          <stop offset="100%" stop-color="#05060a" stop-opacity="1"/>
+        </radialGradient>
+        <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+          <path d="M40 0H0V40" fill="none" stroke="#1a1e2a" stroke-width="0.5"/>
+        </pattern>
+      </defs>
+      <rect width="${W}" height="${H}" fill="url(#mapGlow)"/>
+      <rect width="${W}" height="${H}" fill="url(#grid)"/>
+      <g fill="#1a1e2a" stroke="#262b3a" stroke-width="0.8">
+        <path d="M150 110 L260 90 L330 130 L300 200 L220 230 L150 200 Z"/>
+        <path d="M150 260 L210 250 L260 320 L240 410 L180 430 L150 380 Z"/>
+        <path d="M420 80  L530 90  L560 160 L510 220 L430 200 L400 140 Z"/>
+        <path d="M460 230 L540 260 L560 340 L520 410 L470 400 L430 320 Z"/>
+        <path d="M620 100 L770 110 L820 180 L800 250 L720 250 L630 200 Z"/>
+        <path d="M680 270 L800 280 L820 360 L750 380 L700 340 Z"/>
+        <path d="M820 360 L900 370 L920 430 L860 440 Z"/>
+      </g>
+      ${pins}
+    </svg>`
+
+  const tooltip = $('#map-tooltip')
+  $$('.map-pin-g', wmap).forEach(g => {
+    g.addEventListener('mouseenter', () => {
+      if (!tooltip) return
+      tooltip.innerHTML = `<div class="font-semibold text-white">${escapeHTML(g.dataset.country)}</div>
+        <div class="text-[10px] mono text-gray-400 mt-1">${g.dataset.count} regulatory changes • activity ${g.dataset.activity}</div>`
+      tooltip.style.opacity = '1'
+    })
+    g.addEventListener('mousemove', e => {
+      if (!tooltip) return
+      const c = wmap.getBoundingClientRect()
+      tooltip.style.left = (e.clientX - c.left + 12) + 'px'
+      tooltip.style.top  = (e.clientY - c.top + 12) + 'px'
+    })
+    g.addEventListener('mouseleave', () => { if (tooltip) tooltip.style.opacity = '0' })
+  })
+
+  // QoQ chart
+  const qoqCanvas = $('#chart-policy-trend')
+  if (qoqCanvas) {
+    if (STATE.charts.qoq) STATE.charts.qoq.destroy()
+    const qoq = (p.policy?.qoq || []).slice().sort((a, b) => b.q2 - a.q2)
+    const total = qoq.reduce((s, r) => s + r.q2, 0) || 1
+    const q1total = qoq.reduce((s, r) => s + r.q1, 0) || 1
+    const deltaPct = Math.round(((total - q1total) / q1total) * 100)
+    const lbl = $('#policy-qoq-delta'); if (lbl) lbl.textContent = `${deltaPct >= 0 ? '+' : ''}${deltaPct}% vs Q1`
+    STATE.charts.qoq = new Chart(qoqCanvas, {
+      type: 'bar',
       data: {
-        labels: data.map(d => d.date.slice(5)),
+        labels: qoq.map(r => (r.country || '').slice(0, 6)),
         datasets: [
-          { label: 'Positive', data: data.map(d => d.positive), backgroundColor: 'rgba(16,185,129,0.45)', borderColor: '#10b981', fill: true, tension: 0.35, pointRadius: 0 },
-          { label: 'Neutral',  data: data.map(d => d.neutral),  backgroundColor: 'rgba(58,64,85,0.45)',  borderColor: '#3a4055', fill: true, tension: 0.35, pointRadius: 0 },
-          { label: 'Negative', data: data.map(d => d.negative), backgroundColor: 'rgba(236,72,153,0.45)', borderColor: '#ec4899', fill: true, tension: 0.35, pointRadius: 0 },
+          { label: 'Q1', data: qoq.map(r => r.q1), backgroundColor: '#3a4055', borderRadius: 3 },
+          { label: 'Q2', data: qoq.map(r => r.q2), backgroundColor: '#06b6d4', borderRadius: 3 },
         ],
       },
       options: {
-        responsive: true, maintainAspectRatio: false,
+        responsive: true, maintainAspectRatio: false, indexAxis: 'y',
         plugins: { legend: { labels: { color: '#a1a8bd', font: { size: 10 } } } },
         scales: {
-          x: { stacked: true, ticks: { color: '#3a4055', font: { size: 9 } }, grid: { color: 'rgba(58,64,85,0.15)' } },
-          y: { stacked: true, ticks: { color: '#3a4055', font: { size: 9 } }, grid: { color: 'rgba(58,64,85,0.15)' } },
+          x: { ticks: { color: '#3a4055', font: { size: 9 } }, grid: { color: 'rgba(58,64,85,0.15)' } },
+          y: { ticks: { color: '#a1a8bd', font: { size: 10 } }, grid: { display: false } },
         },
       },
     })
-  } catch (e) { console.warn('sentiment chart fail', e) }
-}
+  }
 
-async function chartPricingRace() {
-  const ctx = $('#chart-pricing-race'); if (!ctx) return
-  try {
-    const data = await SCOUTT.fetch('/api/charts/pricing-race')
-    if (CHART_REGISTRY.pr) CHART_REGISTRY.pr.destroy()
-    CHART_REGISTRY.pr = new Chart(ctx, {
-      type: 'line',
-      data: {
-        labels: data.map(d => d.date.slice(5)),
-        datasets: [
-          { label: 'You',      data: data.map(d => d.you),      borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.1)', tension: 0.3, pointRadius: 0, borderWidth: 2 },
-          { label: 'Stripe',   data: data.map(d => d.stripe),   borderColor: '#f97316', tension: 0, pointRadius: 0, borderWidth: 2, stepped: true },
-          { label: 'Adyen',    data: data.map(d => d.adyen),    borderColor: '#06b6d4', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-          { label: 'Checkout', data: data.map(d => d.checkout), borderColor: '#ec4899', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
-        ],
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { labels: { color: '#a1a8bd', font: { size: 10 } } } },
-        scales: {
-          x: { ticks: { color: '#3a4055', font: { size: 9 } }, grid: { display: false } },
-          y: { ticks: { color: '#3a4055', font: { size: 9 }, callback: v => '$' + v.toFixed(2) }, grid: { color: 'rgba(58,64,85,0.15)' } },
-        },
-      },
-    })
-  } catch (e) { console.warn('pricing chart fail', e) }
-}
-
-// =====================================================================
-// POLICY
-// =====================================================================
-let _policyLoaded = false
-async function ensurePolicyLoaded() {
-  if (_policyLoaded) return
-  _policyLoaded = true
-  await loadPolicyMap()
-}
-async function loadPolicyMap() {
-  try {
-    const data = await SCOUTT.fetch('/api/charts/policy-regions')
-    const pins = $('#map-pins'); const trend = $('#chart-policy-trend')
-    if (pins) {
-      pins.innerHTML = data.map(r => {
-        const x = ((r.lng + 180) / 360) * 100
-        const y = ((90 - r.lat) / 180) * 100
-        const color = r.activity > 70 ? '' : r.activity > 45 ? 'orange' : 'magenta'
-        return `<div class="absolute" style="left:${x}%;top:${y}%;transform:translate(-50%,-50%)" title="${escapeHTML(r.country)}: ${r.count} changes (activity ${r.activity})">
-          <div class="map-pin ${color}"></div>
-          <div class="absolute -top-6 left-1/2 -translate-x-1/2 mono text-[10px] text-gray-300 whitespace-nowrap">${escapeHTML(r.country.slice(0, 12))}</div>
-        </div>`
-      }).join('')
-    }
-    if (trend) {
-      if (CHART_REGISTRY.pt) CHART_REGISTRY.pt.destroy()
-      CHART_REGISTRY.pt = new Chart(trend, {
-        type: 'bar',
-        data: { labels: data.map(d => d.country.slice(0, 6)), datasets: [{ data: data.map(d => d.count), backgroundColor: data.map(d => d.activity > 70 ? '#06b6d4' : d.activity > 45 ? '#f97316' : '#ec4899'), borderRadius: 4 }] },
-        options: { responsive: true, maintainAspectRatio: false, indexAxis: 'y', plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#3a4055', font: { size: 9 } }, grid: { color: 'rgba(58,64,85,0.15)' } }, y: { ticks: { color: '#a1a8bd', font: { size: 9 } }, grid: { display: false } } } },
-      })
-    }
-    const regs = await SCOUTT.fetch('/api/policy/active')
-    const cards = $('#reg-cards')
-    if (cards) cards.innerHTML = regs.length
+  // Active regulations
+  const cards = $('#reg-cards')
+  if (cards) {
+    const regs = p.policy?.active_regulations || []
+    cards.innerHTML = regs.length
       ? regs.map(regCard).join('')
       : '<div class="col-span-full text-center text-sm text-gray-500 py-8">No active regulations in your scope right now.</div>'
-  } catch (e) {
-    const el = $('#reg-cards'); if (el) el.innerHTML = '<div class="col-span-full text-sm text-red-400 py-8">Failed to load policy data.</div>'
   }
 }
 function regCard(r) {
@@ -378,179 +467,335 @@ function regCard(r) {
     <p class="text-xs text-gray-400 leading-relaxed mb-3">${escapeHTML(r.summary || '')}</p>
     <div class="border-t border-ink-700 pt-3 flex items-center justify-between text-[11px]">
       <span class="text-gray-500 mono">${escapeHTML(r.source_name || '')}</span>
-      <a href="${r.source_url || '#'}" target="_blank" rel="noopener" class="text-policy hover:underline">Source →</a>
+      <a href="${escapeHTML(r.source_url || '#')}" target="_blank" rel="noopener" class="text-policy hover:underline">Source →</a>
     </div>
   </div>`
 }
 
-// =====================================================================
-// COMPETITOR
-// =====================================================================
-let _competitorLoaded = false
-async function ensureCompetitorLoaded() {
-  if (_competitorLoaded) return
-  _competitorLoaded = true
-  loadDiffTimeline()
-  await chartPricingRace()
-  await loadFeatureMatrix()
-  await loadCompetitorEvents()
-}
-function loadDiffTimeline() {
-  const el = $('#diff-timeline'); if (!el) return
-  const markers = [
-    { x: 5,  c: '#f97316' }, { x: 18, c: '#f97316' }, { x: 32, c: '#f97316' },
-    { x: 51, c: '#ec4899' }, { x: 68, c: '#f97316' }, { x: 79, c: '#f97316' }, { x: 93, c: '#06b6d4' },
-  ]
-  el.innerHTML = `<div class="absolute inset-0 flex items-center px-2"><div class="w-full h-px bg-ink-600"></div></div>${markers.map(m => `<div class="absolute top-1/2 -translate-y-1/2" style="left:${m.x}%"><div class="w-3 h-3 rounded-full" style="background:${m.c};box-shadow:0 0 0 3px rgba(255,255,255,0.04),0 0 10px ${m.c}"></div></div>`).join('')}<div class="absolute bottom-1 left-2 text-[10px] mono text-gray-500">7 days ago</div><div class="absolute bottom-1 right-2 text-[10px] mono text-policy">now</div>`
-}
-async function loadFeatureMatrix() {
-  try {
-    const { competitors, features } = await SCOUTT.fetch('/api/charts/feature-matrix')
-    const el = $('#feature-matrix'); if (!el) return
-    el.innerHTML = `<table class="w-full text-sm"><thead><tr class="text-[10px] mono uppercase text-gray-500 border-b border-ink-700"><th class="text-left py-2 px-3 font-normal">Feature</th>${competitors.map((c, i) => `<th class="py-2 px-3 font-normal ${i === 0 ? 'text-policy' : ''}">${escapeHTML(c)}</th>`).join('')}</tr></thead><tbody>${features.map(f => `<tr class="border-b border-ink-700/40 hover:bg-ink-800/30"><td class="py-2.5 px-3">${escapeHTML(f.name)}</td>${f.values.map((v, j) => `<td class="py-2.5 px-3 text-center ${j === 0 ? 'bg-policy/5' : ''}">${v ? '<i class="fa-solid fa-check text-emerald-400"></i>' : '<i class="fa-solid fa-xmark text-gray-600"></i>'}</td>`).join('')}</tr>`).join('')}</tbody></table>`
-  } catch (e) { console.warn('matrix fail', e) }
-}
-async function loadCompetitorEvents() {
-  try {
-    const events = await SCOUTT.fetch('/api/competitor/events')
-    const el = $('#competitor-events'); if (!el) return
-    el.innerHTML = events.length ? events.map(e => `
+/* ═════════════════════ COMPETITOR ════════════════════════════ */
+function renderCompetitor(p) {
+  const dt = $('#diff-timeline')
+  if (dt) {
+    const arr = p.competitor?.diff_timeline || []
+    const colorOf = { pricing: '#f97316', product: '#06b6d4', hiring: '#ec4899' }
+    const N = Math.max(1, arr.length - 1)
+    dt.innerHTML = `<div class="absolute inset-0 flex items-center px-2"><div class="w-full h-px bg-ink-600"></div></div>
+      ${arr.map((m, i) => {
+        const x = (i / N) * 96 + 2
+        const c = colorOf[m.kind] || '#06b6d4'
+        return `<div class="absolute top-1/2 -translate-y-1/2" style="left:${x}%"><div class="w-3 h-3 rounded-full" style="background:${c};box-shadow:0 0 0 3px rgba(255,255,255,0.04),0 0 10px ${c}"></div></div>`
+      }).join('')}
+      <div class="absolute bottom-1 left-2 text-[10px] mono text-gray-500">7 days ago</div>
+      <div class="absolute bottom-1 right-2 text-[10px] mono text-policy">now</div>`
+  }
+
+  const d = p.competitor?.pricing_diff
+  if (d) {
+    const t1 = $('#diff-title'); if (t1) t1.textContent = `Pricing Diff — ${d.url}`
+    const b1 = $('#diff-before-time'); if (b1) b1.textContent = d.before_ts || '--'
+    const a1 = $('#diff-after-time');  if (a1) a1.textContent = d.after_ts  || '--'
+    const before = $('#diff-before'), after = $('#diff-after')
+    if (before) before.innerHTML = (d.before_lines || []).map(l => l.startsWith('-')
+      ? `<div class="bg-red-500/15 text-red-400 px-2 py-1 rounded">${escapeHTML(l)}</div>`
+      : `<div>${escapeHTML(l)}</div>`).join('')
+    if (after) after.innerHTML = (d.after_lines || []).map(l => l.startsWith('+')
+      ? `<div class="bg-emerald-500/15 text-emerald-400 px-2 py-1 rounded">${escapeHTML(l)}</div>`
+      : `<div>${escapeHTML(l)}</div>`).join('')
+    const fee = $('#diff-fee-pct'); if (fee) fee.textContent = `${d.fee_change_pct > 0 ? '+' : ''}${d.fee_change_pct}% fee`
+    const th = $('#diff-threat'); if (th) th.textContent = String(d.threat_level)
+  }
+
+  const ctx = $('#chart-pricing-race')
+  if (ctx) {
+    if (STATE.charts.pr) STATE.charts.pr.destroy()
+    const data = p.competitor?.pricing_race_30d || []
+    STATE.charts.pr = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: data.map(d => (d.date || '').slice(5)),
+        datasets: [
+          { label: 'You',      data: data.map(d => d.you),      borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.1)', tension: 0.3, pointRadius: 0, borderWidth: 2 },
+          { label: 'Stripe',   data: data.map(d => d.stripe),   borderColor: '#f97316', tension: 0, pointRadius: 0, borderWidth: 2, stepped: true },
+          { label: 'Adyen',    data: data.map(d => d.adyen),    borderColor: '#06b6d4', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+          { label: 'Checkout', data: data.map(d => d.checkout), borderColor: '#ec4899', tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { labels: { color: '#a1a8bd', font: { size: 10 } } } },
+        scales: {
+          x: { ticks: { color: '#3a4055', font: { size: 9 } }, grid: { display: false } },
+          y: { ticks: { color: '#3a4055', font: { size: 9 }, callback: v => '$' + (+v).toFixed(2) }, grid: { color: 'rgba(58,64,85,0.15)' } },
+        },
+      },
+    })
+  }
+
+  const fm = p.competitor?.feature_matrix
+  const fmEl = $('#feature-matrix')
+  if (fmEl && fm) {
+    fmEl.innerHTML = `<table class="w-full text-sm"><thead><tr class="text-[10px] mono uppercase text-gray-500 border-b border-ink-700"><th class="text-left py-2 px-3 font-normal">Feature</th>${fm.competitors.map((c, i) => `<th class="py-2 px-3 font-normal ${i === 0 ? 'text-policy' : ''}">${escapeHTML(c)}</th>`).join('')}</tr></thead>
+      <tbody>${fm.features.map(f => `<tr class="border-b border-ink-700/40 hover:bg-ink-800/30"><td class="py-2.5 px-3">${escapeHTML(f.name)}</td>${f.values.map((v, j) => `<td class="py-2.5 px-3 text-center ${j === 0 ? 'bg-policy/5' : ''}">${v ? '<i class="fa-solid fa-check text-emerald-400"></i>' : '<i class="fa-solid fa-xmark text-gray-600"></i>'}</td>`).join('')}</tr>`).join('')}</tbody></table>`
+  }
+
+  const ce = $('#competitor-events')
+  if (ce) {
+    const events = p.competitor?.events || []
+    ce.innerHTML = events.length ? events.map(e => `
       <div class="card step-card p-4">
         <div class="flex items-center gap-2 text-[10px] mono uppercase text-competitor mb-2"><i class="fa-solid fa-chess-knight"></i> ${escapeHTML((e.tags && e.tags[0]) || 'competitor')}</div>
         <h4 class="font-semibold text-sm mb-1">${escapeHTML(e.title)}</h4>
         <p class="text-xs text-gray-400 mb-3">${escapeHTML(e.summary || '')}</p>
         <div class="flex items-center justify-between text-[11px] mono text-gray-500">
           <span>sev ${e.severity}</span>
-          <a href="${e.source_url || '#'}" target="_blank" rel="noopener" class="text-policy hover:underline">Source →</a>
+          <a href="${escapeHTML(e.source_url || '#')}" target="_blank" rel="noopener" class="text-policy hover:underline">Source →</a>
         </div>
       </div>`).join('') : '<div class="col-span-full text-sm text-gray-500">No events.</div>'
-  } catch (e) { console.warn('comp events fail', e) }
+  }
 }
 
-// =====================================================================
-// SENTIMENT
-// =====================================================================
-let _sentimentLoaded = false
-async function ensureSentimentLoaded() {
-  if (_sentimentLoaded) return
-  _sentimentLoaded = true
-  await loadBubbles()
-  chartDiverging()
-  await loadWordCloud()
-  renderQuote()
-  await loadSentimentEvents()
-}
-async function loadBubbles() {
-  try {
-    const el = $('#bubble-chart'); if (!el) return
-    const data = await SCOUTT.fetch('/api/charts/topic-bubbles')
-    const W = el.clientWidth || 700, H = 420
-    el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="w-full h-full">${data.map((b, i) => {
-      const r = 18 + (b.mentions / 240) * 38
-      const angle = (i / data.length) * Math.PI * 2
-      const cx = W / 2 + Math.cos(angle) * (Math.min(W, H) / 3.5)
-      const cy = H / 2 + Math.sin(angle) * (Math.min(W, H) / 3.5)
-      const c = b.sentiment > 0.2 ? '#10b981' : b.sentiment < -0.2 ? '#ec4899' : '#a1a8bd'
-      return `<g><circle cx="${cx}" cy="${cy}" r="${r}" fill="${c}" fill-opacity="0.22" stroke="${c}" stroke-width="1.5" /><text x="${cx}" y="${cy + 4}" fill="#e7eaf3" font-size="11" font-family="Inter" text-anchor="middle">${escapeHTML(b.topic.slice(0, 18))}</text></g>`
-    }).join('')}</svg>`
-  } catch (e) { console.warn('bubbles fail', e) }
-}
-function chartDiverging() {
-  const ctx = $('#chart-diverging'); if (!ctx) return
-  if (CHART_REGISTRY.dv) CHART_REGISTRY.dv.destroy()
-  const labels = ['You', 'Stripe', 'Adyen', 'Checkout']
-  const vals = [+24, -8, +6, -14]
-  CHART_REGISTRY.dv = new Chart(ctx, {
-    type: 'bar',
-    data: { labels, datasets: [{ data: vals, backgroundColor: vals.map(v => v > 0 ? '#10b981' : '#ec4899'), borderRadius: 4 }] },
-    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#3a4055', font: { size: 10 } }, grid: { color: 'rgba(58,64,85,0.2)' }, min: -30, max: 30 }, y: { ticks: { color: '#a1a8bd', font: { size: 11 } }, grid: { display: false } } } },
-  })
-}
-async function loadWordCloud() {
-  try {
-    const el = $('#word-cloud'); if (!el) return
-    const words = await SCOUTT.fetch('/api/charts/wordcloud')
+/* ═════════════════════ SENTIMENT ═════════════════════════════ */
+function renderSentiment(p) {
+  // Topic cluster with collision detection
+  const bc = $('#bubble-chart')
+  if (bc) {
+    const data = p.sentiment?.topic_cluster || []
+    const W = bc.clientWidth || 700, H = 420
+    const cx = W / 2, cy = H / 2
+    const maxM = Math.max(...data.map(d => d.mentions), 1)
+    const placed = []
+    data.forEach(b => {
+      const r = 22 + (b.mentions / maxM) * 36
+      let x, y, tries = 0, ok = false
+      while (tries++ < 500) {
+        const ang = Math.random() * Math.PI * 2
+        const dist = Math.random() * (Math.min(W, H) / 2 - r - 12)
+        x = cx + Math.cos(ang) * dist
+        y = cy + Math.sin(ang) * dist
+        if (placed.every(q => Math.hypot(q.x - x, q.y - y) > q.r + r + 6)) { ok = true; break }
+      }
+      placed.push({ x, y, r, b, ok })
+    })
+    bc.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="w-full h-full">
+      ${placed.map(({ x, y, r, b }) => {
+        const c = b.sentiment > 0.2 ? '#10b981' : b.sentiment < -0.2 ? '#ec4899' : '#a1a8bd'
+        // Truncate label to fit inside the circle
+        const maxChars = Math.max(4, Math.floor(r / 4))
+        const label = b.topic.length > maxChars ? b.topic.slice(0, maxChars - 1) + '…' : b.topic
+        const fontSize = Math.max(9, Math.min(13, r / 4))
+        return `<g>
+          <circle cx="${x}" cy="${y}" r="${r}" fill="${c}" fill-opacity="0.22" stroke="${c}" stroke-width="1.5"/>
+          <text x="${x}" y="${y + 4}" fill="#e7eaf3" font-size="${fontSize}" font-family="Inter" text-anchor="middle">${escapeHTML(label)}</text>
+        </g>`
+      }).join('')}
+    </svg>`
+  }
+
+  // Diverging bars
+  const div = $('#chart-diverging')
+  if (div) {
+    if (STATE.charts.dv) STATE.charts.dv.destroy()
+    const arr = p.sentiment?.delta_vs_competitors || []
+    STATE.charts.dv = new Chart(div, {
+      type: 'bar',
+      data: {
+        labels: arr.map(d => d.name),
+        datasets: [{
+          data: arr.map(d => d.value),
+          backgroundColor: arr.map(d => d.value > 0 ? '#10b981' : '#ec4899'),
+          borderRadius: 4,
+        }],
+      },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#3a4055', font: { size: 10 } }, grid: { color: 'rgba(58,64,85,0.2)' }, min: -30, max: 30 },
+          y: { ticks: { color: '#a1a8bd', font: { size: 11 } }, grid: { display: false } },
+        },
+      },
+    })
+  }
+
+  // Word cloud
+  const wc = $('#word-cloud')
+  if (wc) {
+    const words = p.sentiment?.word_cloud || []
     const palette = ['#06b6d4', '#f97316', '#ec4899', '#10b981', '#a1a8bd']
-    el.innerHTML = words.map((w, i) => {
-      const size = 12 + (w.value / 90) * 28
+    const maxV = Math.max(...words.map(w => w.value), 1)
+    wc.innerHTML = words.map((w, i) => {
+      const size = 12 + (w.value / maxV) * 26
       const c = palette[i % palette.length]
       return `<span class="inline-block font-semibold hover:scale-110 transition" style="font-size:${size}px;color:${c}">${escapeHTML(w.text)}</span>`
     }).join('')
-  } catch (e) { console.warn('wc fail', e) }
-}
-const QUOTES = [
-  { text: 'Switched our ACH from Stripe to a competitor after the silent fee hike. $14k a year saved.', src: 'Reddit r/fintech', stars: '★★★★★' },
-  { text: 'Fraud false-positives blocking 8% of real transactions. Support is the worst part.', src: 'G2 Crowd', stars: '★★☆☆☆' },
-  { text: 'Instant KYC is the killer feature. We onboarded a marketplace in 4 hours.', src: 'Product Hunt', stars: '★★★★★' },
-  { text: 'Pricing transparency on their site changed overnight without notice. Not great.', src: 'Trustpilot', stars: '★★☆☆☆' },
-  { text: 'Adyen Embedded Finance just dropped. Clean docs but priced for $100M+ companies.', src: 'Hacker News', stars: '★★★★☆' },
-]
-let qi = 0
-function renderQuote() {
-  const el = $('#quotes-carousel'); if (!el) return
-  const q = QUOTES[qi]
-  el.innerHTML = `<div class="w-full slide-up"><div class="text-sentiment text-2xl mono mb-2">"</div><p class="text-base leading-relaxed mb-3">${escapeHTML(q.text)}</p><div class="flex items-center justify-between text-xs text-gray-500"><span class="mono">${escapeHTML(q.src)}</span><span class="text-yellow-400">${q.stars}</span></div></div>`
-  const c = $('#quote-counter'); if (c) c.textContent = `${qi + 1} / ${QUOTES.length}`
-}
-async function loadSentimentEvents() {
-  try {
-    const events = await SCOUTT.fetch('/api/sentiment/events')
-    const el = $('#sentiment-events-feed'); if (!el) return
-    el.innerHTML = events.length ? events.map(e => `
+  }
+
+  STATE.quoteIdx = 0
+  renderQuote(p)
+
+  const sef = $('#sentiment-events-feed')
+  if (sef) {
+    const events = p.sentiment?.events || []
+    sef.innerHTML = events.length ? events.map(e => `
       <div class="card step-card p-4">
         <div class="flex items-center gap-2 text-[10px] mono uppercase text-sentiment mb-2"><i class="fa-solid fa-wave-square"></i> sentiment</div>
         <h4 class="font-semibold text-sm mb-1">${escapeHTML(e.title)}</h4>
         <p class="text-xs text-gray-400 mb-3">${escapeHTML(e.summary || '')}</p>
         <div class="flex items-center justify-between text-[11px] mono text-gray-500">
           <span>sev ${e.severity}</span>
-          <a href="${e.source_url || '#'}" target="_blank" rel="noopener" class="text-policy hover:underline">Source →</a>
+          <a href="${escapeHTML(e.source_url || '#')}" target="_blank" rel="noopener" class="text-policy hover:underline">Source →</a>
         </div>
       </div>`).join('') : '<div class="col-span-full text-sm text-gray-500">No sentiment events.</div>'
-  } catch (e) { console.warn('sent events fail', e) }
+  }
+}
+function renderQuote(p) {
+  const el = $('#quotes-carousel'); if (!el) return
+  const quotes = (p || STATE.payload)?.sentiment?.quotes || []
+  if (!quotes.length) { el.innerHTML = '<div class="text-sm text-gray-500">No quotes.</div>'; const c = $('#quote-counter'); if (c) c.textContent = '0 / 0'; return }
+  const q = quotes[STATE.quoteIdx % quotes.length]
+  el.innerHTML = `<div class="w-full slide-up">
+    <div class="text-sentiment text-2xl mono mb-2">"</div>
+    <p class="text-base leading-relaxed mb-3">${escapeHTML(q.text)}</p>
+    <div class="flex items-center justify-between text-xs text-gray-500">
+      <span class="mono">${escapeHTML(q.src)}</span>
+      <span class="text-yellow-400">${escapeHTML(q.stars || '★★★★★')}</span>
+    </div></div>`
+  const c = $('#quote-counter'); if (c) c.textContent = `${(STATE.quoteIdx % quotes.length) + 1} / ${quotes.length}`
 }
 
-// =====================================================================
-// ARCHETYPE
-// =====================================================================
-let _archetypeLoaded = false
-function ensureArchetypeLoaded() { if (_archetypeLoaded) return; _archetypeLoaded = true; chartRadar() }
-function chartRadar() {
+/* ═════════════════════ ARCHETYPE ═════════════════════════════ */
+function renderArchetype(p) {
+  const a = p.archetype || {}
   const ctx = $('#chart-radar'); if (!ctx) return
-  if (CHART_REGISTRY.rd) CHART_REGISTRY.rd.destroy()
-  CHART_REGISTRY.rd = new Chart(ctx, {
+  if (STATE.charts.rd) STATE.charts.rd.destroy()
+  const ind = $('#archetype-industry'); if (ind) ind.textContent = a.industry || '--'
+  const hi = $('#archetype-higher');    if (hi)  hi.textContent  = (a.higher  || []).join(', ') || '--'
+  const lo = $('#archetype-lower');     if (lo)  lo.textContent  = (a.lower   || []).join(', ') || '--'
+  const ne = $('#archetype-neutral');   if (ne)  ne.textContent  = (a.neutral || []).join(', ') || '--'
+  STATE.charts.rd = new Chart(ctx, {
     type: 'radar',
     data: {
-      labels: ['Compliance', 'Pricing', 'Onboarding', 'Sentiment', 'Embedded Finance', 'Innovation Speed'],
+      labels: a.axes || [],
       datasets: [
-        { label: 'You', data: [88, 72, 95, 70, 45, 80], borderColor: '#06b6d4', backgroundColor: 'rgba(6,182,212,0.15)', pointBackgroundColor: '#06b6d4' },
-        { label: 'Industry baseline', data: [65, 75, 60, 68, 78, 65], borderColor: '#f97316', backgroundColor: 'rgba(249,115,22,0.10)', pointBackgroundColor: '#f97316' },
+        { label: 'You',               data: a.you      || [], borderColor: '#06b6d4', backgroundColor: 'rgba(6,182,212,0.15)', pointBackgroundColor: '#06b6d4' },
+        { label: 'Industry baseline', data: a.baseline || [], borderColor: '#f97316', backgroundColor: 'rgba(249,115,22,0.10)', pointBackgroundColor: '#f97316' },
       ],
     },
-    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#a1a8bd', font: { size: 11 } } } }, scales: { r: { angleLines: { color: 'rgba(58,64,85,0.4)' }, grid: { color: 'rgba(58,64,85,0.3)' }, pointLabels: { color: '#a1a8bd', font: { size: 10 } }, ticks: { color: '#3a4055', backdropColor: 'transparent', font: { size: 9 } }, suggestedMin: 0, suggestedMax: 100 } } },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#a1a8bd', font: { size: 11 } } } },
+      scales: {
+        r: {
+          angleLines: { color: 'rgba(58,64,85,0.4)' }, grid: { color: 'rgba(58,64,85,0.3)' },
+          pointLabels: { color: '#a1a8bd', font: { size: 10 } },
+          ticks: { color: '#3a4055', backdropColor: 'transparent', font: { size: 9 } },
+          suggestedMin: 0, suggestedMax: 100,
+        },
+      },
+    },
   })
 }
 
-// =====================================================================
-// GLOBAL SEARCH (⌘K) — categorized + debounced + ask-fallback
-// =====================================================================
-let SEARCH_DEBOUNCE = null
-async function refreshSearchIndex() {
+/* ═════════════════════ SCENARIO ══════════════════════════════ */
+async function runScenario() {
+  const input = $('#scenario-input'); const scenario = input?.value.trim(); if (!scenario) return
+  const btn = $('#scenario-run'); const err = $('#scenario-error'); const result = $('#scenario-result')
+  if (!btn) return
+  btn.disabled = true
+  btn.innerHTML = '<div class="w-4 h-4 border-2 border-ink-950 border-t-transparent rounded-full animate-spin"></div> Re-running…'
+  if (err) err.classList.add('hidden')
+  if (result) result.classList.add('hidden')
+
+  // Make sure the payload is cached server-side first so /api/scenario returns fast.
+  if (SCOUTT.hasKey && (!STATE.payload || STATE.payload.source !== 'anakin-live')) {
+    try { await fetchPayload(STATE.day) } catch {}
+  }
+
   try {
-    const { index } = await SCOUTT.fetch('/api/search-index')
-    GLOBAL_INDEX = index || []
-  } catch { GLOBAL_INDEX = [] }
-}
-function debounce(fn, wait) {
-  return (...args) => { clearTimeout(SEARCH_DEBOUNCE); SEARCH_DEBOUNCE = setTimeout(() => fn(...args), wait) }
-}
-const SECTION_ICON = {
-  'Policy Radar':      'fa-scale-balanced text-policy',
-  'Competitor Pulse':  'fa-chess-knight text-competitor',
-  'Sentiment Storm':   'fa-wave-square text-sentiment',
-  "Today's Actions":   'fa-list-check text-action',
-  'Overnight Brief':   'fa-sun text-policy',
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 25_000)
+    const res = await fetch('/api/scenario', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...SCOUTT.headers() },
+      body: JSON.stringify({ scenario }), signal: ctrl.signal,
+    })
+    clearTimeout(timer)
+    if (!res.ok) throw new Error('scenario ' + res.status)
+    const data = await res.json()
+    if (result) result.classList.remove('hidden')
+    const set = (id, v) => { const el = $(id); if (el) el.textContent = v }
+    set('#s-before',  data.threat_level_before)
+    set('#s-after',   data.threat_level_after)
+    set('#s-threats', '+' + (data.delta_threats || 0))
+    set('#s-actions', '+' + (data.delta_actions || 0))
+    const n = $('#s-narrative'); if (n) n.textContent = data.narrative || ''
+    const ev = $('#s-events')
+    if (ev) ev.innerHTML = (data.impacted_events || []).map(e => `
+      <div class="card p-3 flex items-start gap-3">
+        <i class="fa-solid fa-arrow-trend-up text-action mt-1"></i>
+        <div class="flex-1">
+          <div class="text-sm font-medium">${escapeHTML(e.title)}</div>
+          <div class="text-xs text-gray-500">sev ${e.severity} • ${escapeHTML(e.pillar)}</div>
+        </div>
+      </div>`).join('')
+  } catch (e) {
+    if (err) {
+      err.classList.remove('hidden')
+      err.innerHTML = `<i class="fa-solid fa-triangle-exclamation mr-2"></i>Scenario failed: ${escapeHTML(e.message || String(e))}.
+        ${SCOUTT.hasKey ? 'Live briefing may still be generating — try again in ~10 seconds.' : 'Please retry.'}`
+    } else {
+      showToast('Scenario failed: ' + e.message, 'error')
+    }
+  } finally {
+    btn.disabled = false
+    btn.innerHTML = '<i class="fa-solid fa-play"></i> Run scenario'
+  }
 }
 
+/* ═════════════════════ MODALS ════════════════════════════════ */
+function openBriefModal() {
+  const m = $('#brief-modal'); if (!m) return
+  m.classList.remove('hidden')
+  const b = STATE.payload?.briefing
+  const title = $('#brief-modal-title'); if (title) title.textContent = b?.headline || 'Daily briefing'
+  const events  = b?.events  || []
+  const actions = b?.actions || []
+  $('#brief-modal-body').innerHTML = `
+    <div class="flex items-center gap-3 text-xs">
+      <span class="px-2 py-1 rounded bg-policy/15 text-policy border border-policy/40 mono">Threat ${b?.threat_level ?? '--'}/100</span>
+      <span class="text-gray-500">${events.length} events • ${actions.length} actions</span>
+      <span class="ml-auto text-[10px] mono text-gray-500 uppercase">${STATE.payload?.source || 'demo'}</span>
+    </div>
+    <div><h4 class="font-semibold text-base mb-2">Overnight events</h4>
+      <ul class="space-y-2">${events.slice(0, 12).map(e => `
+        <li class="border-l-2 pl-3 ${e.pillar === 'policy' ? 'border-policy' : e.pillar === 'competitor' ? 'border-competitor' : 'border-sentiment'}">
+          <div class="text-sm font-medium">${escapeHTML(e.title)}</div>
+          <div class="text-xs text-gray-400 mt-0.5">${escapeHTML(e.summary || '')}</div>
+          <div class="text-[10px] mono text-gray-500 mt-1">sev ${e.severity} • <a href="${escapeHTML(e.source_url || '#')}" target="_blank" rel="noopener" class="text-policy hover:underline">source ↗</a></div>
+        </li>`).join('')}
+      </ul></div>
+    <div><h4 class="font-semibold text-base mb-2">Today's 3 actions</h4>
+      <ol class="space-y-2 list-decimal list-inside">${actions.map(a => `
+        <li><span class="font-medium">${escapeHTML(a.title)}</span>
+          <div class="text-xs text-gray-400 ml-5">${escapeHTML(a.why_now || '')}</div></li>`).join('')}
+      </ol></div>`
+}
+function closeBriefModal() { $('#brief-modal')?.classList.add('hidden') }
+
+/* ═════════════════════ ASK SCOUTT (⌘K) ═══════════════════════ */
+let SEARCH_DEBOUNCE = null
+function debounce(fn, w) { return (...a) => { clearTimeout(SEARCH_DEBOUNCE); SEARCH_DEBOUNCE = setTimeout(() => fn(...a), w) } }
+async function refreshSearchIndex() {
+  try { const { index } = await SCOUTT.fetch('/api/search-index'); GLOBAL_INDEX = index || [] }
+  catch { GLOBAL_INDEX = [] }
+}
+const SECTION_ICON = {
+  'Policy Radar': 'fa-scale-balanced text-policy',
+  'Competitor Pulse': 'fa-chess-knight text-competitor',
+  'Sentiment Storm': 'fa-wave-square text-sentiment',
+  "Today's Actions": 'fa-list-check text-action',
+  'Overnight Brief': 'fa-sun text-policy',
+}
 function renderSearchResults(q) {
   const results = $('#cmdk-results'); const sugg = $('#cmdk-suggestions'); const out = $('#cmdk-output')
   if (!results || !sugg || !out) return
@@ -560,8 +805,7 @@ function renderSearchResults(q) {
   const matches = GLOBAL_INDEX.filter(it =>
     (it.title || '').toLowerCase().includes(needle) ||
     (it.subtitle || '').toLowerCase().includes(needle) ||
-    (it.section || '').toLowerCase().includes(needle),
-  )
+    (it.section || '').toLowerCase().includes(needle))
   const grouped = matches.reduce((m, r) => { (m[r.section] = m[r.section] || []).push(r); return m }, {})
   const order = ['Overnight Brief', 'Policy Radar', 'Competitor Pulse', 'Sentiment Storm', "Today's Actions"]
   let html = ''
@@ -569,7 +813,7 @@ function renderSearchResults(q) {
     const arr = grouped[sec]; if (!arr || !arr.length) return
     html += `<div class="px-4 py-2 text-[10px] mono uppercase tracking-widest text-gray-500 bg-ink-900 border-y border-ink-700">Found in ${escapeHTML(sec)} (${arr.length})</div>`
     html += arr.slice(0, 6).map(r => `
-      <button type="button" data-tab="${r.tab}" data-url="${r.url || ''}" class="search-hit w-full text-left px-4 py-3 hover:bg-ink-700 flex items-start gap-3 border-b border-ink-800 cursor-pointer">
+      <button type="button" data-tab="${r.tab}" data-url="${escapeHTML(r.url || '')}" class="search-hit w-full text-left px-4 py-3 hover:bg-ink-700 flex items-start gap-3 border-b border-ink-800 cursor-pointer">
         <i class="fa-solid ${SECTION_ICON[sec] || 'fa-circle text-gray-500'} mt-1 text-xs"></i>
         <div class="flex-1 min-w-0">
           <div class="text-sm font-medium truncate">${escapeHTML(r.title)}</div>
@@ -578,36 +822,25 @@ function renderSearchResults(q) {
         <span class="mono text-[10px] text-gray-500 shrink-0">sev ${r.severity ?? '–'}</span>
       </button>`).join('')
   })
-  if (!matches.length) {
+  if (!matches.length)
     html = `<div class="px-4 py-6 text-center text-sm text-gray-500">No matches in dashboard data.</div>
-      <button id="cmdk-ask-instead" type="button" class="w-full text-left px-4 py-3 bg-policy/10 hover:bg-policy/20 border-t border-policy/30 text-sm cursor-pointer">
-        <i class="fa-solid fa-sparkles text-policy mr-2"></i> Ask SCOUTT: "<strong>${escapeHTML(q)}</strong>"
-      </button>`
-  } else {
+            <button id="cmdk-ask-instead" type="button" class="w-full text-left px-4 py-3 bg-policy/10 hover:bg-policy/20 border-t border-policy/30 text-sm cursor-pointer">
+              <i class="fa-solid fa-sparkles text-policy mr-2"></i> Ask SCOUTT: "<strong>${escapeHTML(q)}</strong>"
+            </button>`
+  else
     html += `<button id="cmdk-ask-instead" type="button" class="w-full text-left px-4 py-3 bg-policy/5 hover:bg-policy/15 border-t border-ink-700 text-sm cursor-pointer">
-        <i class="fa-solid fa-sparkles text-policy mr-2"></i> Or ask SCOUTT: "<strong>${escapeHTML(q)}</strong>"
-      </button>`
-  }
+              <i class="fa-solid fa-sparkles text-policy mr-2"></i> Or ask SCOUTT: "<strong>${escapeHTML(q)}</strong>"
+            </button>`
   results.innerHTML = html
-
-  $$('.search-hit').forEach(b => b.addEventListener('click', () => {
-    const tab = b.dataset.tab
-    closeCmdk()
-    if (tab) activateTab(tab)
-  }))
+  $$('.search-hit').forEach(b => b.addEventListener('click', () => { closeCmdk(); if (b.dataset.tab) activateTab(b.dataset.tab) }))
   $('#cmdk-ask-instead')?.addEventListener('click', () => { $('#cmdk-input').value = q; askIt() })
 }
-
-function openCmdk() {
-  $('#cmdk')?.classList.remove('hidden')
-  setTimeout(() => $('#cmdk-input')?.focus(), 50)
-}
+function openCmdk() { $('#cmdk')?.classList.remove('hidden'); setTimeout(() => $('#cmdk-input')?.focus(), 50) }
 function closeCmdk() {
   $('#cmdk')?.classList.add('hidden')
   const inp = $('#cmdk-input'); if (inp) inp.value = ''
   $('#cmdk-output')?.classList.add('hidden'); $('#cmdk-results')?.classList.add('hidden'); $('#cmdk-suggestions')?.classList.remove('hidden')
 }
-
 async function askIt() {
   const q = $('#cmdk-input')?.value.trim(); if (!q) return
   const sugg = $('#cmdk-suggestions'); const results = $('#cmdk-results'); const out = $('#cmdk-output')
@@ -617,7 +850,7 @@ async function askIt() {
     const data = await SCOUTT.post('/api/ask', { question: q })
     out.innerHTML = `<div class="text-sm leading-relaxed">${linkifyCitations(data.answer)}</div>
       <div class="mt-4 border-t border-ink-700 pt-3"><div class="text-[10px] mono uppercase text-gray-500 mb-2">Citations</div>
-      <div class="flex flex-wrap gap-1.5">${(data.citations || []).map(c => `<button type="button" data-url="${c.url}" class="citation-chip text-[11px] mono px-2 py-1 rounded border border-${c.pillar === 'policy' ? 'policy' : c.pillar === 'competitor' ? 'competitor' : 'sentiment'}/50 text-${c.pillar === 'policy' ? 'policy' : c.pillar === 'competitor' ? 'competitor' : 'sentiment'} hover:bg-ink-700 cursor-pointer">${c.ref} ${escapeHTML(c.title.slice(0, 50))}</button>`).join('')}</div></div>
+      <div class="flex flex-wrap gap-1.5">${(data.citations || []).map(c => `<button type="button" data-url="${escapeHTML(c.url)}" class="citation-chip text-[11px] mono px-2 py-1 rounded border border-${c.pillar === 'policy' ? 'policy' : c.pillar === 'competitor' ? 'competitor' : 'sentiment'}/50 text-${c.pillar === 'policy' ? 'policy' : c.pillar === 'competitor' ? 'competitor' : 'sentiment'} hover:bg-ink-700 cursor-pointer">${c.ref} ${escapeHTML((c.title || '').slice(0, 50))}</button>`).join('')}</div></div>
       <div class="text-[10px] mono text-gray-600 mt-3">model: ${escapeHTML(data.model || '')}</div>`
     $$('.citation-chip').forEach(b => b.addEventListener('click', () => window.open(b.dataset.url, '_blank')))
   } catch (e) {
@@ -626,25 +859,19 @@ async function askIt() {
 }
 function linkifyCitations(s) { return (s || '').replace(/\[(\d+)\]/g, '<sup class="text-policy mono">[$1]</sup>') }
 
-// =====================================================================
-// TRANSPARENCY DRAWER
-// =====================================================================
+/* ═════════════════════ TRANSPARENCY ══════════════════════════ */
 function closeDrawer() { $('#transparency-drawer')?.classList.remove('open'); $('#transparency-backdrop')?.classList.add('hidden') }
 function renderTransparency(d) {
   const section = (t, b) => `<section><h3 class="font-semibold text-sm mb-2 flex items-center gap-2"><span class="w-1 h-4 bg-policy"></span> ${t}</h3>${b}</section>`
   const code = (s, max = 4000) => `<pre class="code">${escapeHTML((typeof s === 'string' ? s : JSON.stringify(s, null, 2)).slice(0, max))}</pre>`
-  return `${section('1. Daily Battle Brief — Anakin call', `<p class="text-gray-400 mb-2">${escapeHTML(d.daily_briefing.endpoint)}</p><div class="text-[10px] mono uppercase text-gray-500 mb-1">System prompt</div>${code(d.daily_briefing.system_prompt)}<div class="text-[10px] mono uppercase text-gray-500 mb-1 mt-3">Templated user prompt</div>${code(d.daily_briefing.user_prompt)}<div class="text-[10px] mono uppercase text-gray-500 mb-1 mt-3">Custom JSON schema</div>${code(d.daily_briefing.json_schema)}`)}
+  return `${section('1. Daily Battle Brief — Anakin call', `<p class="text-gray-400 mb-2">${escapeHTML(d.daily_briefing.endpoint)}</p>${code(d.daily_briefing.system_prompt)}<div class="text-[10px] mono uppercase text-gray-500 mb-1 mt-3">User prompt</div>${code(d.daily_briefing.user_prompt)}<div class="text-[10px] mono uppercase text-gray-500 mb-1 mt-3">Custom JSON schema</div>${code(d.daily_briefing.json_schema)}`)}
   ${section('2. Hourly competitor scraper', `<p class="text-gray-400 mb-2">${escapeHTML(d.competitor_scraper.endpoint)}</p>${code(d.competitor_scraper.prompt)}`)}
   ${section('3. Ask SCOUTT', `<p class="text-gray-400 mb-2">${escapeHTML(d.ask_realitypulse.endpoint)}</p>${code(d.ask_realitypulse.prompt_template)}`)}
   ${section('4. Raw response sample', code(d.raw_response_sample, 6000))}`
 }
 
-// =====================================================================
-// ELEVENLABS TTS  (with loader + browser fallback)
-// Reference: https://elevenlabs.io/docs/eleven-api/guides/cookbooks/text-to-speech
-// =====================================================================
-let _audioBusy = false
-let _audioObjUrl = null
+/* ═════════════════════ TTS ═══════════════════════════════════ */
+let _audioBusy = false; let _audioObjUrl = null
 function setListenLoading(loading) {
   const icon = $('#play-audio-icon'); const label = $('#play-audio-label'); const btn = $('#play-audio')
   if (!icon || !label || !btn) return
@@ -658,15 +885,11 @@ function setListenLoading(loading) {
     label.textContent = 'Listen'
   }
 }
-
 async function playBriefAudio() {
-  if (_audioBusy) return
-  _audioBusy = true
-  const brief = STATE.briefing || await loadBriefing()
-  const text = brief
-    ? `Good morning. Threat level ${brief.threat_level}. ${brief.headline || ''} ${(brief.events || []).slice(0, 4).map(e => e.title).join('. ')}.`
-    : 'Good morning. No briefing loaded.'
-
+  if (_audioBusy) return; _audioBusy = true
+  const b = STATE.payload?.briefing
+  const text = b ? `Threat level ${b.threat_level}. ${b.headline || ''} ${(b.events || []).slice(0, 4).map(e => e.title).join('. ')}.`
+                 : 'No briefing loaded.'
   const toast = $('#audio-toast'); const sub = $('#audio-toast-sub'); const title = $('#audio-toast-title')
   setListenLoading(true)
   toast?.classList.remove('hidden')
@@ -690,7 +913,6 @@ async function playBriefAudio() {
     await audio.play()
     audio.onended = () => { toast?.classList.add('hidden') }
   } catch (e) {
-    // Fallback to browser SpeechSynthesis when proxy fails (e.g. no ELEVENLABS_API_KEY)
     if (sub) sub.textContent = 'Browser TTS fallback'
     setListenLoading(false)
     if (window.speechSynthesis) {
@@ -701,21 +923,29 @@ async function playBriefAudio() {
       if (title) title.textContent = 'TTS unavailable'
       setTimeout(() => toast?.classList.add('hidden'), 2500)
     }
-  } finally {
-    _audioBusy = false
-  }
+  } finally { _audioBusy = false }
 }
 function stopAudio() {
   const audio = $('#audio-el')
   if (audio) { audio.pause(); audio.currentTime = 0 }
   if (window.speechSynthesis) speechSynthesis.cancel()
-  $('#audio-toast')?.classList.add('hidden')
-  setListenLoading(false)
+  $('#audio-toast')?.classList.add('hidden'); setListenLoading(false)
 }
 
-// =====================================================================
-// TIME MACHINE — slider + reset (fixes Issue #d)
-// =====================================================================
+/* ═════════════════════ TABS ══════════════════════════════════ */
+function activateTab(target) {
+  if (!target) return
+  $$('.tab-btn').forEach(b => {
+    if (b.dataset.tab === target) { b.classList.add('tab-active'); b.classList.remove('text-gray-400') }
+    else { b.classList.remove('tab-active'); b.classList.add('text-gray-400') }
+  })
+  $$('.tab-pane').forEach(p => p.classList.add('hidden'))
+  document.querySelector(`[data-pane="${target}"]`)?.classList.remove('hidden')
+  window.dispatchEvent(new Event('resize'))
+}
+
+/* ═════════════════════ TIME MACHINE ══════════════════════════ */
+let TM_DEBOUNCE = null
 function updateTimeMachine(v) {
   const label = $('#time-machine-label'); if (!label) return
   const num = Number(v)
@@ -727,197 +957,136 @@ function updateTimeMachine(v) {
     label.textContent = d.toISOString().slice(0, 10) + ' — cached'
     label.classList.remove('text-policy'); label.classList.add('text-competitor')
   }
+  clearTimeout(TM_DEBOUNCE)
+  TM_DEBOUNCE = setTimeout(async () => {
+    try { const data = await fetchPayload(num); await renderAll(data) }
+    catch (e) { showToast('Time machine load failed: ' + e.message, 'error') }
+  }, 220)
 }
 
-// =====================================================================
-// SCENARIO
-// =====================================================================
-async function runScenario() {
-  const input = $('#scenario-input'); const scenario = input?.value.trim(); if (!scenario) return
-  const btn = $('#scenario-run'); if (!btn) return
-  btn.disabled = true
-  btn.innerHTML = '<div class="w-4 h-4 border-2 border-ink-950 border-t-transparent rounded-full animate-spin"></div> Re-running…'
-  try {
-    const data = await SCOUTT.post('/api/scenario', { scenario })
-    await new Promise(r => setTimeout(r, 400))
-    $('#scenario-result')?.classList.remove('hidden')
-    const set = (id, v) => { const el = $(id); if (el) el.textContent = v }
-    set('#s-before',  data.threat_level_before)
-    set('#s-after',   data.threat_level_after)
-    set('#s-threats', '+' + data.delta_threats)
-    set('#s-actions', '+' + data.delta_actions)
-    const ev = $('#s-events'); if (ev) ev.innerHTML = (data.impacted_events || []).map(e => `<div class="card p-3 flex items-start gap-3"><i class="fa-solid fa-arrow-trend-up text-action mt-1"></i><div class="flex-1"><div class="text-sm font-medium">${escapeHTML(e.title)}</div><div class="text-xs text-gray-500">sev ${e.severity} • ${e.pillar}</div></div></div>`).join('')
-  } catch (e) {
-    showToast('Scenario failed: ' + e.message, 'error')
-  } finally {
-    btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-play"></i> Run scenario'
-  }
+/* ═════════════════════ API-KEY UI ════════════════════════════ */
+function refreshKeyUI() {
+  const label = $('#apikey-label'), icon = $('#apikey-icon')
+  if (!label || !icon) return
+  if (SCOUTT.hasKey) { label.textContent = 'Live • Anakin'; icon.classList.remove('text-policy'); icon.classList.add('text-emerald-400') }
+  else { label.textContent = 'Enter API Key'; icon.classList.add('text-policy'); icon.classList.remove('text-emerald-400') }
+}
+function openKeyModal() {
+  const m = $('#apikey-modal'); if (!m) return
+  m.classList.remove('hidden')
+  const inp = $('#apikey-input'); if (inp) inp.value = SCOUTT.apiKey
+  $('#apikey-status')?.classList.add('hidden')
+  setTimeout(() => $('#apikey-input')?.focus(), 50)
+}
+function closeKeyModal() { $('#apikey-modal')?.classList.add('hidden') }
+function showStatus(msg, ok = true) {
+  const el = $('#apikey-status'); if (!el) return
+  el.classList.remove('hidden')
+  el.className = `mt-3 text-xs ${ok ? 'text-emerald-400' : 'text-red-400'}`
+  el.textContent = msg
 }
 
-// =====================================================================
-// MASTER RELOAD (after key save/clear)
-// =====================================================================
-async function reloadAllPanes() {
-  _policyLoaded = _competitorLoaded = _sentimentLoaded = _archetypeLoaded = false
-  STATE.briefing = null; STATE.timeline = null; STATE.actions = null
-  await loadBriefing(); await loadTimeline(); await loadActions(); await chartSentimentVolume()
-  drawSparklines()
-  await refreshSearchIndex()
-  const active = document.querySelector('.tab-btn.tab-active')?.dataset.tab
-  if (active === 'policy')     ensurePolicyLoaded()
-  if (active === 'competitor') ensureCompetitorLoaded()
-  if (active === 'sentiment')  ensureSentimentLoaded()
-  if (active === 'archetype')  ensureArchetypeLoaded()
-}
-
-// =====================================================================
-// EVENT WIRING  (event delegation = resilient to dynamic content)
-// =====================================================================
+/* ═════════════════════ EVENT WIRING ══════════════════════════ */
 function wireEvents() {
-  // ── Tabs (event delegation guarantees clicks always reach the handler) ──
+  // Tab nav
   document.addEventListener('click', e => {
     const tabBtn = e.target.closest('.tab-btn')
-    if (tabBtn) { e.preventDefault(); activateTab(tabBtn.dataset.tab) }
+    if (tabBtn && tabBtn.dataset.tab) activateTab(tabBtn.dataset.tab)
   })
 
-  // ── API KEY MODAL ──
-  $('#apikey-btn')?.addEventListener('click', openKeyModal)
-  $('#apikey-close')?.addEventListener('click', closeKeyModal)
-  $('#apikey-cancel')?.addEventListener('click', closeKeyModal)
-  $('#apikey-modal')?.addEventListener('click', e => { if (e.target.id === 'apikey-modal') closeKeyModal() })
-  $('#apikey-save')?.addEventListener('click', async () => {
-    const k = $('#apikey-input')?.value.trim()
-    if (!k) { showStatus('Please paste a key first.', false); return }
-    SCOUTT.apiKey = k
-    try { localStorage.setItem('scoutt_anakin_key', k) } catch {}
-    showStatus('✓ Saved. Switching to live mode…', true)
-    refreshKeyUI(); showToast('Live mode active. Regenerating briefing from Anakin…')
-    setTimeout(closeKeyModal, 600)
-    await reloadAllPanes()
-  })
-  $('#apikey-clear')?.addEventListener('click', async () => {
-    SCOUTT.apiKey = ''
-    try { localStorage.removeItem('scoutt_anakin_key') } catch {}
-    showStatus('Cleared — back to demo data.', true); refreshKeyUI()
-    setTimeout(closeKeyModal, 400)
-    await reloadAllPanes()
-  })
-
-  // ── ⌘K  (global keyboard shortcut + focus) ──
+  // ⌘K
   $('#cmdk-trigger')?.addEventListener('click', openCmdk)
   document.addEventListener('keydown', e => {
-    const k = (e.key || '').toLowerCase()
-    if ((e.metaKey || e.ctrlKey) && k === 'k') { e.preventDefault(); openCmdk() }
-    if (e.key === 'Escape') {
-      if (!$('#cmdk')?.classList.contains('hidden'))           closeCmdk()
-      else if (!$('#apikey-modal')?.classList.contains('hidden')) closeKeyModal()
-      else if (!$('#brief-modal')?.classList.contains('hidden')) closeBriefModal()
-    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openCmdk() }
+    if (e.key === 'Escape') { closeCmdk(); closeBriefModal(); closeKeyModal(); closeDrawer() }
   })
-  $('#cmdk')?.addEventListener('click', e => { if (e.target.id === 'cmdk') closeCmdk() })
+  const inp = $('#cmdk-input')
+  inp?.addEventListener('input', debounce(() => renderSearchResults(inp.value), 120))
+  inp?.addEventListener('keydown', e => { if (e.key === 'Enter') askIt() })
   $$('.cmdk-suggestion').forEach(b => b.addEventListener('click', () => {
-    const inp = $('#cmdk-input'); if (!inp) return
-    inp.value = b.textContent.replace(/^→\s*Ask SCOUTT:\s*"|"$/g, '').trim()
-    if (b.classList.contains('ask')) askIt()
-    else renderSearchResults(inp.value)
+    inp.value = b.textContent.replace(/^→ Ask SCOUTT:\s*/, '').replace(/^"/, '').replace(/"$/, '')
+    if (b.classList.contains('ask')) askIt(); else renderSearchResults(inp.value)
   }))
-  $('#cmdk-input')?.addEventListener('input', debounce(e => renderSearchResults(e.target.value), 120))
-  $('#cmdk-input')?.addEventListener('keydown', e => {
-    if (e.key === 'Enter') {
-      const q = $('#cmdk-input')?.value.trim()
-      if (!q) return
-      const hits = $$('.search-hit')
-      if (hits.length === 1) hits[0].click()
-      else askIt()
-    }
-  })
+  $('#cmdk')?.addEventListener('click', e => { if (e.target.id === 'cmdk') closeCmdk() })
 
-  // ── Transparency drawer ──
+  // API key modal
+  $('#apikey-btn')?.addEventListener('click', openKeyModal)
+  $('#apikey-cancel')?.addEventListener('click', closeKeyModal)
+  $('#apikey-close')?.addEventListener('click', closeKeyModal)
+  $('#apikey-clear')?.addEventListener('click', async () => {
+    try { localStorage.removeItem('scoutt_anakin_key') } catch {}
+    SCOUTT.apiKey = ''; refreshKeyUI(); showStatus('Key cleared.', true)
+    try { await SCOUTT.post('/api/dashboard/refresh', {}) } catch {}
+    const data = await fetchPayload(0); await renderAll(data)
+    setTimeout(closeKeyModal, 700)
+  })
+  $('#apikey-save')?.addEventListener('click', async () => {
+    const k = $('#apikey-input')?.value.trim() || ''
+    if (!k) { showStatus('Paste a key first.', false); return }
+    try { localStorage.setItem('scoutt_anakin_key', k) } catch {}
+    SCOUTT.apiKey = k; refreshKeyUI(); showStatus('Key saved. Fetching live data…', true)
+    try { await SCOUTT.post('/api/dashboard/refresh', {}) } catch {}
+    try {
+      const data = await fetchPayload(0); await renderAll(data)
+      if (data.source === 'anakin-live') showStatus('✓ Live data flowing.', true)
+      else if (data.source === 'demo-fallback') showStatus('Live call failed: ' + (data.error || 'unknown'), false)
+      setTimeout(closeKeyModal, 1500)
+    } catch (e) { showStatus('Failed: ' + e.message, false) }
+  })
+  $('#apikey-modal')?.addEventListener('click', e => { if (e.target.id === 'apikey-modal') closeKeyModal() })
+
+  // Transparency
   $('#transparency-trigger')?.addEventListener('click', async () => {
     $('#transparency-backdrop')?.classList.remove('hidden')
     $('#transparency-drawer')?.classList.add('open')
-    const drawer = $('#transparency-drawer')
-    if (drawer && !drawer.dataset.loaded) {
-      try {
-        const data = await SCOUTT.fetch('/api/transparency')
-        $('#transparency-body').innerHTML = renderTransparency(data)
-        drawer.dataset.loaded = '1'
-      } catch (e) {
-        $('#transparency-body').innerHTML = '<p class="text-red-400">Failed to load.</p>'
-      }
+    try {
+      const d = await SCOUTT.fetch('/api/transparency')
+      const body = $('#transparency-body'); if (body) body.innerHTML = renderTransparency(d)
+    } catch (e) {
+      const body = $('#transparency-body'); if (body) body.innerHTML = `<div class="text-red-400">${escapeHTML(e.message)}</div>`
     }
   })
   $('#transparency-close')?.addEventListener('click', closeDrawer)
   $('#transparency-backdrop')?.addEventListener('click', closeDrawer)
 
-  // ── Listen + Read full brief  (fixes Issue #4) ──
-  $('#play-audio')?.addEventListener('click', playBriefAudio)
-  $('#audio-stop')?.addEventListener('click', stopAudio)
+  // Read full brief + audio
   $('#read-full-brief')?.addEventListener('click', openBriefModal)
   $('#brief-modal-close')?.addEventListener('click', closeBriefModal)
   $('#brief-modal')?.addEventListener('click', e => { if (e.target.id === 'brief-modal') closeBriefModal() })
+  $('#play-audio')?.addEventListener('click', playBriefAudio)
+  $('#audio-stop')?.addEventListener('click', stopAudio)
 
-  // ── TIME MACHINE  (fixes Issue #d) ──
-  const tmSlider = $('#time-machine'); const tmReset = $('#time-machine-reset')
-  tmSlider?.addEventListener('input', e => updateTimeMachine(e.target.value))
-  tmSlider?.addEventListener('change', e => updateTimeMachine(e.target.value))
-  tmReset?.addEventListener('click', () => {
-    if (!tmSlider) return
-    tmSlider.value = '0'
-    tmSlider.dispatchEvent(new Event('input', { bubbles: true }))
-    updateTimeMachine(0)
-    tmReset.classList.add('shadow-glow-cyan')
-    setTimeout(() => tmReset.classList.remove('shadow-glow-cyan'), 600)
-  })
-  // Initial render
-  if (tmSlider) updateTimeMachine(tmSlider.value)
+  // Time Machine
+  const tm = $('#time-machine')
+  tm?.addEventListener('input',  e => updateTimeMachine(e.target.value))
+  tm?.addEventListener('change', e => updateTimeMachine(e.target.value))
+  $('#time-machine-reset')?.addEventListener('click', () => { if (tm) tm.value = 0; updateTimeMachine(0) })
 
-  // ── Scenario ──
+  // Quotes
+  $('#quote-prev')?.addEventListener('click', () => { STATE.quoteIdx = (STATE.quoteIdx - 1 + 1000) % 1000; renderQuote() })
+  $('#quote-next')?.addEventListener('click', () => { STATE.quoteIdx = (STATE.quoteIdx + 1) % 1000; renderQuote() })
+
+  // Scenario
   $('#scenario-run')?.addEventListener('click', runScenario)
-
-  // ── Quotes ──
-  $('#quote-next')?.addEventListener('click', () => { qi = (qi + 1) % QUOTES.length; renderQuote() })
-  $('#quote-prev')?.addEventListener('click', () => { qi = (qi - 1 + QUOTES.length) % QUOTES.length; renderQuote() })
-
-  // ── Theme toggle (icon only — page is already dark) ──
-  $('#theme-toggle')?.addEventListener('click', () => document.documentElement.classList.toggle('dark'))
-
-  // ── Pulse-wheel tooltip + click-through ──
-  const tooltip = $('#wheel-tooltip')
-  $$('.wheel-tick').forEach(g => {
-    g.addEventListener('mouseenter', () => {
-      if (!tooltip) return
-      const t = g.dataset.title; const s = g.dataset.sev
-      tooltip.innerHTML = `<div class="font-semibold text-white">${escapeHTML(t)}</div><div class="text-[10px] mono text-gray-400 mt-1">severity ${s}</div>`
-      tooltip.style.opacity = '1'
-    })
-    g.addEventListener('mousemove', e => {
-      if (!tooltip) return
-      const c = $('#pulse-wheel-container').getBoundingClientRect()
-      tooltip.style.left = (e.clientX - c.left + 10) + 'px'
-      tooltip.style.top  = (e.clientY - c.top + 10)  + 'px'
-    })
-    g.addEventListener('mouseleave', () => { if (tooltip) tooltip.style.opacity = '0' })
-    g.addEventListener('click', () => { if (g.dataset.url && g.dataset.url !== '#') window.open(g.dataset.url, '_blank') })
+  $('#scenario-input')?.addEventListener('keydown', e => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') runScenario()
   })
 }
 
-// =====================================================================
-// BOOT
-// =====================================================================
-;(async function init() {
+/* ═════════════════════ BOOT ══════════════════════════════════ */
+async function boot() {
   refreshKeyUI()
   wireEvents()
   try {
-    await loadBriefing()
-    await loadTimeline()
-    await loadActions()
-    await chartSentimentVolume()
-    drawSparklines()
-    setTimeout(drawSparklines, 250)
-    window.addEventListener('resize', () => { drawSparklines() })
-    await refreshSearchIndex()
+    const data = await fetchPayload(0)
+    await renderAll(data)
   } catch (e) {
-    console.error('SCOUTT boot error:', e)
+    showToast('Initial load failed: ' + e.message, 'error')
   }
-})()
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', boot)
+} else {
+  boot()
+}
