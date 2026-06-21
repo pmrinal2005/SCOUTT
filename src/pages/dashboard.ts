@@ -1,6 +1,9 @@
 // src/pages/dashboard.ts
 // All hardcoded chart HTML removed — everything is rendered by dashboard.js
 // from /api/dashboard?day=N payload.
+//
+// 🆕 Loads /static/world-map-paths.js BEFORE dashboard.js so the real-world
+// map paths constant is available when renderPolicy runs.
 import { htmlShell } from './shell'
 
 export const dashboardPage = (isPublicThreatIndex = false) =>
@@ -73,6 +76,8 @@ ${apiKeyModal()}
 ${briefModal()}
 ${liveLoadingOverlay()}
 
+<!-- 🆕 Load real-world-map SVG paths constant BEFORE dashboard.js -->
+<script src="/static/world-map-paths.js"></script>
 <script src="/static/dashboard.js"></script>
 `,
   })
@@ -195,7 +200,7 @@ function policyTab() {
         <h3 class="font-semibold">Global Regulatory Heatmap</h3>
         <span class="text-[10px] mono text-gray-500 uppercase">Hover a pin</span>
       </div>
-      <div id="world-map" class="relative w-full rounded-lg bg-gradient-to-br from-ink-900 to-ink-950 overflow-hidden border border-ink-700" style="aspect-ratio:2/1; min-height:340px;"></div>
+      <div id="world-map" class="relative w-full rounded-lg bg-gradient-to-br from-ink-900 to-ink-950 overflow-hidden border border-ink-700" style="aspect-ratio:2/1; min-height:380px;"></div>
       <div id="map-tooltip" class="absolute bg-ink-950 border border-policy/50 rounded-lg p-3 text-xs pointer-events-none opacity-0 transition-opacity shadow-glow-cyan max-w-[240px] z-10"></div>
     </div>
 
@@ -328,22 +333,20 @@ function sentimentTab() {
     <div class="col-span-12 lg:col-span-6 card p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="font-semibold">Verbatim quotes</h3>
-        <span id="quote-counter" class="text-[10px] mono text-gray-500 uppercase">--</span>
+        <span id="quote-counter" class="text-[10px] mono text-gray-500 uppercase">-- / --</span>
       </div>
-      <div id="quotes-carousel" class="min-h-[200px] flex items-center"></div>
-      <div class="flex items-center justify-between mt-3">
-        <button id="quote-prev" type="button" class="text-gray-400 hover:text-white text-sm cursor-pointer"><i class="fa-solid fa-arrow-left"></i> Prev</button>
-        <button id="quote-next" type="button" class="text-gray-400 hover:text-white text-sm cursor-pointer">Next <i class="fa-solid fa-arrow-right"></i></button>
+      <div id="quote-card" class="min-h-[140px]"></div>
+      <div class="flex items-center justify-end gap-2 mt-3">
+        <button id="quote-prev" type="button" class="card-hover card w-8 h-8 flex items-center justify-center cursor-pointer"><i class="fa-solid fa-chevron-left text-xs"></i></button>
+        <button id="quote-next" type="button" class="card-hover card w-8 h-8 flex items-center justify-center cursor-pointer"><i class="fa-solid fa-chevron-right text-xs"></i></button>
       </div>
     </div>
     <div class="col-span-12 card p-5">
       <div class="flex items-center justify-between mb-3">
-        <h3 class="font-semibold">Live Sentiment Events</h3>
-        <span class="text-[10px] mono text-sentiment uppercase">Stream</span>
+        <h3 class="font-semibold">Sentiment Events Feed</h3>
+        <span class="text-[10px] mono text-gray-500 uppercase">Live</span>
       </div>
-      <div id="sentiment-events-feed" class="grid md:grid-cols-2 lg:grid-cols-3 gap-3">
-        <div class="text-xs text-gray-500">Loading…</div>
-      </div>
+      <div id="sentiment-events-feed" class="grid md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
     </div>
   </div>
 </section>`
@@ -355,27 +358,45 @@ function sentimentTab() {
 function scenarioTab() {
   return `
 <section data-pane="scenario" class="tab-pane hidden">
-  <div class="card p-6 max-w-3xl mx-auto">
-    <div class="flex items-start gap-4 mb-6">
-      <div class="w-12 h-12 rounded-lg bg-action/15 border border-action/40 flex items-center justify-center shrink-0"><i class="fa-solid fa-flask text-action text-xl"></i></div>
-      <div>
-        <h2 class="text-xl font-bold mb-1">"What if?" Scenario Simulator</h2>
-        <p class="text-sm text-gray-400">Re-runs over the current cached briefing. <span class="text-action mono">Zero new credits.</span></p>
+  <div class="grid grid-cols-12 gap-5">
+    <div class="col-span-12 card p-6">
+      <h3 class="font-semibold mb-2">Scenario Simulator</h3>
+      <p class="text-sm text-gray-400 mb-4">Describe a hypothetical — we'll re-run threat math against the current briefing with 0 new credits.</p>
+      <textarea id="scenario-input" rows="3" placeholder="What if the EU AI Act enforcement is delayed by 6 months and Stripe lowers ACH back to 0.80?" class="w-full bg-ink-900 border border-ink-600 rounded-lg p-3 text-sm focus:outline-none focus:border-policy mono"></textarea>
+      <div class="flex items-center gap-2 mt-3">
+        <button id="scenario-run" type="button" class="bg-policy text-ink-950 font-semibold px-4 py-2 rounded-lg text-sm hover:shadow-glow-cyan cursor-pointer flex items-center gap-2"><i class="fa-solid fa-play"></i> Run scenario</button>
+        <span class="text-[11px] text-gray-500 mono">⌘ + Enter</span>
       </div>
+      <div id="scenario-error" class="hidden mt-3 text-xs text-red-400"></div>
     </div>
-    <textarea id="scenario-input" rows="3" placeholder='Try: "What if EU AI Act enforcement is delayed 6 months?" or "What if Stripe drops ACH back to $0.70?"' class="w-full bg-ink-900 border border-ink-600 rounded-lg px-4 py-3 text-sm focus:outline-none focus:border-action"></textarea>
-    <button id="scenario-run" type="button" class="mt-3 bg-action text-ink-950 font-semibold px-5 py-2.5 rounded-lg hover:shadow-glow-emerald transition flex items-center gap-2 cursor-pointer"><i class="fa-solid fa-play"></i> Run scenario</button>
 
-    <div id="scenario-error" class="hidden mt-4 border border-red-500/40 bg-red-500/10 text-red-300 text-sm rounded-lg px-4 py-3"></div>
-
-    <div id="scenario-result" class="hidden mt-6 space-y-4">
-      <div class="grid grid-cols-3 gap-3">
-        <div class="card p-4 text-center"><div class="text-[10px] mono uppercase text-gray-500 mb-1">Threat Level</div><div class="mono"><span id="s-before" class="text-gray-500 line-through">--</span> → <span id="s-after" class="text-action text-2xl font-bold">--</span></div></div>
-        <div class="card p-4 text-center"><div class="text-[10px] mono uppercase text-gray-500 mb-1">New Threats</div><div id="s-threats" class="mono text-2xl font-bold text-competitor">--</div></div>
-        <div class="card p-4 text-center"><div class="text-[10px] mono uppercase text-gray-500 mb-1">New Actions</div><div id="s-actions" class="mono text-2xl font-bold text-policy">--</div></div>
+    <div id="scenario-result" class="hidden col-span-12 grid grid-cols-12 gap-5">
+      <div class="col-span-12 md:col-span-3 card p-4 text-center">
+        <div class="text-[10px] mono uppercase text-gray-500 mb-1">Before</div>
+        <div id="s-before" class="mono text-3xl font-semibold">--</div>
       </div>
-      <div id="s-narrative" class="card p-3 text-sm text-gray-300"></div>
-      <div id="s-events" class="space-y-2"></div>
+      <div class="col-span-12 md:col-span-3 card p-4 text-center">
+        <div class="text-[10px] mono uppercase text-gray-500 mb-1">After</div>
+        <div id="s-after" class="mono text-3xl font-semibold text-policy">--</div>
+      </div>
+      <div class="col-span-12 md:col-span-3 card p-4 text-center">
+        <div class="text-[10px] mono uppercase text-gray-500 mb-1">Δ Threats</div>
+        <div id="s-threats" class="mono text-3xl font-semibold text-competitor">--</div>
+      </div>
+      <div class="col-span-12 md:col-span-3 card p-4 text-center">
+        <div class="text-[10px] mono uppercase text-gray-500 mb-1">Δ Actions</div>
+        <div id="s-actions" class="mono text-3xl font-semibold text-action">--</div>
+      </div>
+
+      <div class="col-span-12 card p-4">
+        <div class="text-[10px] mono uppercase text-gray-500 mb-2">Narrative</div>
+        <div id="s-narrative" class="text-sm text-gray-300"></div>
+      </div>
+
+      <div class="col-span-12">
+        <div class="text-[10px] mono uppercase text-gray-500 mb-2">Impacted events</div>
+        <div id="s-events" class="grid md:grid-cols-2 gap-3"></div>
+      </div>
     </div>
   </div>
 </section>`
@@ -387,22 +408,91 @@ function scenarioTab() {
 function archetypeTab() {
   return `
 <section data-pane="archetype" class="tab-pane hidden">
-  <div class="card p-6">
-    <h2 class="text-xl font-bold mb-1">Industry Archetype Comparison</h2>
-    <p class="text-sm text-gray-400 mb-6">Your <span id="archetype-industry" class="text-policy mono">--</span> profile vs the synthetic industry baseline.</p>
-    <div class="relative" style="height:360px"><canvas id="chart-radar"></canvas></div>
-    <div class="mt-6 grid md:grid-cols-3 gap-3">
-      <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">You score higher on</div><div id="archetype-higher" class="mt-1 text-sm">--</div></div>
-      <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">Industry beats you on</div><div id="archetype-lower" class="mt-1 text-sm">--</div></div>
-      <div class="card p-3"><div class="text-[10px] mono uppercase text-gray-500">Coin-flip</div><div id="archetype-neutral" class="mt-1 text-sm">--</div></div>
+  <div class="grid grid-cols-12 gap-5">
+    <div class="col-span-12 lg:col-span-7 card p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Archetype Comparison</h3>
+        <span class="text-[10px] mono text-policy uppercase" id="archetype-industry">--</span>
+      </div>
+      <div class="relative" style="height:420px"><canvas id="chart-radar"></canvas></div>
+    </div>
+    <div class="col-span-12 lg:col-span-5 card p-5">
+      <h3 class="font-semibold mb-3">Where you stand</h3>
+      <dl class="text-sm space-y-3">
+        <div><dt class="text-[10px] mono uppercase text-gray-500">Above baseline</dt><dd id="archetype-higher" class="text-action">--</dd></div>
+        <div><dt class="text-[10px] mono uppercase text-gray-500">Below baseline</dt><dd id="archetype-lower" class="text-sentiment">--</dd></div>
+        <div><dt class="text-[10px] mono uppercase text-gray-500">In line</dt><dd id="archetype-neutral" class="text-gray-300">--</dd></div>
+      </dl>
     </div>
   </div>
 </section>`
 }
 
 // ════════════════════════════════════════════════════════════════════
-// Modals / overlays
+// MODALS / OVERLAYS
 // ════════════════════════════════════════════════════════════════════
+function apiKeyModal() {
+  return `
+<div id="apikey-modal" class="hidden fixed inset-0 z-[60] cmdk-backdrop flex items-center justify-center px-4">
+  <div class="card w-full max-w-md p-6 slide-up">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-2">
+        <div class="w-9 h-9 rounded-lg bg-policy/15 border border-policy/40 flex items-center justify-center"><i class="fa-solid fa-key text-policy"></i></div>
+        <h3 class="font-semibold text-lg">Connect your Anakin API key</h3>
+      </div>
+      <button id="apikey-close" type="button" class="text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <p class="text-sm text-gray-400 mb-4">Paste your Anakin API key to switch from demo data to a live Anakin Agentic Search → NVIDIA NIM reshape pipeline. Every card in every tab becomes dynamic.</p>
+    <label class="block text-xs mono uppercase text-gray-500 mb-1">Anakin API Key</label>
+    <input id="apikey-input" type="password" placeholder="anakin-live-…" class="w-full bg-ink-900 border border-ink-600 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-policy mono" autocomplete="off" />
+    <div class="mt-3 text-[11px] text-gray-500 leading-relaxed">
+      Stored only in your browser (localStorage). Sent to our server as the <code class="mono text-policy">X-Anakin-Key</code> header.
+      <a href="https://anakin.io/docs/integrations" target="_blank" rel="noopener" class="text-policy hover:underline">Where do I find this?</a>
+    </div>
+    <div id="apikey-status" class="hidden mt-3 text-xs"></div>
+    <div class="flex justify-between items-center mt-5">
+      <button id="apikey-clear" type="button" class="text-xs text-gray-400 hover:text-red-400 cursor-pointer">Clear stored key</button>
+      <div class="flex gap-2">
+        <button id="apikey-cancel" type="button" class="text-gray-400 hover:text-white px-4 py-2 text-sm cursor-pointer">Cancel</button>
+        <button id="apikey-save" type="button" class="bg-policy text-ink-950 font-semibold px-4 py-2 rounded-lg text-sm hover:shadow-glow-cyan cursor-pointer">Save &amp; go live</button>
+      </div>
+    </div>
+  </div>
+</div>`
+}
+
+function liveLoadingOverlay() {
+  return `
+<div id="live-loading" class="hidden fixed inset-0 z-[70] bg-ink-950/80 backdrop-blur-sm flex items-center justify-center">
+  <div class="card p-6 flex items-center gap-4 max-w-md">
+    <div class="w-8 h-8 border-4 border-policy border-t-transparent rounded-full animate-spin"></div>
+    <div>
+      <div class="font-semibold text-sm" id="live-loading-title">Generating live briefing…</div>
+      <div class="text-[11px] mono text-gray-500 mt-1" id="live-loading-sub">Anakin Agentic Search → NVIDIA reshape.</div>
+    </div>
+  </div>
+</div>`
+}
+
+function briefModal() {
+  return `
+<div id="brief-modal" class="hidden fixed inset-0 z-[55] cmdk-backdrop flex items-center justify-center px-4">
+  <div class="card w-full max-w-3xl p-6 slide-up max-h-[85vh] overflow-y-auto">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-lg bg-policy/15 border border-policy/40 flex items-center justify-center"><i class="fa-solid fa-newspaper text-policy"></i></div>
+        <div>
+          <div class="text-xs mono uppercase text-policy">Daily Battle Brief</div>
+          <h3 class="font-semibold text-lg" id="brief-modal-title">Loading…</h3>
+        </div>
+      </div>
+      <button id="brief-modal-close" type="button" class="text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div id="brief-modal-body" class="text-sm leading-relaxed text-gray-300 space-y-4"></div>
+  </div>
+</div>`
+}
+
 function cmdkPalette() {
   return `
 <div id="cmdk" class="hidden fixed inset-0 z-50 cmdk-backdrop flex items-start justify-center pt-24 px-4">
@@ -419,7 +509,7 @@ function cmdkPalette() {
         <button type="button" class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700">EU AI Act</button>
         <button type="button" class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700">Stripe pricing</button>
         <button type="button" class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700">fraud sentiment</button>
-        <button type="button" class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700 ask">→ Ask SCOUTT: "Should I match Stripe's price hike?"</button>
+        <button type="button" class="cmdk-suggestion w-full text-left px-2 py-2 rounded hover:bg-ink-700">→ Ask SCOUTT: "Should I match Stripe's price hike?"</button>
       </div>
     </div>
     <div id="cmdk-output" class="hidden px-4 py-4 border-t border-ink-700 max-h-[440px] overflow-y-auto"></div>
@@ -453,68 +543,6 @@ function audioBriefToast() {
   <button id="audio-stop" type="button" class="ml-3 text-gray-400 hover:text-white cursor-pointer"><i class="fa-solid fa-stop"></i></button>
 </div>
 <audio id="audio-el" class="hidden"></audio>`
-}
-
-function apiKeyModal() {
-  return `
-<div id="apikey-modal" class="hidden fixed inset-0 z-[60] cmdk-backdrop flex items-center justify-center px-4">
-  <div class="card w-full max-w-md p-6 slide-up">
-    <div class="flex items-center justify-between mb-4">
-      <div class="flex items-center gap-2">
-        <div class="w-9 h-9 rounded-lg bg-policy/15 border border-policy/40 flex items-center justify-center"><i class="fa-solid fa-key text-policy"></i></div>
-        <h3 class="font-semibold text-lg">Connect your Anakin API key</h3>
-      </div>
-      <button id="apikey-close" type="button" class="text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
-    </div>
-    <p class="text-sm text-gray-400 mb-4">Paste your Anakin API key to switch from demo data to live briefings generated from real Agentic-Search calls. Every card in every tab becomes dynamic.</p>
-    <label class="block text-xs mono uppercase text-gray-500 mb-1">Anakin API Key</label>
-    <input id="apikey-input" type="password" placeholder="anakin-live-…" class="w-full bg-ink-900 border border-ink-600 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-policy mono" autocomplete="off" />
-    <div class="mt-3 text-[11px] text-gray-500 leading-relaxed">
-      Stored only in your browser (localStorage). Sent to our server as the <code class="mono text-policy">X-Anakin-Key</code> header.
-      <a href="https://anakin.io/docs/integrations" target="_blank" rel="noopener" class="text-policy hover:underline">Where do I find this?</a>
-    </div>
-    <div id="apikey-status" class="hidden mt-3 text-xs"></div>
-    <div class="flex justify-between items-center mt-5">
-      <button id="apikey-clear" type="button" class="text-xs text-gray-400 hover:text-red-400 cursor-pointer">Clear stored key</button>
-      <div class="flex gap-2">
-        <button id="apikey-cancel" type="button" class="text-gray-400 hover:text-white px-4 py-2 text-sm cursor-pointer">Cancel</button>
-        <button id="apikey-save" type="button" class="bg-policy text-ink-950 font-semibold px-4 py-2 rounded-lg text-sm hover:shadow-glow-cyan cursor-pointer">Save &amp; go live</button>
-      </div>
-    </div>
-  </div>
-</div>`
-}
-
-function briefModal() {
-  return `
-<div id="brief-modal" class="hidden fixed inset-0 z-[55] cmdk-backdrop flex items-center justify-center px-4">
-  <div class="card w-full max-w-3xl p-6 slide-up max-h-[85vh] overflow-y-auto">
-    <div class="flex items-center justify-between mb-4">
-      <div class="flex items-center gap-3">
-        <div class="w-10 h-10 rounded-lg bg-policy/15 border border-policy/40 flex items-center justify-center"><i class="fa-solid fa-newspaper text-policy"></i></div>
-        <div>
-          <div class="text-xs mono uppercase text-policy">Daily Battle Brief</div>
-          <h3 class="font-semibold text-lg" id="brief-modal-title">Loading…</h3>
-        </div>
-      </div>
-      <button id="brief-modal-close" type="button" class="text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
-    </div>
-    <div id="brief-modal-body" class="text-sm leading-relaxed text-gray-300 space-y-4"></div>
-  </div>
-</div>`
-}
-
-function liveLoadingOverlay() {
-  return `
-<div id="live-loading" class="hidden fixed inset-0 z-[70] bg-ink-950/80 backdrop-blur-sm flex items-center justify-center">
-  <div class="card p-6 flex items-center gap-4 max-w-md">
-    <div class="w-8 h-8 border-4 border-policy border-t-transparent rounded-full animate-spin"></div>
-    <div>
-      <div class="font-semibold text-sm" id="live-loading-title">Generating live briefing…</div>
-      <div class="text-[11px] mono text-gray-500 mt-1" id="live-loading-sub">Anakin Agentic Search → NVIDIA reshape. Up to 60s.</div>
-    </div>
-  </div>
-</div>`
 }
 
 function kpiCard(label: string, key: string, deltaClass: string, icon: string) {

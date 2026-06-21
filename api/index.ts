@@ -1,8 +1,17 @@
 // api/index.ts
 // =============================================================================
 // SCOUTT — Express serverless handler for Vercel.
-// Drives the whole dashboard from a single /api/dashboard?day=N endpoint.
-// Anakin Agentic Search → NVIDIA NIM reshape → DashboardPayload (cached 10 min).
+// 🔥 REWRITTEN to split the Anakin → NVIDIA pipeline across THREE short
+// serverless calls so we never hit the Vercel Hobby 60s cap.
+//
+//   POST /api/anakin/start       → submit Anakin job   (≈2s)
+//   GET  /api/anakin/poll/:jobId → one Anakin poll      (≈1-2s)
+//   POST /api/nvidia/reshape     → NVIDIA NIM reshape   (≈8-15s)
+//
+// All three are well under 60s. The browser orchestrates the loop.
+// Once the reshape completes, every legacy endpoint (/api/dashboard,
+// /api/briefing/today, /api/charts/*, etc.) serves from the warm cache
+// dynamically — so every section of every tab becomes data-driven.
 // =============================================================================
 import express, { Request, Response, NextFunction } from 'express'
 import path from 'path'
@@ -13,10 +22,7 @@ import { dashboardPage } from '../src/pages/dashboard'
 import { onboardingPage } from '../src/pages/onboarding'
 
 import {
-  DEMO_TENANT, DEMO_BRIEFING, DEMO_TIMELINE, DEMO_PRICING_RACE,
-  DEMO_SENTIMENT_VOLUME, DEMO_TOPIC_BUBBLES, DEMO_WORDCLOUD,
-  DEMO_FEATURE_MATRIX, DEMO_POLICY_REGIONS, DEMO_GLOBE_DOTS, DEMO_CREDIT_LEDGER,
-  buildDemoPayload,
+  DEMO_TENANT, DEMO_BRIEFING, DEMO_GLOBE_DOTS, DEMO_CREDIT_LEDGER, buildDemoPayload,
 } from '../src/demo-data'
 
 import {
@@ -24,7 +30,11 @@ import {
   ASK_FRESH_SEARCH_PROMPT, COMPETITOR_SCRAPE_PROMPT,
 } from '../src/anakin-prompts'
 
-import { getDashboardPayload, invalidateCacheFor, peekCacheFor } from '../src/live-pipeline'
+import {
+  anakinSubmit, anakinPollOnce, buildAndCachePayload, nvidiaReshape,
+  getDashboardPayload, invalidateCacheFor, peekCacheFor, peekRawFor,
+  buildBriefingPrompt,
+} from '../src/live-pipeline'
 
 const app = express()
 app.use(express.json({ limit: '2mb' }))
@@ -39,7 +49,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next()
 })
 
-// ─── STATIC ASSETS (works on Vercel via vercel.json route) ─────────────
+// ─── STATIC ASSETS ─────────────────────────────────────────────────────
 const PUBLIC_DIR = path.join(process.cwd(), 'public')
 const STATIC_DIR = path.join(PUBLIC_DIR, 'static')
 
@@ -117,11 +127,93 @@ app.get('/api/health', (req, res) => res.status(200).json({
   anakin_env_key: Boolean(process.env.ANAKIN_API_KEY),
   nvidia: Boolean(process.env.NVIDIA_API_KEY),
   elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY),
+  cached_live: Boolean(req.header('x-anakin-key') && peekCacheFor(String(req.header('x-anakin-key')))),
   timestamp: new Date().toISOString(),
 }))
 
 // =============================================================================
-// 🔥 UNIFIED dashboard endpoint — drives the ENTIRE UI
+// 🆕 STEP 1 — Anakin submit (≤3s)
+// =============================================================================
+app.post('/api/anakin/start', async (req, res) => {
+  const key = anakinKey(req)
+  if (!key) return res.status(400).json({ error: 'X-Anakin-Key header required' })
+  try {
+    const tenant = DEMO_TENANT
+    const prompt = buildBriefingPrompt(tenant)
+    const jobId = await anakinSubmit(key, prompt)
+    res.json({ ok: true, job_id: jobId, message: 'Anakin Agentic Search submitted.' })
+  } catch (e: any) {
+    res.status(502).json({ ok: false, error: String(e?.message || e) })
+  }
+})
+
+// =============================================================================
+// 🆕 STEP 2 — Anakin single poll (≤2s, no looping on server)
+// =============================================================================
+app.get('/api/anakin/poll/:jobId', async (req, res) => {
+  const key = anakinKey(req)
+  if (!key) return res.status(400).json({ error: 'X-Anakin-Key header required' })
+  const jobId = req.params.jobId
+  if (!jobId) return res.status(400).json({ error: 'job_id required' })
+  try {
+    const out = await anakinPollOnce(key, jobId)
+    res.json({ ok: true, ...out })
+  } catch (e: any) {
+    res.status(502).json({ ok: false, status: 'unknown', error: String(e?.message || e) })
+  }
+})
+
+// =============================================================================
+// 🆕 STEP 3 — NVIDIA NIM reshape (≤15s)
+// Browser calls this once /api/anakin/poll returns status='completed'.
+// =============================================================================
+app.post('/api/nvidia/reshape', async (req, res) => {
+  const key = anakinKey(req)
+  if (!key) return res.status(400).json({ error: 'X-Anakin-Key header required' })
+  try {
+    // Browser may pass the raw Anakin JSON for safety against cold-starts.
+    const body: any = req.body || {}
+    const raw = body.raw ?? peekRawFor(key)
+    if (!raw) return res.status(409).json({ error: 'No Anakin raw output found. Poll must complete first.' })
+    const payload = await buildAndCachePayload(key, DEMO_TENANT, raw)
+    res.json(payload)
+  } catch (e: any) {
+    // Fail-safe: keep the UI alive.
+    const demo = buildDemoPayload(DEMO_TENANT)
+    ;(demo as any).source = 'demo-fallback'
+    ;(demo as any).error = String(e?.message || e)
+    res.status(200).json(demo)
+  }
+})
+
+// =============================================================================
+// 🆕 ONE-SHOT END-TO-END SAFEGUARD (used by /api/dashboard when warm cache
+// is empty AND the env-set ANAKIN_API_KEY is present — runs server-side but
+// CAPS at 25s so we never hit Vercel's 60s wall).
+// =============================================================================
+async function tryEndToEndShortCircuit(key: string): Promise<any | null> {
+  const startedAt = Date.now()
+  const HARD_CAP_MS = 25_000
+  try {
+    const jobId = await anakinSubmit(key, buildBriefingPrompt(DEMO_TENANT))
+    while (Date.now() - startedAt < HARD_CAP_MS) {
+      const out = await anakinPollOnce(key, jobId)
+      if (out.status === 'completed') {
+        return await buildAndCachePayload(key, DEMO_TENANT, out.raw)
+      }
+      if (out.status === 'failed') return null
+      await new Promise(r => setTimeout(r, 4_000))
+    }
+  } catch { /* ignore */ }
+  return null
+}
+
+// =============================================================================
+// 🔥 UNIFIED dashboard endpoint — always returns within ~1s.
+// Strategy:
+//   1. Serve warm cache if available.
+//   2. Otherwise serve the demo template tagged source='demo-warming'.
+//      Browser then drives /api/anakin/start → poll → reshape.
 // =============================================================================
 app.get('/api/dashboard', async (req, res) => {
   try {
@@ -129,8 +221,9 @@ app.get('/api/dashboard', async (req, res) => {
     res.json(p)
   } catch (e: any) {
     const demo = buildDemoPayload(DEMO_TENANT)
-    demo.source = 'demo-fallback'
-    res.json({ ...demo, error: String(e?.message || e) })
+    ;(demo as any).source = 'demo-fallback'
+    ;(demo as any).error = String(e?.message || e)
+    res.json(demo)
   }
 })
 
@@ -142,7 +235,9 @@ app.post('/api/dashboard/refresh', (req, res) => {
 })
 
 // =============================================================================
-// LEGACY endpoints — all now derive from the unified payload
+// LEGACY endpoints — all now derive from the unified payload.
+// Once the warm cache is populated by /api/nvidia/reshape, every one of these
+// returns dynamic live data.
 // =============================================================================
 app.get('/api/tenant/demo', (_req, res) => res.json(DEMO_TENANT))
 
@@ -151,28 +246,33 @@ app.get('/api/briefing/today', async (req, res) => {
   res.json({ ...p.briefing, source: p.source, generated_at_iso: p.generated_at_iso })
 })
 
-app.get('/api/timeline', async (req, res) => {
-  const p = await payloadFor(req); res.json(p.timeline)
-})
-app.get('/api/actions/today', async (req, res) => {
-  const p = await payloadFor(req); res.json(p.briefing.actions || [])
-})
-app.get('/api/credit-ledger', (_req, res) => res.json(DEMO_CREDIT_LEDGER))
+app.get('/api/timeline',         async (req, res) => res.json((await payloadFor(req)).timeline))
+app.get('/api/actions/today',    async (req, res) => res.json((await payloadFor(req)).briefing.actions || []))
+app.get('/api/credit-ledger',    (_req, res) => res.json(DEMO_CREDIT_LEDGER))
 
-app.get('/api/charts/pricing-race', async (req, res) => res.json((await payloadFor(req)).competitor.pricing_race_30d))
+app.get('/api/charts/pricing-race',     async (req, res) => res.json((await payloadFor(req)).competitor.pricing_race_30d))
 app.get('/api/charts/sentiment-volume', async (req, res) => res.json((await payloadFor(req)).sentiment_volume_14d))
-app.get('/api/charts/topic-bubbles', async (req, res) => res.json((await payloadFor(req)).sentiment.topic_cluster))
-app.get('/api/charts/wordcloud', async (req, res) => res.json((await payloadFor(req)).sentiment.word_cloud))
-app.get('/api/charts/feature-matrix', async (req, res) => res.json((await payloadFor(req)).competitor.feature_matrix))
-app.get('/api/charts/policy-regions', async (req, res) => res.json((await payloadFor(req)).policy.regions))
-app.get('/api/charts/globe-dots', (_req, res) => res.json(DEMO_GLOBE_DOTS))
+app.get('/api/charts/topic-bubbles',    async (req, res) => res.json((await payloadFor(req)).sentiment.topic_cluster))
+app.get('/api/charts/wordcloud',        async (req, res) => res.json((await payloadFor(req)).sentiment.word_cloud))
+app.get('/api/charts/feature-matrix',   async (req, res) => res.json((await payloadFor(req)).competitor.feature_matrix))
+app.get('/api/charts/policy-regions',   async (req, res) => res.json((await payloadFor(req)).policy.regions))
+app.get('/api/charts/globe-dots',       async (req, res) => {
+  // Now also derived from live policy.regions when available.
+  const p = await payloadFor(req)
+  const dots = (p.policy?.regions || []).map(r => ({
+    lat: r.lat, lng: r.lng, size: r.activity / 100,
+    color: r.activity > 70 ? '#06b6d4' : r.activity > 45 ? '#f97316' : '#ec4899',
+    label: `${r.country}: ${r.count} changes`,
+  }))
+  res.json(dots.length ? dots : DEMO_GLOBE_DOTS)
+})
 
-app.get('/api/policy/active', async (req, res) => res.json((await payloadFor(req)).policy.active_regulations))
+app.get('/api/policy/active',     async (req, res) => res.json((await payloadFor(req)).policy.active_regulations))
 app.get('/api/competitor/events', async (req, res) => res.json((await payloadFor(req)).competitor.events))
-app.get('/api/sentiment/events', async (req, res) => res.json((await payloadFor(req)).sentiment.events))
+app.get('/api/sentiment/events',  async (req, res) => res.json((await payloadFor(req)).sentiment.events))
 
 // =============================================================================
-// SEARCH INDEX (⌘K) — built from the live payload
+// SEARCH INDEX (⌘K)
 // =============================================================================
 app.get('/api/search-index', async (req, res) => {
   const p = await payloadFor(req)
@@ -216,7 +316,12 @@ app.get('/api/transparency', (_req, res) => {
       }),
       json_schema: BRIEFING_JSON_SCHEMA,
       poll_endpoint: 'GET https://api.anakin.io/v1/agentic-search/{job_id}',
-      poll_interval_ms: 10000,
+      poll_interval_ms: 8000,
+    },
+    nvidia_reshape: {
+      endpoint: 'POST https://integrate.api.nvidia.com/v1/chat/completions',
+      model: 'meta/llama-3.2-3b-instruct',
+      docs: 'https://build.nvidia.com/meta/llama-3.2-3b-instruct',
     },
     competitor_scraper: {
       endpoint: 'POST https://api.anakin.io/v1/crawl',
@@ -231,8 +336,7 @@ app.get('/api/transparency', (_req, res) => {
 })
 
 // =============================================================================
-// ASK SCOUTT — fast, NVIDIA-only path (uses citations from current brief).
-// Avoids slow Anakin call in this hot path.
+// ASK SCOUTT — NVIDIA-only fast path
 // =============================================================================
 app.post('/api/ask', async (req, res) => {
   const { question } = (req.body || {}) as { question: string }
@@ -293,15 +397,13 @@ function synthesizeMockAnswer(question: string, threat: number): string {
 }
 
 // =============================================================================
-// SCENARIO — pure derivation from cached payload (zero Anakin calls)
-// Fixes the "failed to fetch" because we no longer block on Anakin.
+// SCENARIO — derives from cached payload only (0 Anakin/NVIDIA calls)
 // =============================================================================
 app.post('/api/scenario', async (req, res) => {
   try {
     const { scenario } = (req.body || {}) as { scenario: string }
     if (!scenario || !String(scenario).trim()) return res.status(400).json({ error: 'Empty scenario' })
 
-    // Prefer warm cache so we never block on Anakin in this hot path.
     const key = anakinKey(req)
     let p = key ? peekCacheFor(key) : null
     if (!p) p = await payloadFor(req)

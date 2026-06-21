@@ -1,7 +1,11 @@
 /* =====================================================================
-   SCOUTT — dashboard.js (full rewrite)
-   Drives every tile from /api/dashboard?day=N. Demo when no Anakin key,
-   live Anakin → NVIDIA-reshaped JSON when key is set.
+   SCOUTT — dashboard.js (full rewrite, v2)
+   Drives every tile from /api/dashboard?day=N. When an Anakin key is
+   set, the browser orchestrates the async pipeline so we NEVER hit the
+   Vercel 60s cap:
+     1. POST /api/anakin/start          → {job_id}
+     2. GET  /api/anakin/poll/:jobId    → {status, raw?}    (loop here)
+     3. POST /api/nvidia/reshape        → final DashboardPayload
    ===================================================================== */
 
 const $  = (s, p = document) => p.querySelector(s)
@@ -28,7 +32,7 @@ const SCOUTT = {
 }
 SCOUTT.init()
 
-const STATE = { payload: null, day: 0, quoteIdx: 0, charts: {} }
+const STATE = { payload: null, day: 0, quoteIdx: 0, charts: {}, liveRunInflight: false }
 let GLOBAL_INDEX = []
 
 /* ═════════════════════════ UTILITIES ═════════════════════════ */
@@ -49,6 +53,8 @@ function setLiveLoading(on, title, sub) {
   if (sub)   { const s = $('#live-loading-sub');   if (s) s.textContent = sub }
   el.classList.toggle('hidden', !on)
 }
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms) } }
+const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 /* ═════════════════════ GREETING (time-aware) ════════════════════ */
 function applyTimeGreeting() {
@@ -69,21 +75,85 @@ function applyTimeGreeting() {
   }
 }
 
+/* ═════════════════════════ LIVE PIPELINE ═════════════════════════
+   Orchestrates Anakin start → poll → NVIDIA reshape entirely from
+   the browser so no single server call exceeds ~15s.
+   ════════════════════════════════════════════════════════════════ */
+async function runLivePipeline() {
+  if (STATE.liveRunInflight) return null
+  STATE.liveRunInflight = true
+  setLiveLoading(true, 'Generating live briefing…',
+    'Step 1/3 — Submitting Anakin Agentic Search…')
+
+  try {
+    // 1) START
+    const startResp = await SCOUTT.post('/api/anakin/start', {})
+    if (!startResp.ok || !startResp.job_id) throw new Error(startResp.error || 'Anakin start failed')
+    const jobId = startResp.job_id
+
+    // 2) POLL — every 8s for up to 5 minutes
+    setLiveLoading(true, 'Generating live briefing…',
+      `Step 2/3 — Anakin job ${jobId.slice(0, 8)}… polling every 8s.`)
+    const startedAt = Date.now()
+    const MAX_POLL_MS = 5 * 60_000
+    let raw = null
+    while (Date.now() - startedAt < MAX_POLL_MS) {
+      await sleep(8_000)
+      let pollData
+      try {
+        pollData = await SCOUTT.fetch(`/api/anakin/poll/${encodeURIComponent(jobId)}`)
+      } catch (e) {
+        // Network hiccup — keep trying.
+        continue
+      }
+      if (pollData.status === 'completed' && pollData.raw) { raw = pollData.raw; break }
+      if (pollData.status === 'failed') throw new Error(pollData.message || 'Anakin job failed')
+      const elapsed = Math.round((Date.now() - startedAt) / 1000)
+      setLiveLoading(true, 'Generating live briefing…',
+        `Step 2/3 — Anakin status: ${pollData.status || '...'} (${elapsed}s elapsed)`)
+    }
+    if (!raw) throw new Error('Anakin polling exceeded 5 minutes')
+
+    // 3) RESHAPE via NVIDIA NIM
+    setLiveLoading(true, 'Generating live briefing…',
+      'Step 3/3 — NVIDIA meta/llama-3.2-3b-instruct reshape…')
+    const payload = await SCOUTT.post('/api/nvidia/reshape', { raw })
+    if (!payload || !payload.briefing) throw new Error('NVIDIA reshape returned empty payload')
+
+    STATE.payload = payload
+    showToast('✓ Live briefing generated via Anakin → NVIDIA reshape.', 'info')
+    return payload
+  } catch (e) {
+    showToast('Live pipeline failed: ' + e.message + ' — showing demo.', 'error')
+    // Fall back to cached/demo
+    try { STATE.payload = await SCOUTT.fetch(`/api/dashboard?day=${STATE.day}`) } catch {}
+    return STATE.payload
+  } finally {
+    STATE.liveRunInflight = false
+    setLiveLoading(false)
+  }
+}
+
 /* ═════════════════════════ FETCH PAYLOAD ═════════════════════════ */
 async function fetchPayload(day = 0) {
-  const isLiveFirstLoad = SCOUTT.hasKey && (!STATE.payload || STATE.payload.source !== 'anakin-live')
-  if (isLiveFirstLoad) setLiveLoading(true, 'Generating live briefing…',
-    'Anakin Agentic Search → NVIDIA reshape. May take up to 60s.')
-  try {
-    const data = await SCOUTT.fetch(`/api/dashboard?day=${day}`)
-    STATE.payload = data; STATE.day = day
-    if (data.source === 'demo-fallback' && SCOUTT.hasKey) {
-      showToast('Live call failed — showing demo. ' + (data.error || ''), 'error')
-    } else if (data.source === 'anakin-live') {
-      showToast(day === 0 ? 'Live briefing loaded.' : `Day-${day} snapshot ready.`)
-    }
-    return data
-  } finally { setLiveLoading(false) }
+  // 1) Always hit /api/dashboard first — returns instantly with either
+  //    warm-cache live data, demo data, or 'demo-warming' marker.
+  const data = await SCOUTT.fetch(`/api/dashboard?day=${day}`)
+  STATE.payload = data; STATE.day = day
+
+  // 2) If user has a key but payload is not live yet, kick off pipeline.
+  if (SCOUTT.hasKey && data.source !== 'anakin-live' && day === 0) {
+    // Don't block initial render — fire-and-update.
+    runLivePipeline().then(live => {
+      if (live && live.source === 'anakin-live') {
+        STATE.payload = live
+        renderAll(live)
+      }
+    })
+  } else if (data.source === 'anakin-live') {
+    showToast(day === 0 ? 'Live briefing loaded from cache.' : `Day-${day} snapshot ready.`)
+  }
+  return data
 }
 
 /* ═════════════════════════ RENDER ROOT ════════════════════════ */
@@ -172,7 +242,7 @@ function showDraftModal(data) {
   m.addEventListener('click', e => { if (e.target === m) m.remove() })
 }
 
-/* ─── Pulse Wheel (DATA-DRIVEN) ───────────────────────────────── */
+/* ─── Pulse Wheel ───────────────────────────────── */
 function renderPulseWheel(p) {
   const host = $('#pulse-wheel-container'); if (!host) return
   const points = (p.pulse_wheel && p.pulse_wheel.length) ? p.pulse_wheel : []
@@ -272,88 +342,92 @@ function drawSparkline(cv, data, color) {
   ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.stroke()
 }
 
-/* ─── Threat meter (DATA-DRIVEN) ─────────────────────────────── */
+/* ─── 🆕 FIXED Threat meter ──────────────────────────────────
+   Bugfix: previous code used `transform: rotate(${angle - 90}deg)` which
+   sent the needle 90° too far CCW, often pointing OUTSIDE the gauge
+   card (as visible in the user's screenshot). The gauge arc sweeps
+   from 30,120 (left) → 210,120 (right) over the top, so:
+       v = 0   → needle should point LEFT  → rotate -90°
+       v = 50  → needle should point UP    → rotate   0°
+       v = 100 → needle should point RIGHT → rotate +90°
+   Correct formula: rotate = -90 + (v/100) * 180
+   ────────────────────────────────────────────────────────────── */
 function renderThreatMeter(p) {
   const host = $('#threat-meter-container'); if (!host) return
-  const v = Math.max(0, Math.min(100, p.threat_meter?.value ?? p.briefing.threat_level ?? 0))
-  const label = p.threat_meter?.label || 'Elevated'
-  const angle = -90 + (v / 100) * 180
+  const v = Math.max(0, Math.min(100, Number(p.threat_meter?.value ?? p.briefing.threat_level ?? 0)))
+  const label = p.threat_meter?.label || labelForThreat(v)
+  // ✅ Correct rotation: -90deg (full left) → 0deg (top) → +90deg (full right)
+  const needleRotation = -90 + (v / 100) * 180
+  // Arc length math: π·r (r=90) ≈ 282.74, dasharray below scales 0..100 → 0..282.74
+  const ARC_LEN = 282.74
+  const dashOffset = (v / 100) * ARC_LEN
+
   host.innerHTML = `
   <div class="relative">
-    <svg viewBox="0 0 240 140" class="w-full">
+    <svg viewBox="0 0 240 150" class="w-full" preserveAspectRatio="xMidYMid meet">
       <defs>
         <linearGradient id="threatGrad" x1="0" x2="1">
-          <stop offset="0%" stop-color="#10b981" /><stop offset="50%" stop-color="#f97316" /><stop offset="100%" stop-color="#ef4444" />
+          <stop offset="0%"  stop-color="#10b981" />
+          <stop offset="50%" stop-color="#f97316" />
+          <stop offset="100%" stop-color="#ef4444" />
         </linearGradient>
       </defs>
-      <path d="M 30 120 A 90 90 0 0 1 210 120" fill="none" stroke="#1a1e2a" stroke-width="18" stroke-linecap="round" />
-      <path d="M 30 120 A 90 90 0 0 1 210 120" fill="none" stroke="url(#threatGrad)" stroke-width="18" stroke-linecap="round" stroke-dasharray="${(v / 100) * 283}, 283" />
-      <g style="transform-origin:120px 120px; transform: rotate(${angle - 90}deg);">
-        <line x1="120" y1="120" x2="120" y2="40" stroke="#e7eaf3" stroke-width="2.5" stroke-linecap="round" />
-        <circle cx="120" cy="40" r="4" fill="#06b6d4" />
+
+      <!-- Background arc (full sweep) -->
+      <path d="M 30 120 A 90 90 0 0 1 210 120" fill="none" stroke="#1a1e2a"
+            stroke-width="18" stroke-linecap="round" />
+
+      <!-- Foreground arc, length proportional to v -->
+      <path d="M 30 120 A 90 90 0 0 1 210 120" fill="none" stroke="url(#threatGrad)"
+            stroke-width="18" stroke-linecap="round"
+            stroke-dasharray="${dashOffset.toFixed(2)} ${ARC_LEN.toFixed(2)}" />
+
+      <!-- Tick marks every 25% (0 / 25 / 50 / 75 / 100) -->
+      ${[0, 25, 50, 75, 100].map(pct => {
+        const ang = (-90 + (pct / 100) * 180) * Math.PI / 180
+        const x1 = 120 + Math.cos(ang) * 78
+        const y1 = 120 + Math.sin(ang) * 78
+        const x2 = 120 + Math.cos(ang) * 70
+        const y2 = 120 + Math.sin(ang) * 70
+        return `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}"
+                      x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"
+                      stroke="#3a4055" stroke-width="1.5" stroke-linecap="round"/>`
+      }).join('')}
+
+      <!-- ✅ Needle group, pivoting at gauge center (120,120) -->
+      <g transform="rotate(${needleRotation.toFixed(2)} 120 120)">
+        <line x1="120" y1="120" x2="120" y2="44" stroke="#e7eaf3"
+              stroke-width="2.5" stroke-linecap="round" />
+        <circle cx="120" cy="44" r="4" fill="#06b6d4" />
       </g>
-      <circle cx="120" cy="120" r="8" fill="#0a0c14" stroke="#06b6d4" stroke-width="1.5" />
+
+      <!-- Hub -->
+      <circle cx="120" cy="120" r="9" fill="#0a0c14" stroke="#06b6d4" stroke-width="1.5" />
+      <circle cx="120" cy="120" r="3" fill="#06b6d4" />
     </svg>
+
     <div class="text-center mt-2">
-      <div class="mono text-3xl font-semibold text-white">${v}<span class="text-base text-gray-500">/100</span></div>
+      <div class="mono text-3xl font-semibold text-white">
+        ${v}<span class="text-base text-gray-500">/100</span>
+      </div>
       <div class="text-[10px] mono uppercase text-gray-500 tracking-widest">${escapeHTML(label)}</div>
     </div>
   </div>`
 }
-
-/* ─── Sankey (DATA-DRIVEN) ───────────────────────────────────── */
-function renderSankey(p) {
-  const host = $('#sankey-container'); if (!host) return
-  const t = p.threats_to_actions || { sources: [], targets: [], links: [] }
-  const srcColors = ['#06b6d4', '#f97316', '#ec4899', '#10b981']
-  const srcY = t.sources.map((_, i, a) => 30 + (i * (160 / Math.max(a.length, 1))))
-  const tgtY = t.targets.map((_, i, a) => 40 + (i * (140 / Math.max(a.length, 1))))
-
-  const srcRects = t.sources.map((n, i) => `
-    <rect x="10" y="${srcY[i] - 18}" width="14" height="36" fill="${srcColors[i % 4]}" rx="2" />
-    <text x="32" y="${srcY[i] - 2}" fill="#e7eaf3" font-family="Inter" font-size="11" font-weight="500">${escapeHTML(n.label)}</text>
-    <text x="32" y="${srcY[i] + 12}" fill="${srcColors[i % 4]}" font-family="JetBrains Mono" font-size="10">${n.count} threats</text>`).join('')
-
-  const tgtRects = t.targets.map((n, i) => `
-    <rect x="280" y="${tgtY[i] - 14}" width="14" height="28" fill="#10b981" rx="2" />
-    <text x="275" y="${tgtY[i] - 2}" fill="#e7eaf3" font-family="Inter" font-size="11" font-weight="500" text-anchor="end">${escapeHTML(n.label)}</text>`).join('')
-
-  const flows = (t.links || []).map(l => {
-    const y1 = srcY[l.from] || 30, y2 = tgtY[l.to] || 50
-    const w = Math.max(1.5, Math.min(6, Number(l.value) || 2))
-    return `<path d="M 24 ${y1} C 150 ${y1} 150 ${y2} 280 ${y2}" stroke="${srcColors[l.from % 4]}" stroke-width="${w}" fill="none" opacity="0.45" />`
-  }).join('')
-
-  host.innerHTML = `<svg viewBox="0 0 320 200" class="w-full">${flows}${srcRects}${tgtRects}</svg>`
+function labelForThreat(v) {
+  if (v >= 80) return 'Severe'
+  if (v >= 60) return 'Elevated'
+  if (v >= 35) return 'Moderate'
+  return 'Low'
 }
 
-/* ─── Sentiment Volume chart ─────────────────────────────────── */
-function renderSentimentVolume(p) {
-  const ctx = $('#chart-sentiment-volume'); if (!ctx) return
-  const data = p.sentiment_volume_14d || []
-  if (STATE.charts.sv) STATE.charts.sv.destroy()
-  STATE.charts.sv = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: data.map(d => (d.date || '').slice(5)),
-      datasets: [
-        { label: 'Positive', data: data.map(d => d.positive), backgroundColor: 'rgba(16,185,129,0.45)', borderColor: '#10b981', fill: true, tension: 0.35, pointRadius: 0 },
-        { label: 'Neutral',  data: data.map(d => d.neutral),  backgroundColor: 'rgba(58,64,85,0.45)',  borderColor: '#3a4055', fill: true, tension: 0.35, pointRadius: 0 },
-        { label: 'Negative', data: data.map(d => d.negative), backgroundColor: 'rgba(236,72,153,0.45)', borderColor: '#ec4899', fill: true, tension: 0.35, pointRadius: 0 },
-      ],
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { labels: { color: '#a1a8bd', font: { size: 10 } } } },
-      scales: {
-        x: { stacked: true, ticks: { color: '#3a4055', font: { size: 9 } }, grid: { color: 'rgba(58,64,85,0.15)' } },
-        y: { stacked: true, ticks: { color: '#3a4055', font: { size: 9 } }, grid: { color: 'rgba(58,64,85,0.15)' } },
-      },
-    },
-  })
-}
-
-/* ═══════════════ POLICY (heatmap + QoQ + cards) ══════════════ */
+/* ─── 🆕 FIXED Policy — real-world map ───────────────────────────
+   Replaces the previous low-poly blobs with real country outlines
+   loaded from /static/world-map-paths.js. Coordinates use the same
+   equirectangular projection (viewBox 0 0 1000 500) so the existing
+   pin math (x = (lng+180)/360 * W, y = (90-lat)/180 * H) continues
+   to map regional pins correctly onto the real continents.
+   ────────────────────────────────────────────────────────────── */
 function renderPolicy(p) {
   const wmap = $('#world-map'); if (!wmap) return
   const regions = p.policy?.regions || []
@@ -362,41 +436,61 @@ function renderPolicy(p) {
     const x = ((r.lng + 180) / 360) * W
     const y = ((90 - r.lat)  / 180) * H
     const color = r.activity > 70 ? '#06b6d4' : r.activity > 45 ? '#f97316' : '#ec4899'
-    const size = 6 + (r.activity / 100) * 14
+    const size = 5 + (r.activity / 100) * 10
     return `
-      <g class="map-pin-g" data-country="${escapeHTML(r.country)}" data-count="${r.count}" data-activity="${r.activity}" style="cursor:pointer">
-        <circle cx="${x}" cy="${y}" r="${size + 14}" fill="${color}" opacity="0.10">
-          <animate attributeName="r" from="${size + 8}" to="${size + 22}" dur="2.6s" repeatCount="indefinite" />
+      <g class="map-pin-g" data-country="${escapeHTML(r.country)}"
+         data-count="${r.count}" data-activity="${r.activity}" style="cursor:pointer">
+        <circle cx="${x}" cy="${y}" r="${size + 12}" fill="${color}" opacity="0.10">
+          <animate attributeName="r" from="${size + 6}" to="${size + 18}" dur="2.6s" repeatCount="indefinite" />
           <animate attributeName="opacity" from="0.30" to="0" dur="2.6s" repeatCount="indefinite" />
         </circle>
-        <circle cx="${x}" cy="${y}" r="${size}" fill="${color}" opacity="0.90" stroke="#fff" stroke-opacity="0.25" stroke-width="0.8"/>
-        <text x="${x}" y="${y - size - 6}" fill="#e7eaf3" font-family="JetBrains Mono" font-size="11" text-anchor="middle">${escapeHTML(r.country)}</text>
+        <circle cx="${x}" cy="${y}" r="${size}" fill="${color}" opacity="0.92"
+                stroke="#fff" stroke-opacity="0.35" stroke-width="0.8"/>
+        <text x="${x}" y="${(y - size - 5).toFixed(1)}" fill="#e7eaf3"
+              font-family="JetBrains Mono" font-size="10" text-anchor="middle"
+              paint-order="stroke" stroke="#05060a" stroke-width="2">
+          ${escapeHTML(r.country)}
+        </text>
       </g>`
   }).join('')
 
-  // Stylised low-poly continents — visually grounds the pins
+  const realPaths = (window.SCOUTT_WORLD_MAP_PATHS || '').trim()
+
   wmap.innerHTML = `
-    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="absolute inset-0 w-full h-full">
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet"
+         class="absolute inset-0 w-full h-full">
       <defs>
-        <radialGradient id="mapGlow" cx="50%" cy="50%" r="65%">
-          <stop offset="0%" stop-color="#0d1320" stop-opacity="0.6"/>
+        <radialGradient id="mapGlow" cx="50%" cy="50%" r="70%">
+          <stop offset="0%"   stop-color="#0e1626" stop-opacity="0.85"/>
           <stop offset="100%" stop-color="#05060a" stop-opacity="1"/>
         </radialGradient>
-        <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-          <path d="M40 0H0V40" fill="none" stroke="#1a1e2a" stroke-width="0.5"/>
+        <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
+          <path d="M50 0H0V50" fill="none" stroke="#11151f" stroke-width="0.6"/>
         </pattern>
+        <linearGradient id="oceanGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%"   stop-color="#0a1424"/>
+          <stop offset="100%" stop-color="#050810"/>
+        </linearGradient>
       </defs>
+
+      <!-- Ocean / background -->
+      <rect width="${W}" height="${H}" fill="url(#oceanGrad)"/>
       <rect width="${W}" height="${H}" fill="url(#mapGlow)"/>
-      <rect width="${W}" height="${H}" fill="url(#grid)"/>
-      <g fill="#1a1e2a" stroke="#262b3a" stroke-width="0.8">
-        <path d="M150 110 L260 90 L330 130 L300 200 L220 230 L150 200 Z"/>
-        <path d="M150 260 L210 250 L260 320 L240 410 L180 430 L150 380 Z"/>
-        <path d="M420 80  L530 90  L560 160 L510 220 L430 200 L400 140 Z"/>
-        <path d="M460 230 L540 260 L560 340 L520 410 L470 400 L430 320 Z"/>
-        <path d="M620 100 L770 110 L820 180 L800 250 L720 250 L630 200 Z"/>
-        <path d="M680 270 L800 280 L820 360 L750 380 L700 340 Z"/>
-        <path d="M820 360 L900 370 L920 430 L860 440 Z"/>
+      <rect width="${W}" height="${H}" fill="url(#grid)" opacity="0.6"/>
+
+      <!-- Latitude reference lines (equator + tropics) -->
+      <g stroke="#1a2236" stroke-width="0.6" stroke-dasharray="2,3" fill="none">
+        <line x1="0" y1="250" x2="${W}" y2="250" stroke="#2a3550"/>  <!-- Equator -->
+        <line x1="0" y1="185" x2="${W}" y2="185"/>                    <!-- Tropic of Cancer -->
+        <line x1="0" y1="315" x2="${W}" y2="315"/>                    <!-- Tropic of Capricorn -->
       </g>
+
+      <!-- Real continents -->
+      <g fill="#1c2638" stroke="#2f3a55" stroke-width="0.8" stroke-linejoin="round">
+        ${realPaths}
+      </g>
+
+      <!-- Regional pins -->
       ${pins}
     </svg>`
 
@@ -446,7 +540,7 @@ function renderPolicy(p) {
     })
   }
 
-  // Active regulations
+  // Active regulations cards
   const cards = $('#reg-cards')
   if (cards) {
     const regs = p.policy?.active_regulations || []
@@ -456,23 +550,24 @@ function renderPolicy(p) {
   }
 }
 function regCard(r) {
-  const sev = r.severity
-  const sevColor = sev >= 80 ? 'text-red-400' : sev >= 60 ? 'text-competitor' : 'text-policy'
-  return `<div class="card step-card p-5">
-    <div class="flex items-start justify-between mb-2">
-      <div class="flex items-center gap-2 text-[10px] mono uppercase text-policy"><i class="fa-solid fa-scale-balanced"></i> ${escapeHTML((r.tags && r.tags[0]) || 'Policy')}</div>
-      <div class="text-right"><div class="mono text-xl font-bold ${sevColor}">${sev}</div><div class="text-[9px] mono uppercase text-gray-500">impact</div></div>
+  const tags = (r.tags || []).slice(0, 3).map(t =>
+    `<span class="px-2 py-0.5 mono text-[9px] uppercase rounded bg-policy/15 text-policy border border-policy/40">${escapeHTML(t)}</span>`).join(' ')
+  return `<div class="card step-card p-4">
+    <div class="flex items-center gap-2 text-[10px] mono uppercase text-policy mb-2">
+      <i class="fa-solid fa-scale-balanced"></i> ${escapeHTML(r.source_name || 'Regulator')}
     </div>
-    <h4 class="font-semibold mb-1 leading-snug">${escapeHTML(r.title)}</h4>
-    <p class="text-xs text-gray-400 leading-relaxed mb-3">${escapeHTML(r.summary || '')}</p>
-    <div class="border-t border-ink-700 pt-3 flex items-center justify-between text-[11px]">
-      <span class="text-gray-500 mono">${escapeHTML(r.source_name || '')}</span>
+    <h4 class="font-semibold text-sm mb-1">${escapeHTML(r.title)}</h4>
+    <p class="text-xs text-gray-400 mb-3">${escapeHTML((r.summary || '').slice(0, 200))}</p>
+    <div class="flex flex-wrap items-center gap-1.5 mb-3">${tags}</div>
+    <div class="flex items-center justify-between text-[11px] mono text-gray-500">
+      <span>sev ${r.severity}${r.deadline ? ' • due ' + r.deadline : ''}</span>
       <a href="${escapeHTML(r.source_url || '#')}" target="_blank" rel="noopener" class="text-policy hover:underline">Source →</a>
     </div>
   </div>`
 }
 
-/* ═════════════════════ COMPETITOR ════════════════════════════ */
+/* ─── Competitor / Sentiment / Archetype / Sankey / SentimentVolume
+       (unchanged from original — they were already data-driven) ─── */
 function renderCompetitor(p) {
   const dt = $('#diff-timeline')
   if (dt) {
@@ -554,9 +649,7 @@ function renderCompetitor(p) {
   }
 }
 
-/* ═════════════════════ SENTIMENT ═════════════════════════════ */
 function renderSentiment(p) {
-  // Topic cluster with collision detection
   const bc = $('#bubble-chart')
   if (bc) {
     const data = p.sentiment?.topic_cluster || []
@@ -579,7 +672,6 @@ function renderSentiment(p) {
     bc.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="w-full h-full">
       ${placed.map(({ x, y, r, b }) => {
         const c = b.sentiment > 0.2 ? '#10b981' : b.sentiment < -0.2 ? '#ec4899' : '#a1a8bd'
-        // Truncate label to fit inside the circle
         const maxChars = Math.max(4, Math.floor(r / 4))
         const label = b.topic.length > maxChars ? b.topic.slice(0, maxChars - 1) + '…' : b.topic
         const fontSize = Math.max(9, Math.min(13, r / 4))
@@ -591,7 +683,6 @@ function renderSentiment(p) {
     </svg>`
   }
 
-  // Diverging bars
   const div = $('#chart-diverging')
   if (div) {
     if (STATE.charts.dv) STATE.charts.dv.destroy()
@@ -617,7 +708,6 @@ function renderSentiment(p) {
     })
   }
 
-  // Word cloud
   const wc = $('#word-cloud')
   if (wc) {
     const words = p.sentiment?.word_cloud || []
@@ -648,22 +738,22 @@ function renderSentiment(p) {
       </div>`).join('') : '<div class="col-span-full text-sm text-gray-500">No sentiment events.</div>'
   }
 }
+
 function renderQuote(p) {
-  const el = $('#quotes-carousel'); if (!el) return
-  const quotes = (p || STATE.payload)?.sentiment?.quotes || []
-  if (!quotes.length) { el.innerHTML = '<div class="text-sm text-gray-500">No quotes.</div>'; const c = $('#quote-counter'); if (c) c.textContent = '0 / 0'; return }
-  const q = quotes[STATE.quoteIdx % quotes.length]
-  el.innerHTML = `<div class="w-full slide-up">
-    <div class="text-sentiment text-2xl mono mb-2">"</div>
-    <p class="text-base leading-relaxed mb-3">${escapeHTML(q.text)}</p>
-    <div class="flex items-center justify-between text-xs text-gray-500">
-      <span class="mono">${escapeHTML(q.src)}</span>
-      <span class="text-yellow-400">${escapeHTML(q.stars || '★★★★★')}</span>
-    </div></div>`
-  const c = $('#quote-counter'); if (c) c.textContent = `${(STATE.quoteIdx % quotes.length) + 1} / ${quotes.length}`
+  const host = $('#quote-card'); if (!host) return
+  const qs = (p || STATE.payload)?.sentiment?.quotes || []
+  if (!qs.length) { host.innerHTML = '<div class="text-xs text-gray-500">No quotes.</div>'; return }
+  const idx = STATE.quoteIdx % qs.length
+  const q = qs[idx]
+  const cnt = $('#quote-counter'); if (cnt) cnt.textContent = `${idx + 1} / ${qs.length}`
+  host.innerHTML = `
+    <div class="text-sm leading-relaxed mb-3">"${escapeHTML(q.text)}"</div>
+    <div class="flex items-center justify-between text-[11px] mono text-gray-500">
+      <span>${escapeHTML(q.src || '')}</span>
+      <span class="text-competitor">${escapeHTML(q.stars || '')}</span>
+    </div>`
 }
 
-/* ═════════════════════ ARCHETYPE ═════════════════════════════ */
 function renderArchetype(p) {
   const a = p.archetype || {}
   const ctx = $('#chart-radar'); if (!ctx) return
@@ -696,6 +786,234 @@ function renderArchetype(p) {
   })
 }
 
+function renderSankey(p) {
+  const host = $('#sankey-container'); if (!host) return
+  const t = p.threats_to_actions || { sources: [], targets: [], links: [] }
+  const srcColors = ['#06b6d4', '#f97316', '#ec4899', '#10b981']
+  const srcY = t.sources.map((_, i, a) => 30 + (i * (160 / Math.max(a.length, 1))))
+  const tgtY = t.targets.map((_, i, a) => 40 + (i * (140 / Math.max(a.length, 1))))
+
+  const srcRects = t.sources.map((n, i) => `
+    <rect x="10" y="${srcY[i] - 18}" width="14" height="36" fill="${srcColors[i % 4]}" rx="2" />
+    <text x="32" y="${srcY[i] - 2}" fill="#e7eaf3" font-family="Inter" font-size="11" font-weight="500">${escapeHTML(n.label)}</text>
+    <text x="32" y="${srcY[i] + 12}" fill="${srcColors[i % 4]}" font-family="JetBrains Mono" font-size="10">${n.count} threats</text>`).join('')
+
+  const tgtRects = t.targets.map((n, i) => `
+    <rect x="280" y="${tgtY[i] - 14}" width="14" height="28" fill="#10b981" rx="2" />
+    <text x="275" y="${tgtY[i] - 2}" fill="#e7eaf3" font-family="Inter" font-size="11" font-weight="500" text-anchor="end">${escapeHTML(n.label)}</text>`).join('')
+
+  const flows = (t.links || []).map(l => {
+    const y1 = srcY[l.from] || 30, y2 = tgtY[l.to] || 50
+    const w = Math.max(1.5, Math.min(6, Number(l.value) || 2))
+    return `<path d="M 24 ${y1} C 150 ${y1} 150 ${y2} 280 ${y2}" stroke="${srcColors[l.from % 4]}" stroke-width="${w}" fill="none" opacity="0.45" />`
+  }).join('')
+
+  host.innerHTML = `<svg viewBox="0 0 320 200" class="w-full">${flows}${srcRects}${tgtRects}</svg>`
+}
+
+function renderSentimentVolume(p) {
+  const ctx = $('#chart-sentiment-volume'); if (!ctx) return
+  const data = p.sentiment_volume_14d || []
+  if (STATE.charts.sv) STATE.charts.sv.destroy()
+  STATE.charts.sv = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.map(d => (d.date || '').slice(5)),
+      datasets: [
+        { label: 'Positive', data: data.map(d => d.positive), backgroundColor: 'rgba(16,185,129,0.45)', borderColor: '#10b981', fill: true, tension: 0.35, pointRadius: 0 },
+        { label: 'Neutral',  data: data.map(d => d.neutral),  backgroundColor: 'rgba(58,64,85,0.45)',  borderColor: '#3a4055', fill: true, tension: 0.35, pointRadius: 0 },
+        { label: 'Negative', data: data.map(d => d.negative), backgroundColor: 'rgba(236,72,153,0.45)', borderColor: '#ec4899', fill: true, tension: 0.35, pointRadius: 0 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#a1a8bd', font: { size: 10 } } } },
+      scales: {
+        x: { stacked: true, ticks: { color: '#3a4055', font: { size: 9 } }, grid: { color: 'rgba(58,64,85,0.15)' } },
+        y: { stacked: true, ticks: { color: '#3a4055', font: { size: 9 } }, grid: { color: 'rgba(58,64,85,0.15)' } },
+      },
+    },
+  })
+}
+
+/* ─── Tab activation ─────────────────────────────────────────── */
+function activateTab(name) {
+  $$('.tab-btn').forEach(b => b.classList.toggle('tab-active', b.dataset.tab === name))
+  $$('.tab-btn').forEach(b => b.classList.toggle('text-gray-400', b.dataset.tab !== name))
+  $$('.tab-pane').forEach(s => s.classList.toggle('hidden', s.dataset.pane !== name))
+}
+
+/* ─── Time Machine ────────────────────────────────────────────── */
+async function updateTimeMachine(day) {
+  const lbl = $('#time-machine-label')
+  if (lbl) lbl.textContent = day === 0 || day === '0' ? 'Today — live' : `Day −${day}`
+  try {
+    const data = await SCOUTT.fetch(`/api/dashboard?day=${day}`)
+    STATE.payload = data; STATE.day = +day
+    renderAll(data)
+  } catch (e) { showToast('Time machine error: ' + e.message, 'error') }
+}
+
+/* ─── ⌘K palette ────────────────────────────────────────────── */
+function openCmdk() {
+  const c = $('#cmdk'); if (!c) return
+  c.classList.remove('hidden'); setTimeout(() => $('#cmdk-input')?.focus(), 50)
+}
+function closeCmdk() {
+  const c = $('#cmdk'); if (!c) return
+  c.classList.add('hidden')
+  $('#cmdk-results')?.classList.add('hidden')
+  $('#cmdk-output')?.classList.add('hidden')
+  $('#cmdk-suggestions')?.classList.remove('hidden')
+  const i = $('#cmdk-input'); if (i) i.value = ''
+}
+async function refreshSearchIndex() {
+  try { const { index } = await SCOUTT.fetch('/api/search-index'); GLOBAL_INDEX = index || [] }
+  catch { GLOBAL_INDEX = [] }
+}
+function renderSearchResults(q) {
+  const sugg = $('#cmdk-suggestions'); const out = $('#cmdk-output'); const results = $('#cmdk-results')
+  if (!q.trim()) { results.classList.add('hidden'); sugg.classList.remove('hidden'); out.classList.add('hidden'); return }
+  sugg.classList.add('hidden'); out.classList.add('hidden')
+  const term = q.toLowerCase()
+  const matches = GLOBAL_INDEX.filter(r => (r.title || '').toLowerCase().includes(term) || (r.subtitle || '').toLowerCase().includes(term)).slice(0, 12)
+  results.classList.remove('hidden')
+  results.innerHTML = matches.length ? matches.map(m => `
+    <button type="button" data-tab="${m.tab}" class="cmdk-result w-full text-left px-4 py-3 hover:bg-ink-700/60 border-b border-ink-700/40 flex items-start gap-3">
+      <span class="text-[10px] mono uppercase text-gray-500 shrink-0 pt-0.5">${escapeHTML(m.section)}</span>
+      <div class="flex-1">
+        <div class="text-sm font-medium">${escapeHTML(m.title)}</div>
+        <div class="text-xs text-gray-500 line-clamp-1">${escapeHTML(m.subtitle || '')}</div>
+      </div>
+    </button>`).join('') + `<div class="px-4 py-2 text-[11px] text-gray-500 mono">Press Enter to Ask SCOUTT instead</div>`
+    : '<div class="px-4 py-6 text-xs text-gray-500 text-center">No matches. Press Enter to ask SCOUTT.</div>'
+  $$('.cmdk-result').forEach(b => b.addEventListener('click', () => { activateTab(b.dataset.tab); closeCmdk() }))
+}
+function linkifyCitations(text) {
+  return escapeHTML(text || '').replace(/\[(\d+)\]/g, '<span class="text-policy font-semibold">[$1]</span>')
+}
+async function askIt() {
+  const q = $('#cmdk-input')?.value.trim(); if (!q) return
+  const sugg = $('#cmdk-suggestions'); const results = $('#cmdk-results'); const out = $('#cmdk-output')
+  sugg.classList.add('hidden'); results.classList.add('hidden'); out.classList.remove('hidden')
+  out.innerHTML = '<div class="flex items-center gap-2 text-gray-400 text-sm"><div class="w-4 h-4 border-2 border-policy border-t-transparent rounded-full animate-spin"></div> Thinking…</div>'
+  try {
+    const data = await SCOUTT.post('/api/ask', { question: q })
+    out.innerHTML = `<div class="text-sm leading-relaxed">${linkifyCitations(data.answer)}</div>
+      <div class="mt-4 border-t border-ink-700 pt-3"><div class="text-[10px] mono uppercase text-gray-500 mb-2">Citations</div>
+      <div class="flex flex-wrap gap-1.5">${(data.citations || []).map(c => `<button type="button" data-url="${escapeHTML(c.url)}" class="citation-chip text-[11px] mono px-2 py-1 rounded border border-${c.pillar === 'policy' ? 'policy' : c.pillar === 'competitor' ? 'competitor' : 'sentiment'}/50 text-${c.pillar === 'policy' ? 'policy' : c.pillar === 'competitor' ? 'competitor' : 'sentiment'} hover:bg-ink-700 cursor-pointer">${c.ref} ${escapeHTML((c.title || '').slice(0, 50))}</button>`).join('')}</div></div>
+      <div class="text-[10px] mono text-gray-600 mt-3">model: ${escapeHTML(data.model || '')}</div>`
+    $$('.citation-chip').forEach(b => b.addEventListener('click', () => window.open(b.dataset.url, '_blank')))
+  } catch (e) {
+    out.innerHTML = `<div class="text-red-400 text-sm">Error: ${escapeHTML(e.message)}</div>`
+  }
+}
+
+/* ─── API key modal helpers ─────────────────────────────────── */
+function refreshKeyUI() {
+  const label = $('#apikey-label'), icon = $('#apikey-icon')
+  if (!label || !icon) return
+  if (SCOUTT.hasKey) { label.textContent = 'Live • Anakin'; icon.classList.remove('text-policy'); icon.classList.add('text-emerald-400') }
+  else { label.textContent = 'Enter API Key'; icon.classList.add('text-policy'); icon.classList.remove('text-emerald-400') }
+}
+function openKeyModal() {
+  const m = $('#apikey-modal'); if (!m) return
+  m.classList.remove('hidden')
+  const inp = $('#apikey-input'); if (inp) inp.value = SCOUTT.apiKey
+  $('#apikey-status')?.classList.add('hidden')
+  setTimeout(() => $('#apikey-input')?.focus(), 50)
+}
+function closeKeyModal() { $('#apikey-modal')?.classList.add('hidden') }
+function showStatus(text, ok) {
+  const el = $('#apikey-status'); if (!el) return
+  el.classList.remove('hidden')
+  el.className = `mt-3 text-xs ${ok ? 'text-emerald-400' : 'text-red-400'}`
+  el.textContent = text
+}
+
+/* ─── Transparency drawer ─────────────────────────────────── */
+function closeDrawer() {
+  $('#transparency-backdrop')?.classList.add('hidden')
+  $('#transparency-drawer')?.classList.remove('open')
+}
+function renderTransparency(d) {
+  return Object.entries(d).map(([k, v]) => `
+    <div>
+      <h3 class="text-xs mono uppercase text-policy mb-2">${k}</h3>
+      <pre class="bg-ink-900 border border-ink-700 rounded-lg p-3 text-[11px] mono text-gray-300 whitespace-pre-wrap break-words max-h-[280px] overflow-auto">${escapeHTML(JSON.stringify(v, null, 2))}</pre>
+    </div>`).join('')
+}
+
+/* ─── Brief modal ─────────────────────────────────────────── */
+function openBriefModal() {
+  const m = $('#brief-modal'); if (!m) return
+  m.classList.remove('hidden')
+  const p = STATE.payload; if (!p) return
+  const title = $('#brief-modal-title'); if (title) title.textContent = p.briefing?.headline || 'Today'
+  const body = $('#brief-modal-body'); if (!body) return
+  body.innerHTML = (p.briefing?.events || []).map(e => `
+    <div class="border-l-2 border-${e.pillar === 'policy' ? 'policy' : e.pillar === 'competitor' ? 'competitor' : 'sentiment'} pl-3">
+      <div class="text-[10px] mono uppercase text-gray-500 mb-1">${escapeHTML(e.pillar)} • sev ${e.severity}</div>
+      <div class="text-sm font-semibold">${escapeHTML(e.title)}</div>
+      <p class="text-xs text-gray-400 mt-1">${escapeHTML(e.summary || '')}</p>
+      <a href="${escapeHTML(e.source_url || '#')}" target="_blank" rel="noopener" class="text-[11px] text-policy hover:underline">${escapeHTML(e.source_name || 'source')} →</a>
+    </div>`).join('') || '<div class="text-xs text-gray-500">No events.</div>'
+}
+function closeBriefModal() { $('#brief-modal')?.classList.add('hidden') }
+
+/* ─── Audio TTS ───────────────────────────────────────────── */
+let _audioBusy = false, _audioObjUrl = null
+function setListenLoading(on) {
+  const icon = $('#play-audio-icon'); if (!icon) return
+  icon.innerHTML = on
+    ? '<div class="w-4 h-4 border-2 border-policy border-t-transparent rounded-full animate-spin"></div>'
+    : '<i class="fa-solid fa-headphones text-policy"></i>'
+}
+function stopAudio() {
+  $('#audio-toast')?.classList.add('hidden')
+  const a = $('#audio-el'); if (a) { a.pause(); a.currentTime = 0 }
+  if (window.speechSynthesis) speechSynthesis.cancel()
+}
+async function playBriefAudio() {
+  if (_audioBusy) return; _audioBusy = true
+  const b = STATE.payload?.briefing
+  const text = b ? `Threat level ${b.threat_level}. ${b.headline || ''} ${(b.events || []).slice(0, 4).map(e => e.title).join('. ')}.`
+                 : 'No briefing loaded.'
+  const toast = $('#audio-toast'); const sub = $('#audio-toast-sub'); const title = $('#audio-toast-title')
+  setListenLoading(true)
+  toast?.classList.remove('hidden')
+  if (sub)   sub.textContent = 'Calling ElevenLabs…'
+  if (title) title.textContent = 'Generating audio…'
+  try {
+    const res = await fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...SCOUTT.headers() },
+      body: JSON.stringify({ text }),
+    })
+    if (!res.ok) throw new Error('TTS proxy returned ' + res.status)
+    const blob = await res.blob()
+    if (_audioObjUrl) URL.revokeObjectURL(_audioObjUrl)
+    _audioObjUrl = URL.createObjectURL(blob)
+    const audio = $('#audio-el'); audio.src = _audioObjUrl
+    if (sub)   sub.textContent = 'ElevenLabs • playing'
+    if (title) title.textContent = 'Reading your brief'
+    setListenLoading(false)
+    await audio.play()
+    audio.onended = () => { toast?.classList.add('hidden') }
+  } catch (e) {
+    if (sub) sub.textContent = 'Browser TTS fallback'
+    setListenLoading(false)
+    if (window.speechSynthesis) {
+      const u = new SpeechSynthesisUtterance(text); u.rate = 1.05; u.pitch = 1
+      speechSynthesis.cancel(); speechSynthesis.speak(u)
+      u.onend = () => toast?.classList.add('hidden')
+    } else {
+      if (title) title.textContent = 'TTS unavailable'
+      setTimeout(() => toast?.classList.add('hidden'), 2500)
+    }
+  } finally { _audioBusy = false }
+}
+
 /* ═════════════════════ SCENARIO ══════════════════════════════ */
 async function runScenario() {
   const input = $('#scenario-input'); const scenario = input?.value.trim(); if (!scenario) return
@@ -705,11 +1023,6 @@ async function runScenario() {
   btn.innerHTML = '<div class="w-4 h-4 border-2 border-ink-950 border-t-transparent rounded-full animate-spin"></div> Re-running…'
   if (err) err.classList.add('hidden')
   if (result) result.classList.add('hidden')
-
-  // Make sure the payload is cached server-side first so /api/scenario returns fast.
-  if (SCOUTT.hasKey && (!STATE.payload || STATE.payload.source !== 'anakin-live')) {
-    try { await fetchPayload(STATE.day) } catch {}
-  }
 
   try {
     const ctrl = new AbortController()
@@ -741,260 +1054,21 @@ async function runScenario() {
   } catch (e) {
     if (err) {
       err.classList.remove('hidden')
-      err.innerHTML = `<i class="fa-solid fa-triangle-exclamation mr-2"></i>Scenario failed: ${escapeHTML(e.message || String(e))}.
-        ${SCOUTT.hasKey ? 'Live briefing may still be generating — try again in ~10 seconds.' : 'Please retry.'}`
-    } else {
-      showToast('Scenario failed: ' + e.message, 'error')
-    }
+      err.innerHTML = `<i class="fa-solid fa-triangle-exclamation mr-2"></i>Scenario failed: ${escapeHTML(e.message || String(e))}.`
+    } else { showToast('Scenario failed: ' + e.message, 'error') }
   } finally {
     btn.disabled = false
     btn.innerHTML = '<i class="fa-solid fa-play"></i> Run scenario'
   }
 }
 
-/* ═════════════════════ MODALS ════════════════════════════════ */
-function openBriefModal() {
-  const m = $('#brief-modal'); if (!m) return
-  m.classList.remove('hidden')
-  const b = STATE.payload?.briefing
-  const title = $('#brief-modal-title'); if (title) title.textContent = b?.headline || 'Daily briefing'
-  const events  = b?.events  || []
-  const actions = b?.actions || []
-  $('#brief-modal-body').innerHTML = `
-    <div class="flex items-center gap-3 text-xs">
-      <span class="px-2 py-1 rounded bg-policy/15 text-policy border border-policy/40 mono">Threat ${b?.threat_level ?? '--'}/100</span>
-      <span class="text-gray-500">${events.length} events • ${actions.length} actions</span>
-      <span class="ml-auto text-[10px] mono text-gray-500 uppercase">${STATE.payload?.source || 'demo'}</span>
-    </div>
-    <div><h4 class="font-semibold text-base mb-2">Overnight events</h4>
-      <ul class="space-y-2">${events.slice(0, 12).map(e => `
-        <li class="border-l-2 pl-3 ${e.pillar === 'policy' ? 'border-policy' : e.pillar === 'competitor' ? 'border-competitor' : 'border-sentiment'}">
-          <div class="text-sm font-medium">${escapeHTML(e.title)}</div>
-          <div class="text-xs text-gray-400 mt-0.5">${escapeHTML(e.summary || '')}</div>
-          <div class="text-[10px] mono text-gray-500 mt-1">sev ${e.severity} • <a href="${escapeHTML(e.source_url || '#')}" target="_blank" rel="noopener" class="text-policy hover:underline">source ↗</a></div>
-        </li>`).join('')}
-      </ul></div>
-    <div><h4 class="font-semibold text-base mb-2">Today's 3 actions</h4>
-      <ol class="space-y-2 list-decimal list-inside">${actions.map(a => `
-        <li><span class="font-medium">${escapeHTML(a.title)}</span>
-          <div class="text-xs text-gray-400 ml-5">${escapeHTML(a.why_now || '')}</div></li>`).join('')}
-      </ol></div>`
-}
-function closeBriefModal() { $('#brief-modal')?.classList.add('hidden') }
-
-/* ═════════════════════ ASK SCOUTT (⌘K) ═══════════════════════ */
-let SEARCH_DEBOUNCE = null
-function debounce(fn, w) { return (...a) => { clearTimeout(SEARCH_DEBOUNCE); SEARCH_DEBOUNCE = setTimeout(() => fn(...a), w) } }
-async function refreshSearchIndex() {
-  try { const { index } = await SCOUTT.fetch('/api/search-index'); GLOBAL_INDEX = index || [] }
-  catch { GLOBAL_INDEX = [] }
-}
-const SECTION_ICON = {
-  'Policy Radar': 'fa-scale-balanced text-policy',
-  'Competitor Pulse': 'fa-chess-knight text-competitor',
-  'Sentiment Storm': 'fa-wave-square text-sentiment',
-  "Today's Actions": 'fa-list-check text-action',
-  'Overnight Brief': 'fa-sun text-policy',
-}
-function renderSearchResults(q) {
-  const results = $('#cmdk-results'); const sugg = $('#cmdk-suggestions'); const out = $('#cmdk-output')
-  if (!results || !sugg || !out) return
-  if (!q.trim()) { results.classList.add('hidden'); sugg.classList.remove('hidden'); out.classList.add('hidden'); return }
-  sugg.classList.add('hidden'); out.classList.add('hidden'); results.classList.remove('hidden')
-  const needle = q.toLowerCase()
-  const matches = GLOBAL_INDEX.filter(it =>
-    (it.title || '').toLowerCase().includes(needle) ||
-    (it.subtitle || '').toLowerCase().includes(needle) ||
-    (it.section || '').toLowerCase().includes(needle))
-  const grouped = matches.reduce((m, r) => { (m[r.section] = m[r.section] || []).push(r); return m }, {})
-  const order = ['Overnight Brief', 'Policy Radar', 'Competitor Pulse', 'Sentiment Storm', "Today's Actions"]
-  let html = ''
-  order.forEach(sec => {
-    const arr = grouped[sec]; if (!arr || !arr.length) return
-    html += `<div class="px-4 py-2 text-[10px] mono uppercase tracking-widest text-gray-500 bg-ink-900 border-y border-ink-700">Found in ${escapeHTML(sec)} (${arr.length})</div>`
-    html += arr.slice(0, 6).map(r => `
-      <button type="button" data-tab="${r.tab}" data-url="${escapeHTML(r.url || '')}" class="search-hit w-full text-left px-4 py-3 hover:bg-ink-700 flex items-start gap-3 border-b border-ink-800 cursor-pointer">
-        <i class="fa-solid ${SECTION_ICON[sec] || 'fa-circle text-gray-500'} mt-1 text-xs"></i>
-        <div class="flex-1 min-w-0">
-          <div class="text-sm font-medium truncate">${escapeHTML(r.title)}</div>
-          <div class="text-[11px] text-gray-500 truncate">${escapeHTML(r.subtitle || '')}</div>
-        </div>
-        <span class="mono text-[10px] text-gray-500 shrink-0">sev ${r.severity ?? '–'}</span>
-      </button>`).join('')
-  })
-  if (!matches.length)
-    html = `<div class="px-4 py-6 text-center text-sm text-gray-500">No matches in dashboard data.</div>
-            <button id="cmdk-ask-instead" type="button" class="w-full text-left px-4 py-3 bg-policy/10 hover:bg-policy/20 border-t border-policy/30 text-sm cursor-pointer">
-              <i class="fa-solid fa-sparkles text-policy mr-2"></i> Ask SCOUTT: "<strong>${escapeHTML(q)}</strong>"
-            </button>`
-  else
-    html += `<button id="cmdk-ask-instead" type="button" class="w-full text-left px-4 py-3 bg-policy/5 hover:bg-policy/15 border-t border-ink-700 text-sm cursor-pointer">
-              <i class="fa-solid fa-sparkles text-policy mr-2"></i> Or ask SCOUTT: "<strong>${escapeHTML(q)}</strong>"
-            </button>`
-  results.innerHTML = html
-  $$('.search-hit').forEach(b => b.addEventListener('click', () => { closeCmdk(); if (b.dataset.tab) activateTab(b.dataset.tab) }))
-  $('#cmdk-ask-instead')?.addEventListener('click', () => { $('#cmdk-input').value = q; askIt() })
-}
-function openCmdk() { $('#cmdk')?.classList.remove('hidden'); setTimeout(() => $('#cmdk-input')?.focus(), 50) }
-function closeCmdk() {
-  $('#cmdk')?.classList.add('hidden')
-  const inp = $('#cmdk-input'); if (inp) inp.value = ''
-  $('#cmdk-output')?.classList.add('hidden'); $('#cmdk-results')?.classList.add('hidden'); $('#cmdk-suggestions')?.classList.remove('hidden')
-}
-async function askIt() {
-  const q = $('#cmdk-input')?.value.trim(); if (!q) return
-  const sugg = $('#cmdk-suggestions'); const results = $('#cmdk-results'); const out = $('#cmdk-output')
-  sugg.classList.add('hidden'); results.classList.add('hidden'); out.classList.remove('hidden')
-  out.innerHTML = '<div class="flex items-center gap-2 text-gray-400 text-sm"><div class="w-4 h-4 border-2 border-policy border-t-transparent rounded-full animate-spin"></div> Thinking…</div>'
-  try {
-    const data = await SCOUTT.post('/api/ask', { question: q })
-    out.innerHTML = `<div class="text-sm leading-relaxed">${linkifyCitations(data.answer)}</div>
-      <div class="mt-4 border-t border-ink-700 pt-3"><div class="text-[10px] mono uppercase text-gray-500 mb-2">Citations</div>
-      <div class="flex flex-wrap gap-1.5">${(data.citations || []).map(c => `<button type="button" data-url="${escapeHTML(c.url)}" class="citation-chip text-[11px] mono px-2 py-1 rounded border border-${c.pillar === 'policy' ? 'policy' : c.pillar === 'competitor' ? 'competitor' : 'sentiment'}/50 text-${c.pillar === 'policy' ? 'policy' : c.pillar === 'competitor' ? 'competitor' : 'sentiment'} hover:bg-ink-700 cursor-pointer">${c.ref} ${escapeHTML((c.title || '').slice(0, 50))}</button>`).join('')}</div></div>
-      <div class="text-[10px] mono text-gray-600 mt-3">model: ${escapeHTML(data.model || '')}</div>`
-    $$('.citation-chip').forEach(b => b.addEventListener('click', () => window.open(b.dataset.url, '_blank')))
-  } catch (e) {
-    out.innerHTML = `<div class="text-red-400 text-sm">Error: ${escapeHTML(e.message)}</div>`
-  }
-}
-function linkifyCitations(s) { return (s || '').replace(/\[(\d+)\]/g, '<sup class="text-policy mono">[$1]</sup>') }
-
-/* ═════════════════════ TRANSPARENCY ══════════════════════════ */
-function closeDrawer() { $('#transparency-drawer')?.classList.remove('open'); $('#transparency-backdrop')?.classList.add('hidden') }
-function renderTransparency(d) {
-  const section = (t, b) => `<section><h3 class="font-semibold text-sm mb-2 flex items-center gap-2"><span class="w-1 h-4 bg-policy"></span> ${t}</h3>${b}</section>`
-  const code = (s, max = 4000) => `<pre class="code">${escapeHTML((typeof s === 'string' ? s : JSON.stringify(s, null, 2)).slice(0, max))}</pre>`
-  return `${section('1. Daily Battle Brief — Anakin call', `<p class="text-gray-400 mb-2">${escapeHTML(d.daily_briefing.endpoint)}</p>${code(d.daily_briefing.system_prompt)}<div class="text-[10px] mono uppercase text-gray-500 mb-1 mt-3">User prompt</div>${code(d.daily_briefing.user_prompt)}<div class="text-[10px] mono uppercase text-gray-500 mb-1 mt-3">Custom JSON schema</div>${code(d.daily_briefing.json_schema)}`)}
-  ${section('2. Hourly competitor scraper', `<p class="text-gray-400 mb-2">${escapeHTML(d.competitor_scraper.endpoint)}</p>${code(d.competitor_scraper.prompt)}`)}
-  ${section('3. Ask SCOUTT', `<p class="text-gray-400 mb-2">${escapeHTML(d.ask_realitypulse.endpoint)}</p>${code(d.ask_realitypulse.prompt_template)}`)}
-  ${section('4. Raw response sample', code(d.raw_response_sample, 6000))}`
-}
-
-/* ═════════════════════ TTS ═══════════════════════════════════ */
-let _audioBusy = false; let _audioObjUrl = null
-function setListenLoading(loading) {
-  const icon = $('#play-audio-icon'); const label = $('#play-audio-label'); const btn = $('#play-audio')
-  if (!icon || !label || !btn) return
-  if (loading) {
-    btn.setAttribute('disabled', 'true'); btn.classList.add('opacity-70', 'pointer-events-none')
-    icon.innerHTML = '<span class="w-4 h-4 border-2 border-policy border-t-transparent rounded-full animate-spin inline-block"></span>'
-    label.textContent = 'Generating…'
-  } else {
-    btn.removeAttribute('disabled'); btn.classList.remove('opacity-70', 'pointer-events-none')
-    icon.innerHTML = '<i class="fa-solid fa-headphones text-policy"></i>'
-    label.textContent = 'Listen'
-  }
-}
-async function playBriefAudio() {
-  if (_audioBusy) return; _audioBusy = true
-  const b = STATE.payload?.briefing
-  const text = b ? `Threat level ${b.threat_level}. ${b.headline || ''} ${(b.events || []).slice(0, 4).map(e => e.title).join('. ')}.`
-                 : 'No briefing loaded.'
-  const toast = $('#audio-toast'); const sub = $('#audio-toast-sub'); const title = $('#audio-toast-title')
-  setListenLoading(true)
-  toast?.classList.remove('hidden')
-  if (sub)   sub.textContent = 'Calling ElevenLabs…'
-  if (title) title.textContent = 'Generating audio…'
-  try {
-    const res = await fetch('/api/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...SCOUTT.headers() },
-      body: JSON.stringify({ text }),
-    })
-    if (!res.ok) throw new Error('TTS proxy returned ' + res.status)
-    const blob = await res.blob()
-    if (_audioObjUrl) URL.revokeObjectURL(_audioObjUrl)
-    _audioObjUrl = URL.createObjectURL(blob)
-    const audio = $('#audio-el')
-    audio.src = _audioObjUrl
-    if (sub)   sub.textContent = 'ElevenLabs • playing'
-    if (title) title.textContent = 'Reading your brief'
-    setListenLoading(false)
-    await audio.play()
-    audio.onended = () => { toast?.classList.add('hidden') }
-  } catch (e) {
-    if (sub) sub.textContent = 'Browser TTS fallback'
-    setListenLoading(false)
-    if (window.speechSynthesis) {
-      const u = new SpeechSynthesisUtterance(text); u.rate = 1.05; u.pitch = 1
-      speechSynthesis.cancel(); speechSynthesis.speak(u)
-      u.onend = () => toast?.classList.add('hidden')
-    } else {
-      if (title) title.textContent = 'TTS unavailable'
-      setTimeout(() => toast?.classList.add('hidden'), 2500)
-    }
-  } finally { _audioBusy = false }
-}
-function stopAudio() {
-  const audio = $('#audio-el')
-  if (audio) { audio.pause(); audio.currentTime = 0 }
-  if (window.speechSynthesis) speechSynthesis.cancel()
-  $('#audio-toast')?.classList.add('hidden'); setListenLoading(false)
-}
-
-/* ═════════════════════ TABS ══════════════════════════════════ */
-function activateTab(target) {
-  if (!target) return
-  $$('.tab-btn').forEach(b => {
-    if (b.dataset.tab === target) { b.classList.add('tab-active'); b.classList.remove('text-gray-400') }
-    else { b.classList.remove('tab-active'); b.classList.add('text-gray-400') }
-  })
-  $$('.tab-pane').forEach(p => p.classList.add('hidden'))
-  document.querySelector(`[data-pane="${target}"]`)?.classList.remove('hidden')
-  window.dispatchEvent(new Event('resize'))
-}
-
-/* ═════════════════════ TIME MACHINE ══════════════════════════ */
-let TM_DEBOUNCE = null
-function updateTimeMachine(v) {
-  const label = $('#time-machine-label'); if (!label) return
-  const num = Number(v)
-  if (num === 0) {
-    label.textContent = 'Today — live'
-    label.classList.add('text-policy'); label.classList.remove('text-competitor')
-  } else {
-    const d = new Date(); d.setDate(d.getDate() - num)
-    label.textContent = d.toISOString().slice(0, 10) + ' — cached'
-    label.classList.remove('text-policy'); label.classList.add('text-competitor')
-  }
-  clearTimeout(TM_DEBOUNCE)
-  TM_DEBOUNCE = setTimeout(async () => {
-    try { const data = await fetchPayload(num); await renderAll(data) }
-    catch (e) { showToast('Time machine load failed: ' + e.message, 'error') }
-  }, 220)
-}
-
-/* ═════════════════════ API-KEY UI ════════════════════════════ */
-function refreshKeyUI() {
-  const label = $('#apikey-label'), icon = $('#apikey-icon')
-  if (!label || !icon) return
-  if (SCOUTT.hasKey) { label.textContent = 'Live • Anakin'; icon.classList.remove('text-policy'); icon.classList.add('text-emerald-400') }
-  else { label.textContent = 'Enter API Key'; icon.classList.add('text-policy'); icon.classList.remove('text-emerald-400') }
-}
-function openKeyModal() {
-  const m = $('#apikey-modal'); if (!m) return
-  m.classList.remove('hidden')
-  const inp = $('#apikey-input'); if (inp) inp.value = SCOUTT.apiKey
-  $('#apikey-status')?.classList.add('hidden')
-  setTimeout(() => $('#apikey-input')?.focus(), 50)
-}
-function closeKeyModal() { $('#apikey-modal')?.classList.add('hidden') }
-function showStatus(msg, ok = true) {
-  const el = $('#apikey-status'); if (!el) return
-  el.classList.remove('hidden')
-  el.className = `mt-3 text-xs ${ok ? 'text-emerald-400' : 'text-red-400'}`
-  el.textContent = msg
-}
-
-/* ═════════════════════ EVENT WIRING ══════════════════════════ */
+/* ═════════════════════ EVENT WIRING ══════════════════════════════ */
 function wireEvents() {
-  // Tab nav
   document.addEventListener('click', e => {
     const tabBtn = e.target.closest('.tab-btn')
     if (tabBtn && tabBtn.dataset.tab) activateTab(tabBtn.dataset.tab)
   })
 
-  // ⌘K
   $('#cmdk-trigger')?.addEventListener('click', openCmdk)
   document.addEventListener('keydown', e => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openCmdk() }
@@ -1024,12 +1098,14 @@ function wireEvents() {
     const k = $('#apikey-input')?.value.trim() || ''
     if (!k) { showStatus('Paste a key first.', false); return }
     try { localStorage.setItem('scoutt_anakin_key', k) } catch {}
-    SCOUTT.apiKey = k; refreshKeyUI(); showStatus('Key saved. Fetching live data…', true)
+    SCOUTT.apiKey = k; refreshKeyUI(); showStatus('Key saved. Launching live pipeline…', true)
     try { await SCOUTT.post('/api/dashboard/refresh', {}) } catch {}
     try {
-      const data = await fetchPayload(0); await renderAll(data)
-      if (data.source === 'anakin-live') showStatus('✓ Live data flowing.', true)
-      else if (data.source === 'demo-fallback') showStatus('Live call failed: ' + (data.error || 'unknown'), false)
+      // Kick off the new 3-step browser-orchestrated pipeline.
+      const live = await runLivePipeline()
+      if (live) await renderAll(live)
+      if (live && live.source === 'anakin-live') showStatus('✓ Live Anakin → NVIDIA data flowing.', true)
+      else showStatus('Live call failed — running on demo. Re-try in 10s.', false)
       setTimeout(closeKeyModal, 1500)
     } catch (e) { showStatus('Failed: ' + e.message, false) }
   })

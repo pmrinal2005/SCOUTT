@@ -1,82 +1,183 @@
-# 🛰️ RealityPulse / SCOUTT
-**Bloomberg Terminal for Small & Mid-market Businesses**
-Daily Battle Brief on policy, competitors, and sentiment — powered by Anakin Agentic Search + NVIDIA NIM + Supabase + Vercel.
+# SCOUTT — Bloomberg Terminal for Small & Mid-market Businesses
+
+<p align="left">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/Node.js-339933?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js" />
+  <img src="https://img.shields.io/badge/Express-000000?style=for-the-badge&logo=express&logoColor=white" alt="Express" />
+  <img src="https://img.shields.io/badge/Vercel-000000?style=for-the-badge&logo=vercel&logoColor=white" alt="Vercel" />
+  <img src="https://img.shields.io/badge/NVIDIA_NIM-76B900?style=for-the-badge&logo=nvidia&logoColor=white" alt="NVIDIA" />
+  <img src="https://img.shields.io/badge/Anakin_AI-7C3AED?style=for-the-badge&logo=openai&logoColor=white" alt="Anakin" />
+  <img src="https://img.shields.io/badge/Supabase-3ECF8E?style=for-the-badge&logo=supabase&logoColor=white" alt="Supabase" />
+  <img src="https://img.shields.io/badge/Tailwind_CSS-06B6D4?style=for-the-badge&logo=tailwindcss&logoColor=white" alt="Tailwind" />
+  <img src="https://img.shields.io/badge/Chart.js-FF6384?style=for-the-badge&logo=chartdotjs&logoColor=white" alt="Chart.js" />
+  <img src="https://img.shields.io/badge/Font_Awesome-528DD7?style=for-the-badge&logo=fontawesome&logoColor=white" alt="FontAwesome" />
+  <img src="https://img.shields.io/badge/ElevenLabs-000000?style=for-the-badge&logo=elevenlabs&logoColor=white" alt="ElevenLabs" />
+  <img src="https://img.shields.io/badge/Llama_3.2-FF6F00?style=for-the-badge&logo=meta&logoColor=white" alt="Llama 3.2" />
+</p>
+
+> Daily Battle Brief on policy, competitors, and sentiment — fused into one decisive
+> screen before your first coffee. Powered by an **Anakin Agentic Search → NVIDIA NIM
+> reshape** pipeline that turns raw web intelligence into a fully structured
+> dashboard payload.
+
+🔗 **Live demo:** <https://scouttbymrinal.vercel.app/>
+🔗 **Source:** <https://github.com/pmrinal2005/SCOUTT>
 
 ---
 
-## 🚀 One-paragraph pitch
+## 🚀 What is SCOUTT?
 
-RealityPulse fuses three streams — regulatory filings, competitor pricing-page diffs, and consumer-sentiment signals — into a single 06:00-UTC **Daily Battle Brief** rendered on a Bloomberg-Terminal-grade dashboard with the **Pulse Wheel** as its hero visual. Anakin Agentic Search does the synthesis (≈15 credits/brief), NVIDIA `meta/llama-3.2-3b-instruct` powers the `Cmd+K` "Ask RealityPulse" chat over a pgvector RAG index, and Supabase Realtime broadcasts INSERTs so the dashboard live-updates with Framer-Motion entrances.
+SCOUTT is a Bloomberg-Terminal-grade morning briefing for small and mid-market
+operators. Every business day at 06:00 UTC it scans regulatory filings, competitor
+pricing pages, and consumer sentiment streams, then synthesises everything into:
 
----
-
-## 📐 Architecture (data flow)
-
-1. **Onboarding** → user picks industry + region + competitor domains → saved to `tenants`.
-2. **Vercel Cron (06:00 UTC daily)** → kicks the daily briefing route.
-3. **Briefing pipeline** → submits an Anakin Agentic Search with templated prompt + custom JSON schema, polls every 10 s.
-4. **On completion** → `generated_json` written to `briefings` (JSONB). Sources embedded (NVIDIA NV-Embed-v2) → `pgvector`.
-5. **Supabase Realtime** broadcasts the `INSERT` → dashboard updates live.
-6. **Hourly check** → `/v1/url-scraper` on competitor pricing pages → diff → `competitor_moves` row + Resend/Slack alert.
+- A single **Threat Level** score (0-100) with a Bloomberg-style needle gauge.
+- A 24-hour **Pulse Wheel** of events across Policy / Competitor / Sentiment.
+- A **Global Regulatory Heatmap** of enforcement activity (real world map).
+- The **Top 3 actions** the operator should take today — ready as email & Slack drafts.
+- An NVIDIA-powered **Ask SCOUTT** chat over the day's evidence with bracket citations.
 
 ---
 
-## 🛠️ Tech stack
+## 🏗️ Architecture
 
-| Layer | Choice | Why |
-|---|---|---|
-| Web framework | [Hono](https://hono.dev/) | Ultra-light, runs on Node + Vercel |
-| Hosting | Vercel **Hobby (free)** | Serverless Node functions + global CDN |
-| Database | Supabase **Free tier** | Postgres + pgvector + Realtime + RLS |
-| LLM | NVIDIA NIM `meta/llama-3.2-3b-instruct` | Free for development on build.nvidia.com |
-| Agentic search | Anakin Agentic Search | Structured-output search engine |
-| Styling | Tailwind CDN + Inter/JetBrains Mono | Zero build step |
-| Charts | Chart.js CDN + custom SVG (Pulse Wheel) | Zero npm bloat |
+```
+              ┌────────────────────────┐
+   Browser ──▶│  POST /api/anakin/start│──▶  Anakin Agentic Search
+              └────────────────────────┘            │  (15-credit briefing job)
+                          ▲                         │
+                          │ {job_id}                ▼
+              ┌────────────────────────┐     ┌────────────┐
+              │ GET /api/anakin/poll/… │ ◀── │  job queue │  (poll every 8s)
+              └────────────────────────┘     └────────────┘
+                          ▲                         │
+                          │ status: completed       ▼
+              ┌────────────────────────┐    ┌─────────────────────┐
+              │POST /api/nvidia/reshape│──▶ │ NVIDIA NIM           │
+              │  body: {raw}           │    │ meta/llama-3.2-3b   │
+              └────────────────────────┘    │ instruct             │
+                          │                 └─────────────────────┘
+                          ▼
+              ┌────────────────────────┐
+              │ DashboardPayload (JSON)│ ──▶ rendered into every tile,
+              │  cached 10 min per key │     every tab, every chart.
+              └────────────────────────┘
+```
+
+### Why the pipeline is split across **three** short serverless calls
+
+Vercel **Hobby** plan caps every serverless function at **60s**. A real
+Anakin Agentic Search job typically takes 40-90s, plus the NVIDIA NIM
+reshape (5-15s). Running all of that inside a single request always
+timed out before NVIDIA was even invoked — that's why the previous
+deploy showed *"Live call failed — Anakin poll timeout (Vercel 60s cap)"*
+and NVIDIA logs were empty.
+
+The fix splits the pipeline:
+
+| Step | Endpoint                       | Duration | Purpose                              |
+|------|--------------------------------|----------|--------------------------------------|
+| 1    | `POST /api/anakin/start`       | ≤3 s     | Submit Anakin job, return `job_id`. |
+| 2    | `GET  /api/anakin/poll/:jobId` | ≤2 s     | One Anakin poll (browser loops).    |
+| 3    | `POST /api/nvidia/reshape`     | ≤15 s    | NVIDIA reshape → DashboardPayload.  |
+
+The browser orchestrates the loop. No single serverless call ever
+approaches the 60 s wall, and NVIDIA is now reliably invoked.
 
 ---
 
-## 📁 Project structure
+## 🧰 Tech Stack
+
+| Layer            | Technology                                                                        |
+|------------------|-----------------------------------------------------------------------------------|
+| Web framework    | [Express](https://expressjs.com/) on Vercel `@vercel/node`                       |
+| Language         | TypeScript 5.x                                                                    |
+| Hosting          | [Vercel](https://vercel.com) (Hobby / Pro)                                       |
+| Database         | [Supabase](https://supabase.com) (Postgres + pgvector + Realtime + RLS)          |
+| LLM              | [NVIDIA NIM](https://build.nvidia.com) `meta/llama-3.2-3b-instruct`              |
+| Agentic search   | [Anakin Agentic Search](https://anakin.io/docs/api-reference/agentic-search)     |
+| Styling          | Tailwind CDN + Inter / JetBrains Mono                                            |
+| Charts           | Chart.js + custom SVG (Pulse Wheel, Threat Meter, World Map, Sankey, Bubbles)    |
+| TTS              | [ElevenLabs](https://elevenlabs.io) (multilingual v2)                            |
+| Icons            | Font Awesome 6                                                                    |
+
+---
+
+## 📁 Project Structure
 
 ```
 SCOUTT/
 ├── api/
-│   └── index.ts                  # Vercel serverless entry (imports src/index.tsx)
-├── scripts/
-│   └── dev.ts                    # Local dev server (Node + Hono)
+│   └── index.ts                       # Vercel serverless entry (Express app)
 ├── src/
-│   ├── index.tsx                 # Hono app — every route lives here
-│   ├── supabase.ts               # Supabase client + data accessors
-│   ├── anakin-prompts.ts         # Exact Anakin prompts + JSON schema
-│   ├── demo-data.ts              # Deterministic demo seed (fallback)
-│   ├── hono-node-server.d.ts     # Type shim for serve-static subpath
+│   ├── live-pipeline.ts               # 🆕 Async Anakin → NVIDIA pipeline
+│   ├── anakin-prompts.ts              # Anakin briefing prompt + NVIDIA reshape prompt
+│   ├── demo-data.ts                   # Demo template + buildDemoPayload + DashboardPayload type
+│   ├── supabase.ts                    # Supabase client + data accessors
 │   └── pages/
-│       ├── shell.ts              # HTML shell (Tailwind + Chart.js CDN)
-│       ├── landing.ts            # Landing page (animated SVG globe)
-│       ├── onboarding.ts         # 3-step onboarding wizard
-│       └── dashboard.ts          # Command Center + 5 tabs
+│       ├── shell.ts                   # HTML shell (Tailwind/Chart.js CDN)
+│       ├── landing.ts                 # Marketing landing page
+│       ├── onboarding.ts              # 3-step onboarding wizard
+│       └── dashboard.ts               # Command Center + 5 tabs + modals
 ├── public/
 │   └── static/
-│       ├── dashboard.js          # All client-side interactivity
-│       └── favicon.svg
-├── migrations/                   # Reference only — use supabase_setup.sql
-│   ├── 0001_initial_schema.sql
-│   ├── 0002_demo_seed.sql
-│   └── 0003_realitypulse_rls.sql
-├── supabase_setup.sql            # ★ The one file you paste in Supabase
-├── .env.example
+│       ├── dashboard.js               # All client-side interactivity
+│       └── world-map-paths.js         # 🆕 Real-world country SVG paths
+├── supabase_setup.sql                 # The one SQL file to paste into Supabase
+├── vercel.json                        # Routes & runtime config
 ├── package.json
 ├── tsconfig.json
-├── vercel.json
 └── README.md
 ```
 
 ---
 
-## 🪟 Local setup — Windows (PowerShell)
+## 🔌 API Endpoints
 
-> Requires **Node ≥ 18.18** and **npm ≥ 9**. (`node -v` to verify.)
+### Async live pipeline (new)
 
-```powershell
+| Method | Endpoint                       | Notes                                                |
+|--------|--------------------------------|------------------------------------------------------|
+| POST   | `/api/anakin/start`            | Submit Anakin job. Requires `X-Anakin-Key` header.   |
+| GET    | `/api/anakin/poll/:job_id`     | One-shot poll. Returns `{status, raw?}`.             |
+| POST   | `/api/nvidia/reshape`          | Body `{raw}`. Runs NVIDIA `meta/llama-3.2-3b-instruct`, caches result, returns `DashboardPayload`. |
+
+### Read endpoints (all derive from the cached `DashboardPayload`)
+
+| Endpoint                          | Returns                              |
+|-----------------------------------|--------------------------------------|
+| `GET /api/dashboard?day=N`        | The unified payload (day-aged).      |
+| `GET /api/briefing/today`         | Today's briefing block.              |
+| `GET /api/timeline`               | 7-day event timeline.                |
+| `GET /api/charts/pricing-race`    | Pricing race series.                 |
+| `GET /api/charts/sentiment-volume`| Sentiment volume series.             |
+| `GET /api/charts/topic-bubbles`   | Topic cluster bubbles.               |
+| `GET /api/charts/policy-regions`  | Policy heatmap pins.                 |
+| `GET /api/charts/globe-dots`      | Globe dots (derived from regions).   |
+| `GET /api/policy/active`          | Active regulations cards.            |
+| `GET /api/competitor/events`      | Competitor events feed.              |
+| `GET /api/sentiment/events`       | Sentiment events feed.               |
+| `GET /api/search-index`           | ⌘K search corpus.                    |
+| `GET /api/transparency`           | Exact prompts + schema (judge bait). |
+
+### Misc
+
+| Endpoint                       | Notes                                                |
+|--------------------------------|------------------------------------------------------|
+| `POST /api/ask`                | NVIDIA-powered RAG chat over today's evidence.       |
+| `POST /api/scenario`           | Re-runs threat math against the cached briefing.     |
+| `POST /api/action/draft`       | Returns the cached email / Slack draft for an action.|
+| `POST /api/tts`                | ElevenLabs proxy.                                    |
+| `POST /api/dashboard/refresh`  | Bust the warm cache for the current key.             |
+| `GET  /api/health`             | Reports which integrations are configured.           |
+
+---
+
+## 🛠️ Local setup
+
+> Requires **Node ≥ 18.18** and **npm 9+**.
+
+```bash
 # 1) Clone
 git clone https://github.com/pmrinal2005/SCOUTT.git
 cd SCOUTT
@@ -85,160 +186,114 @@ cd SCOUTT
 npm install
 
 # 3) Configure env vars
-copy .env.example .env.local
-notepad .env.local   # fill in Supabase + NVIDIA keys
+cp .env.example .env.local
+# fill in keys (see below)
 
 # 4) Run dev server
 npm run dev
 # → http://localhost:3000
-# → http://localhost:3000/dashboard?demo=true
+# → http://localhost:3000/dashboard
 ```
 
-### macOS / Linux
-```bash
-git clone https://github.com/pmrinal2005/SCOUTT.git
-cd SCOUTT
-npm install
-cp .env.example .env.local
-nano .env.local
-npm run dev
+### `.env.local`
+
+```ini
+# Required for the NVIDIA reshape step (https://build.nvidia.com/meta/llama-3.2-3b-instruct)
+NVIDIA_API_KEY=nvapi-...
+
+# Optional — if not set, users can paste a key from the dashboard UI
+ANAKIN_API_KEY=anakin-live-...
+
+# Optional — enables ElevenLabs voice for the "Listen" button
+ELEVENLABS_API_KEY=...
+ELEVENLABS_VOICE_ID=JBFqnCBsd6RMkjVDRZzb
+
+# Supabase (free tier is enough for the demo)
+SUPABASE_URL=https://xyz.supabase.co
+SUPABASE_ANON_KEY=...
+SUPABASE_SERVICE_ROLE_KEY=...
+DEMO_TENANT_ID=00000000-0000-0000-0000-000000000001
+
+NODE_ENV=development
 ```
 
 ---
 
-## 🗄️ Supabase setup (free tier)
+## ☁️ Deploy to Vercel
 
-1. Create a project at **https://supabase.com/dashboard** (Free tier).
-2. Open **SQL Editor → New Query**.
-3. Paste the **entire content of `supabase_setup.sql`** (provided in this repo).
-4. Click **Run**. You should see `Success. No rows returned`.
-5. Go to **Settings → API** and copy:
-   - `Project URL` → `SUPABASE_URL`
-   - `anon` key → `SUPABASE_ANON_KEY`
-   - `service_role` key → `SUPABASE_SERVICE_ROLE_KEY` *(secret — never expose to the client)*
+1. Push to GitHub.
+2. <https://vercel.com/new> → import the repo.
+3. **Framework preset:** `Other` (`vercel.json` configures everything).
+4. Add the env vars from `.env.example` for Production / Preview / Development.
+5. **Deploy.**
 
-✅ Done. The demo tenant `Acme Fintech` plus today's briefing are now in the DB.
-
----
-
-## 🚢 Deploy to Vercel (Hobby — free)
-
-1. Push the repo to GitHub.
-2. Go to **https://vercel.com/new** → Import your GitHub repo.
-3. Framework Preset: **Other** (vercel.json already configures everything).
-4. **Environment Variables** — add these for *Production*, *Preview*, and *Development*:
-
-   | Key | Source |
-   |---|---|
-   | `SUPABASE_URL` | Supabase → Settings → API |
-   | `SUPABASE_ANON_KEY` | Supabase → Settings → API |
-   | `SUPABASE_SERVICE_ROLE_KEY` | Supabase → Settings → API (secret) |
-   | `DEMO_TENANT_ID` | `00000000-0000-0000-0000-000000000001` |
-   | `NVIDIA_API_KEY` | https://build.nvidia.com/meta/llama-3.2-3b-instruct |
-   | `ANAKIN_API_KEY` | (optional) https://anakin.io/docs |
-   | `NODE_ENV` | `production` |
-
-5. Click **Deploy**. Vercel runs `npm install` and ships `api/index.ts` as a Node serverless function. No build step.
-
-> **❗ Why the previous deploy failed**: `api/index.ts` exported `config.runtime = 'nodejs20.x'`. That option is reserved for `edge`/`experimental-edge` only — the Node runtime is set by `vercel.json` → `functions["api/index.ts"].runtime`. Removing the `config` export fixes the deployment.
-
----
-
-## 🔌 Hit the live API
-
-| Endpoint | What it returns |
-|---|---|
-| `GET /` | Landing page |
-| `GET /onboarding` | 3-step wizard |
-| `GET /dashboard?demo=true` | Bloomberg-style Command Center |
-| `GET /threat-index` | Public viral page |
-| `GET /api/health` | Status of Supabase / NVIDIA / Anakin connections |
-| `GET /api/briefing/today` | Today's full briefing JSON |
-| `GET /api/timeline` | 7-day event timeline |
-| `GET /api/credit-ledger` | Anakin credit usage |
-| `GET /api/transparency` | The exact Anakin prompt + JSON schema (judge-bait) |
-| `POST /api/ask` `{question}` | NVIDIA-powered RAG chat |
-| `POST /api/scenario` `{scenario}` | Re-runs threat math (0 credits) |
-| `POST /api/action/draft` `{action_id, kind}` | Email / Slack draft |
-| `POST /api/sync/seed` | One-shot seed Supabase from `demo-data.ts` |
-
----
-
-## 🧠 NVIDIA NIM integration (Ask RealityPulse)
-
-```ts
-const resp = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${NVIDIA_API_KEY}` },
-  body: JSON.stringify({
-    model: 'meta/llama-3.2-3b-instruct',
-    messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: question }],
-    temperature: 0.2, top_p: 0.7, max_tokens: 1024, stream: false,
-  }),
-})
-```
-The system prompt injects the day's briefing events as `[1] [2] [3]` evidence rows; the LLM must cite back using those bracket numbers. Citations are rendered as clickable chips that scroll to the source card.
-
----
-
-## 💰 Credit budget (Anakin)
-
-| Activity | Cost | Frequency |
-|---|---|---|
-| Daily Battle Brief (Agentic Search) | 15 | 1× / day / tenant |
-| Competitor pricing diff (url-scraper) | 1 | hourly / domain |
-| Ask RealityPulse (fresh search) | 3 | per question |
-| Cached scenarios / drafts | 0 | unlimited |
-
-Default budget: **150 credits = 40 dev / 60 demo seed / 30 live / 20 buffer**.
-
----
-
-## 🧪 Verify deployment
+Verify after the first deploy:
 
 ```bash
-curl https://YOUR-APP.vercel.app/api/health
-# → { "ok": true, "supabase": true, "nvidia": true, "anakin": false, "time": "..." }
-```
-
-To re-seed Supabase from the deployed app:
-```bash
-curl -X POST https://YOUR-APP.vercel.app/api/sync/seed
+curl https://your-app.vercel.app/api/health
+# → { "status": "ok", "nvidia": true, "anakin_env_key": true, ... }
 ```
 
 ---
 
-## 🏆 Wow features list
+## 🔑 Using the live pipeline
 
-| # | Feature | Why it wins |
-|---|---|---|
-| 1 | Pulse Wheel hero visual | Single memorable image |
-| 2 | Side-by-side competitor diff | Tangible Anakin proof |
-| 3 | Animated threat-level needle | Bloomberg feel |
-| 4 | "What if?" scenario simulator | 0 new credits |
-| 5 | Audio podcast brief | Free SpeechSynthesis API |
-| 6 | Auto-generated email/Slack drafts | Free, cached |
-| 7 | Public Threat Index | Viral SEO play |
-| 8 | `?demo=true` deterministic mode | WiFi-proof |
-| 9 | Credit Meter widget | Engineering maturity |
-| 10 | Time-Machine slider | 0 credits |
-| 11 | Archetype comparisons | Free synthetic baseline |
-| 12 | Anakin Transparency Drawer | Shows prompts/schema/credits |
+1. Open `/dashboard`.
+2. Click **Enter API Key** (top right).
+3. Paste your Anakin API key (from <https://anakin.io/docs/integrations>).
+4. Click **Save & go live**.
+
+The browser then runs the three-step pipeline:
+
+1. `POST /api/anakin/start` → Anakin returns a `job_id`.
+2. Loop `GET /api/anakin/poll/:job_id` every 8 s. The loading overlay shows
+   *"Step 2/3 — Anakin status: processing (Xs elapsed)"*.
+3. Once status is `completed`, the browser calls `POST /api/nvidia/reshape`
+   with the raw JSON. NVIDIA reshapes it into the canonical
+   `DashboardPayload`, the server caches it for 10 minutes, and the dashboard
+   re-renders **every tile** in every tab with the dynamic data.
+
+If the live call ever fails the dashboard gracefully falls back to demo
+data and surfaces the error in a toast — the UI never breaks.
+
+---
+
+## 🧪 Verifying NVIDIA is hit
+
+```bash
+# After the browser pipeline completes:
+curl https://your-app.vercel.app/api/health \
+  -H "X-Anakin-Key: anakin-live-..."
+# → { ..., "cached_live": true }
+```
+
+NVIDIA dashboard at <https://build.nvidia.com> should now show metric
+hits for `meta/llama-3.2-3b-instruct`.
+
+---
+
+## 🐞 Bugfixes shipped in this revision
+
+| # | Issue                                                                | Resolution                                                                                       |
+|---|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
+| 1 | Vercel 60 s timeout → NVIDIA never invoked                           | Split the pipeline into 3 short serverless calls orchestrated by the browser (`live-pipeline.ts`).|
+| 2 | In-memory cache lost on cold start                                   | Browser carries the Anakin `raw` JSON across calls; server cache is purely an optimisation.       |
+| 3 | Threat-Level meter needle pointing outside the gauge card            | Corrected SVG rotation formula in `renderThreatMeter` (`-90° → +90°`, no extra offset).           |
+| 4 | "Global Regulatory Heatmap" rendered as crude blobs                  | Replaced with a real equirectangular world map (`world-map-paths.js`) keeping the lat/lng pin math.|
+| 5 | `/api/charts/globe-dots` returned demo only                          | Now derives from live `policy.regions` when available.                                            |
 
 ---
 
 ## 📚 References
 
-- Anakin Agentic Search — https://anakin.io/docs/api-reference/agentic-search/submit-search
-- Anakin Pricing — https://anakin.io/pricing
-- Anakin Rate Limits — https://anakin.io/docs/documentation/rate-limits
-- NVIDIA NIM (Llama 3.2-3B-Instruct) — https://build.nvidia.com/meta/llama-3.2-3b-instruct
-- Hono — https://hono.dev
-- Supabase Realtime — https://supabase.com/docs/guides/realtime
-- pgvector — https://github.com/pgvector/pgvector
+- Anakin Agentic Search — <https://anakin.io/docs/api-reference/agentic-search/submit-search>
+- NVIDIA NIM Llama 3.2-3B-Instruct — <https://build.nvidia.com/meta/llama-3.2-3b-instruct>
+- Vercel serverless function limits — <https://vercel.com/docs/functions/runtimes#size-limits>
+- Supabase Realtime — <https://supabase.com/docs/guides/realtime>
+- pgvector — <https://github.com/pgvector/pgvector>
 
 ---
 
-## 🧹 License
+## 📝 License
 
 MIT.
