@@ -1,17 +1,27 @@
 // api/index.ts
 // =============================================================================
 // SCOUTT — Express serverless handler for Vercel.
-// 🔥 REWRITTEN to split the Anakin → NVIDIA pipeline across THREE short
-// serverless calls so we never hit the Vercel Hobby 60s cap.
 //
-//   POST /api/anakin/start       → submit Anakin job   (≈2s)
-//   GET  /api/anakin/poll/:jobId → one Anakin poll      (≈1-2s)
-//   POST /api/nvidia/reshape     → NVIDIA NIM reshape   (≈8-15s)
+// 🔥 REWRITTEN (Groq edition).
+// Pipeline is still split across THREE short serverless calls so we never
+// hit the Vercel Hobby 60-second cap, but the LLM reshape stage now uses
+// Groq `meta-llama/llama-4-scout-17b-16e-instruct` instead of NVIDIA NIM
+// `meta/llama-3.2-3b-instruct`. This fixes the bug where the dashboard
+// showed a green "success" toast yet kept rendering demo data — the old
+// 3B model could not emit the full DashboardPayload JSON in 1024 tokens.
 //
-// All three are well under 60s. The browser orchestrates the loop.
-// Once the reshape completes, every legacy endpoint (/api/dashboard,
-// /api/briefing/today, /api/charts/*, etc.) serves from the warm cache
-// dynamically — so every section of every tab becomes data-driven.
+//   POST /api/anakin/start       → submit Anakin job        (~2s)
+//   GET  /api/anakin/poll/:jobId → one Anakin poll          (~1-2s)
+//   POST /api/groq/reshape       → two parallel Groq calls  (~8-15s)
+//
+// The browser orchestrates the loop. Once the reshape completes, every
+// legacy endpoint (/api/dashboard, /api/briefing/today, /api/charts/*, …)
+// serves from the warm cache dynamically — so every section of every tab
+// is data-driven.
+//
+// BACKWARDS-COMPAT: /api/nvidia/reshape still works (it transparently calls
+// the new Groq reshape) so any third-party that hard-coded that path keeps
+// functioning. New clients should use /api/groq/reshape.
 // =============================================================================
 import express, { Request, Response, NextFunction } from 'express'
 import path from 'path'
@@ -31,9 +41,9 @@ import {
 } from '../src/anakin-prompts'
 
 import {
-  anakinSubmit, anakinPollOnce, buildAndCachePayload, nvidiaReshape,
+  anakinSubmit, anakinPollOnce, buildAndCachePayload, groqReshape,
   getDashboardPayload, invalidateCacheFor, peekCacheFor, peekRawFor,
-  buildBriefingPrompt,
+  buildBriefingPrompt, groqAsk,
 } from '../src/live-pipeline'
 
 const app = express()
@@ -123,16 +133,18 @@ async function payloadFor(req: Request) {
 // =============================================================================
 app.get('/api/health', (req, res) => res.status(200).json({
   status: 'ok',
-  anakin_user_key: Boolean(req.header('x-anakin-key')),
-  anakin_env_key: Boolean(process.env.ANAKIN_API_KEY),
-  nvidia: Boolean(process.env.NVIDIA_API_KEY),
-  elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY),
-  cached_live: Boolean(req.header('x-anakin-key') && peekCacheFor(String(req.header('x-anakin-key')))),
-  timestamp: new Date().toISOString(),
+  anakin_user_key:  Boolean(req.header('x-anakin-key')),
+  anakin_env_key:   Boolean(process.env.ANAKIN_API_KEY),
+  groq:             Boolean(process.env.GROQ_API_KEY),
+  elevenlabs:       Boolean(process.env.ELEVENLABS_API_KEY),
+  cached_live:      Boolean(req.header('x-anakin-key') && peekCacheFor(String(req.header('x-anakin-key')))),
+  reshape_model:    'meta-llama/llama-4-scout-17b-16e-instruct (Groq)',
+  timestamp:        new Date().toISOString(),
 }))
 
 // =============================================================================
-// 🆕 STEP 1 — Anakin submit (≤3s)
+// STEP 1 — Anakin submit (≤3s)
+//   Docs: https://anakin.io/docs/api-reference/agentic-search/submit-search
 // =============================================================================
 app.post('/api/anakin/start', async (req, res) => {
   const key = anakinKey(req)
@@ -148,7 +160,8 @@ app.post('/api/anakin/start', async (req, res) => {
 })
 
 // =============================================================================
-// 🆕 STEP 2 — Anakin single poll (≤2s, no looping on server)
+// STEP 2 — Anakin single poll (≤2s, no server-side loop)
+//   Docs: https://anakin.io/docs/api-reference/agentic-search/get-search-result
 // =============================================================================
 app.get('/api/anakin/poll/:jobId', async (req, res) => {
   const key = anakinKey(req)
@@ -164,56 +177,36 @@ app.get('/api/anakin/poll/:jobId', async (req, res) => {
 })
 
 // =============================================================================
-// 🆕 STEP 3 — NVIDIA NIM reshape (≤15s)
+// STEP 3 — Groq reshape (~8-15s, two parallel Groq calls).
 // Browser calls this once /api/anakin/poll returns status='completed'.
+// Replaces the old NVIDIA NIM reshape endpoint.
 // =============================================================================
-app.post('/api/nvidia/reshape', async (req, res) => {
+async function reshapeHandler(req: Request, res: Response) {
   const key = anakinKey(req)
   if (!key) return res.status(400).json({ error: 'X-Anakin-Key header required' })
   try {
-    // Browser may pass the raw Anakin JSON for safety against cold-starts.
     const body: any = req.body || {}
     const raw = body.raw ?? peekRawFor(key)
     if (!raw) return res.status(409).json({ error: 'No Anakin raw output found. Poll must complete first.' })
     const payload = await buildAndCachePayload(key, DEMO_TENANT, raw)
     res.json(payload)
   } catch (e: any) {
-    // Fail-safe: keep the UI alive.
+    // Fail-safe: keep the UI alive with demo data, but flag the error.
     const demo = buildDemoPayload(DEMO_TENANT)
     ;(demo as any).source = 'demo-fallback'
     ;(demo as any).error = String(e?.message || e)
     res.status(200).json(demo)
   }
-})
-
-// =============================================================================
-// 🆕 ONE-SHOT END-TO-END SAFEGUARD (used by /api/dashboard when warm cache
-// is empty AND the env-set ANAKIN_API_KEY is present — runs server-side but
-// CAPS at 25s so we never hit Vercel's 60s wall).
-// =============================================================================
-async function tryEndToEndShortCircuit(key: string): Promise<any | null> {
-  const startedAt = Date.now()
-  const HARD_CAP_MS = 25_000
-  try {
-    const jobId = await anakinSubmit(key, buildBriefingPrompt(DEMO_TENANT))
-    while (Date.now() - startedAt < HARD_CAP_MS) {
-      const out = await anakinPollOnce(key, jobId)
-      if (out.status === 'completed') {
-        return await buildAndCachePayload(key, DEMO_TENANT, out.raw)
-      }
-      if (out.status === 'failed') return null
-      await new Promise(r => setTimeout(r, 4_000))
-    }
-  } catch { /* ignore */ }
-  return null
 }
+app.post('/api/groq/reshape',   reshapeHandler)
+// Backwards-compat alias.
+app.post('/api/nvidia/reshape', reshapeHandler)
 
 // =============================================================================
-// 🔥 UNIFIED dashboard endpoint — always returns within ~1s.
-// Strategy:
+// UNIFIED dashboard endpoint — always returns within ~1s.
 //   1. Serve warm cache if available.
 //   2. Otherwise serve the demo template tagged source='demo-warming'.
-//      Browser then drives /api/anakin/start → poll → reshape.
+//      Browser then drives /api/anakin/start → poll → /api/groq/reshape.
 // =============================================================================
 app.get('/api/dashboard', async (req, res) => {
   try {
@@ -235,8 +228,8 @@ app.post('/api/dashboard/refresh', (req, res) => {
 })
 
 // =============================================================================
-// LEGACY endpoints — all now derive from the unified payload.
-// Once the warm cache is populated by /api/nvidia/reshape, every one of these
+// LEGACY endpoints — all derive from the unified payload.
+// Once the warm cache is populated by /api/groq/reshape, every one of these
 // returns dynamic live data.
 // =============================================================================
 app.get('/api/tenant/demo', (_req, res) => res.json(DEMO_TENANT))
@@ -257,7 +250,7 @@ app.get('/api/charts/wordcloud',        async (req, res) => res.json((await payl
 app.get('/api/charts/feature-matrix',   async (req, res) => res.json((await payloadFor(req)).competitor.feature_matrix))
 app.get('/api/charts/policy-regions',   async (req, res) => res.json((await payloadFor(req)).policy.regions))
 app.get('/api/charts/globe-dots',       async (req, res) => {
-  // Now also derived from live policy.regions when available.
+  // Derived from live policy.regions when available.
   const p = await payloadFor(req)
   const dots = (p.policy?.regions || []).map(r => ({
     lat: r.lat, lng: r.lng, size: r.activity / 100,
@@ -301,7 +294,7 @@ app.get('/api/search-index', async (req, res) => {
 })
 
 // =============================================================================
-// TRANSPARENCY (judge-bait)
+// TRANSPARENCY (judge-bait — now reports the Groq pipeline)
 // =============================================================================
 app.get('/api/transparency', (_req, res) => {
   const tenant = DEMO_TENANT
@@ -318,17 +311,19 @@ app.get('/api/transparency', (_req, res) => {
       poll_endpoint: 'GET https://api.anakin.io/v1/agentic-search/{job_id}',
       poll_interval_ms: 8000,
     },
-    nvidia_reshape: {
-      endpoint: 'POST https://integrate.api.nvidia.com/v1/chat/completions',
-      model: 'meta/llama-3.2-3b-instruct',
-      docs: 'https://build.nvidia.com/meta/llama-3.2-3b-instruct',
+    groq_reshape: {
+      endpoint: 'POST https://api.groq.com/openai/v1/chat/completions',
+      model:    'meta-llama/llama-4-scout-17b-16e-instruct',
+      docs:     'https://console.groq.com/docs',
+      strategy: 'Two parallel JSON-mode calls: (a) briefing core, (b) policy/competitor/sentiment pillars. Each ≤8192 completion tokens.',
     },
     competitor_scraper: {
       endpoint: 'POST https://api.anakin.io/v1/crawl',
       prompt: COMPETITOR_SCRAPE_PROMPT('https://stripe.com/pricing'),
     },
-    ask_realitypulse: {
-      endpoint: 'POST https://integrate.api.nvidia.com/v1/chat/completions',
+    ask_scoutt: {
+      endpoint: 'POST https://api.groq.com/openai/v1/chat/completions',
+      model:    'meta-llama/llama-4-scout-17b-16e-instruct',
       prompt_template: ASK_FRESH_SEARCH_PROMPT('{user_question}', '{industry}'),
     },
     raw_response_sample: DEMO_BRIEFING,
@@ -336,11 +331,11 @@ app.get('/api/transparency', (_req, res) => {
 })
 
 // =============================================================================
-// ASK SCOUTT — NVIDIA-only fast path
+// ASK SCOUTT — now Groq-powered (replaces previous NVIDIA NIM path)
 // =============================================================================
 app.post('/api/ask', async (req, res) => {
   const { question } = (req.body || {}) as { question: string }
-  const nvidiaKey = process.env.NVIDIA_API_KEY
+  const groqKey = process.env.GROQ_API_KEY
   const p = await payloadFor(req)
   const briefing = p.briefing
 
@@ -357,30 +352,25 @@ ${context}`
     ref: `[${i + 1}]`, title: e.title, url: e.source_url, pillar: e.pillar,
   }))
 
-  if (!nvidiaKey) {
+  if (!groqKey) {
     return res.json({
       answer: synthesizeMockAnswer(question, briefing.threat_level),
       citations,
-      model: 'mock (NVIDIA_API_KEY not configured)',
+      model: 'mock (GROQ_API_KEY not configured)',
       credits_used: 0,
     })
   }
   try {
-    const resp = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${nvidiaKey}` },
-      body: JSON.stringify({
-        model: 'meta/llama-3.2-3b-instruct',
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: question }],
-        temperature: 0.2, top_p: 0.7, max_tokens: 1024, stream: false,
-      }),
+    const answer = await groqAsk(systemPrompt, question)
+    res.json({
+      answer,
+      citations,
+      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+      credits_used: 3,
     })
-    const data: any = await resp.json()
-    const answer = data?.choices?.[0]?.message?.content ?? 'No response.'
-    res.json({ answer, citations, model: 'meta/llama-3.2-3b-instruct', credits_used: 3 })
   } catch (err: any) {
     res.status(500).json({
-      error: String(err), answer: 'Error reaching NVIDIA API.', citations,
+      error: String(err), answer: 'Error reaching Groq API.', citations,
     })
   }
 })
@@ -397,7 +387,7 @@ function synthesizeMockAnswer(question: string, threat: number): string {
 }
 
 // =============================================================================
-// SCENARIO — derives from cached payload only (0 Anakin/NVIDIA calls)
+// SCENARIO — derives from cached payload only (0 Anakin/Groq calls)
 // =============================================================================
 app.post('/api/scenario', async (req, res) => {
   try {
@@ -410,21 +400,21 @@ app.post('/api/scenario', async (req, res) => {
     const b = p.briefing
 
     const s = String(scenario).toLowerCase()
-    const matchPolicy = /ai act|gdpr|cfpb|regulation|compliance|fca|sec/i.test(s)
+    const matchPolicy     = /ai act|gdpr|cfpb|regulation|compliance|fca|sec/i.test(s)
     const matchCompetitor = /stripe|adyen|checkout|price|fee|launch|ach|bnpl/i.test(s)
-    const matchSentiment = /sentiment|reddit|review|g2|complaint|churn/i.test(s)
+    const matchSentiment  = /sentiment|reddit|review|g2|complaint|churn/i.test(s)
     const looseDelta = (s.includes('delay') || s.includes('drop') || s.includes('lower')) ? -1 : 1
 
     const baseThreat = b.threat_level
-    const policyBump = matchPolicy ? 14 * looseDelta : 0
-    const competitorBump = matchCompetitor ? 9 * looseDelta : 0
-    const sentimentBump = matchSentiment ? 6 * looseDelta : 0
+    const policyBump     = matchPolicy     ? 14 * looseDelta : 0
+    const competitorBump = matchCompetitor ?  9 * looseDelta : 0
+    const sentimentBump  = matchSentiment  ?  6 * looseDelta : 0
     const newThreat = Math.max(15, Math.min(100, baseThreat + policyBump + competitorBump + sentimentBump))
 
     const impacted = (b.events || []).filter(e =>
-      matchPolicy ? e.pillar === 'policy' :
+      matchPolicy     ? e.pillar === 'policy' :
       matchCompetitor ? e.pillar === 'competitor' :
-      matchSentiment ? e.pillar === 'sentiment' : true,
+      matchSentiment  ? e.pillar === 'sentiment' : true,
     ).slice(0, 5).map(e => ({
       ...e, severity: Math.max(20, Math.min(100, e.severity + (looseDelta < 0 ? -10 : +6))),
     }))
@@ -461,7 +451,7 @@ app.post('/api/action/draft', async (req, res) => {
   res.json({
     kind,
     body: kind === 'email' ? action.email_draft : action.slack_message,
-    generated_by: p.source === 'anakin-live' ? 'anakin agentic-search → nvidia reshape' : 'demo',
+    generated_by: p.source === 'anakin-live' ? 'anakin agentic-search → groq reshape' : 'demo',
     credits_used: 0,
   })
 })

@@ -1,7 +1,17 @@
 // =====================================================================
-// SCOUTT — Anakin prompts + NVIDIA NIM reshape prompt
-// Docs: https://anakin.io/docs/api-reference/agentic-search/submit-search
-//       https://anakin.io/docs/api-reference/agentic-search/get-search-result
+// SCOUTT — Anakin prompts + Groq llama-4-scout reshape prompts
+// Docs:
+//   https://anakin.io/docs/api-reference
+//   https://anakin.io/docs/api-reference/agentic-search
+//   https://anakin.io/docs/api-reference/agentic-search/submit-search
+//   https://anakin.io/docs/api-reference/agentic-search/get-search-result
+//
+// 🔥 REWRITTEN: removed NVIDIA llama-3.2-3b reshape (3B param model could
+// not emit the full DashboardPayload JSON within 1024 tokens — root cause
+// of the "green success toast but demo data" bug). Replaced with Groq
+// `meta-llama/llama-4-scout-17b-16e-instruct` + JSON-mode + 8192 tokens,
+// split into TWO compact reshape prompts so every section of the dashboard
+// is reliably populated from live Anakin agentic-search output.
 // =====================================================================
 
 export const DAILY_BRIEFING_SYSTEM_PROMPT = `You are SCOUTT — a Bloomberg-Terminal-grade business
@@ -90,99 +100,163 @@ export const ASK_FRESH_SEARCH_PROMPT = (question: string, industry: string) =>
   `User question: "${question}". Industry context: ${industry}. Search the last 7 days only.
 Return 3-5 evidence snippets with source URLs. No opinion — just sourced facts.`
 
-// ─────────────────────────────────────────────────────────────────────
-// NVIDIA NIM reshape prompts. Takes raw Anakin generatedJson + tenant
-// info and forces the full DashboardPayload shape required by the UI.
-// This is what makes EVERY card dynamic.
-// ─────────────────────────────────────────────────────────────────────
-export const RESHAPE_SYSTEM_PROMPT = `You are SCOUTT's data normaliser. You are given a raw
-Agentic-Search output JSON and a tenant profile. Reshape into THE EXACT JSON SHAPE below.
-Output ONLY a single JSON object, no markdown, no commentary. Never invent URLs — copy them
-from the source. If the source lacks a field, synthesise a plausible value consistent with
-the briefing context. All numeric arrays must have the stated lengths. All "values" arrays
-in feature_matrix must align with the "competitors" array length.`
+// ═════════════════════════════════════════════════════════════════════
+// GROQ llama-4-scout-17b RESHAPE PROMPTS (split into two compact calls)
+// Each prompt fits comfortably in 8192 max_completion_tokens.
+// ═════════════════════════════════════════════════════════════════════
 
-export const reshapeUserPrompt = (anakinRaw: any, tenant: any) => `TENANT:
+export const RESHAPE_SYSTEM_PROMPT = `You are SCOUTT's data normaliser. Take a raw
+Anakin Agentic-Search output JSON plus a tenant profile and reshape it into the EXACT
+JSON shape requested by the user. Rules:
+  • Output ONLY a single valid JSON object — no markdown fences, no commentary.
+  • Use real URLs ONLY from the raw source. NEVER invent URLs.
+  • If the raw lacks a field, synthesise a plausible value that is consistent with the
+    briefing context (industry, region, competitors). Do not leave fields blank.
+  • All array lengths must match the requested counts exactly.
+  • Numeric ranges must be respected.
+  • Every event MUST include pillar, title, summary, severity (0-100), source_url, source_name.`
+
+// ── RESHAPE STAGE 1 — Briefing core + Pulse Wheel + KPIs + Timeline ──
+export const reshapeCorePrompt = (anakinRaw: any, tenant: any) => `TENANT:
 ${JSON.stringify({ industry: tenant.industry, region: tenant.region, competitors: tenant.competitor_domains })}
 
-RAW_ANAKIN_OUTPUT:
-${JSON.stringify(anakinRaw).slice(0, 16000)}
+RAW_ANAKIN_OUTPUT (truncated):
+${JSON.stringify(anakinRaw).slice(0, 12000)}
 
-PRODUCE THIS EXACT JSON SHAPE (no extra keys, no missing keys):
+Return ONLY this JSON shape (no extra keys, no missing keys, no markdown):
 {
  "briefing": {
    "briefing_date": "YYYY-MM-DD",
-   "headline": "...",
-   "summary": "...",
+   "headline": "single-sentence headline summarising today's brief",
+   "summary": "2-3 sentence summary",
    "threat_level": 0-100,
-   "high_impact_count": int,
+   "high_impact_count": 0-12,
    "events": [
      { "pillar": "policy|competitor|sentiment", "title": "...", "summary": "...",
-       "severity": 0-100, "high_impact": bool, "source_url": "...", "source_name": "...",
-       "detected_at": "ISO8601", "tags": ["..."] }
+       "severity": 0-100, "high_impact": true|false, "source_url": "https://...",
+       "source_name": "...", "detected_at": "ISO8601", "tags": ["..."] }
    ],
    "actions": [
-     { "title": "...", "why_now": "...", "email_draft": "...",
-       "slack_message": "...", "impact": "low|medium|high" }
+     { "title": "...", "why_now": "...", "email_draft": "<=120 words",
+       "slack_message": "<=40 words", "impact": "low|medium|high" }
    ],
    "kpis": { "threats_detected": int, "opportunities": int,
              "action_items": int, "avg_response_time_minutes": int }
  },
- "timeline": [{ "date": "MM-DD", "pillar": "...", "title": "...", "severity": int }],
- "pulse_wheel": [{ "pillar": "policy|competitor|sentiment", "hour": 0-23.99,
-                   "severity": int, "title": "...", "source_url": "..." }],
- "threat_meter": { "value": int, "label": "Low|Moderate|Elevated|Severe",
+ "timeline": [
+   { "date": "MM-DD", "pillar": "policy|competitor|sentiment", "title": "...", "severity": int }
+ ],
+ "pulse_wheel": [
+   { "pillar": "policy|competitor|sentiment", "hour": 0-23.99,
+     "severity": 0-100, "title": "...", "source_url": "https://..." }
+ ],
+ "threat_meter": { "value": 0-100, "label": "Low|Moderate|Elevated|Severe",
                    "sparkline_14d": [14 ints 0-100] },
- "sentiment_volume_14d": [{ "date": "YYYY-MM-DD", "positive": int, "neutral": int, "negative": int }],
- "threats_to_actions": {
-    "sources": [{ "label": "Policy|Competitor|Sentiment", "count": int }],
-    "targets": [{ "label": "...", "count": int }],
-    "links":   [{ "from": int, "to": int, "value": int }]
- },
  "kpi_sparklines": {
-    "threats":[12 floats 0-1],"opps":[12 floats 0-1],
-    "actions":[12 floats 0-1],"response":[12 floats 0-1]
+    "threats": [12 floats 0-1], "opps": [12 floats 0-1],
+    "actions": [12 floats 0-1], "response": [12 floats 0-1]
  },
+ "threats_to_actions": {
+    "sources": [
+      { "label": "Policy",     "count": int },
+      { "label": "Competitor", "count": int },
+      { "label": "Sentiment",  "count": int }
+    ],
+    "targets": [
+      { "label": "Email outreach", "count": int },
+      { "label": "Slack alert",    "count": int },
+      { "label": "Product fix",    "count": int }
+    ],
+    "links": [{ "from": 0-2, "to": 0-2, "value": int }]
+ }
+}
+
+REQUIREMENTS:
+  • briefing.events: produce 8-12 items spread across pillars.
+  • briefing.actions: produce EXACTLY 3 items.
+  • timeline: produce 7-10 items dated within the last 7 days (MM-DD).
+  • pulse_wheel: produce 10-18 items across the 24h cycle.
+  • threat_meter.sparkline_14d: EXACTLY 14 integers between 0-100.
+  • kpi_sparklines: each array EXACTLY 12 floats between 0 and 1.
+  • threats_to_actions.links: 3-6 plausible links.`
+
+// ── RESHAPE STAGE 2 — Policy + Competitor + Sentiment + Archetype + SentimentVolume
+export const reshapePillarsPrompt = (anakinRaw: any, tenant: any) => `TENANT:
+${JSON.stringify({ industry: tenant.industry, region: tenant.region, competitors: tenant.competitor_domains })}
+
+RAW_ANAKIN_OUTPUT (truncated):
+${JSON.stringify(anakinRaw).slice(0, 12000)}
+
+Return ONLY this JSON shape (no markdown, no extra keys):
+{
+ "sentiment_volume_14d": [
+   { "date": "YYYY-MM-DD", "positive": int, "neutral": int, "negative": int }
+ ],
  "policy": {
-   "regions": [{ "country": "...", "code": "...", "lat": -90 to 90, "lng": -180 to 180,
-                 "activity": int, "count": int }],
-   "qoq":     [{ "country": "...", "q1": int, "q2": int }],
+   "regions": [
+     { "country": "...", "code": "US|EU|UK|...", "lat": -90 to 90,
+       "lng": -180 to 180, "activity": 0-100, "count": int }
+   ],
+   "qoq": [{ "country": "...", "q1": int, "q2": int }],
    "active_regulations": [
-     { "title": "...", "summary": "...", "severity": int, "tags": ["..."],
-       "source_url": "...", "source_name": "...", "deadline": "YYYY-MM-DD or null" }
+     { "title": "...", "summary": "...", "severity": 0-100, "tags": ["..."],
+       "source_url": "https://...", "source_name": "...",
+       "deadline": "YYYY-MM-DD or null" }
    ]
  },
  "competitor": {
-   "diff_timeline": [{ "ts_iso": "...", "kind": "pricing|product|hiring" }],
+   "diff_timeline": [{ "ts_iso": "ISO8601", "kind": "pricing|product|hiring" }],
    "pricing_diff": {
-     "url": "...", "before_ts": "...", "after_ts": "...",
-     "before_lines": ["..."], "after_lines": ["..."],
-     "threat_level": int, "fee_change_pct": number
+     "url": "https://${tenant.competitor_domains?.[0] || 'stripe.com'}/pricing",
+     "before_ts": "YYYY-MM-DD HH:MM",
+     "after_ts":  "YYYY-MM-DD HH:MM",
+     "before_lines": ["3-6 lines of old pricing, start removed lines with -"],
+     "after_lines":  ["3-6 lines of new pricing, start added lines with +"],
+     "threat_level": 0-100,
+     "fee_change_pct": -50 to 50
    },
-   "pricing_race_30d": [{ "date": "YYYY-MM-DD", "you": number, "stripe": number,
-                          "adyen": number, "checkout": number }],
-   "events": [{ "title":"...","summary":"...","severity":int,"source_url":"...",
-                "source_name":"...","tags":["..."],"detected_at":"..."}],
+   "pricing_race_30d": [{ "date": "YYYY-MM-DD", "you": float, "stripe": float,
+                          "adyen": float, "checkout": float }],
+   "events": [{ "title":"...","summary":"...","severity":0-100,
+                "source_url":"https://...","source_name":"...","tags":["..."],
+                "detected_at":"ISO8601", "pillar":"competitor", "high_impact": bool }],
    "feature_matrix": {
      "competitors": ["You","Stripe","Adyen","Checkout.com"],
      "features": [{ "name": "...", "values": [bool, bool, bool, bool] }]
    }
  },
  "sentiment": {
-   "topic_cluster": [{ "topic": "...", "mentions": int, "sentiment": -1 to 1 }],
+   "topic_cluster": [{ "topic": "...", "mentions": int, "sentiment": -1.0 to 1.0 }],
    "delta_vs_competitors": [{ "name": "...", "value": -30 to 30 }],
    "word_cloud": [{ "text": "...", "value": int }],
-   "quotes": [{ "text": "...", "src": "...", "stars": "★★★★★" }],
-   "events": [{ "title":"...","summary":"...","severity":int,"source_url":"...",
-                "source_name":"...","tags":["..."],"detected_at":"..."}]
+   "quotes": [{ "text": "verbatim quote", "src": "site/handle", "stars": "★★★★★" }],
+   "events": [{ "title":"...","summary":"...","severity":0-100,
+                "source_url":"https://...","source_name":"...","tags":["..."],
+                "detected_at":"ISO8601", "pillar":"sentiment", "high_impact": bool }]
  },
  "archetype": {
-   "industry": "...",
-   "axes": [6 strings],
+   "industry": "${tenant.industry}",
+   "axes": [6 short axis names],
    "you":      [6 ints 0-100],
    "baseline": [6 ints 0-100],
-   "higher":  ["2 axis names"],
-   "lower":   ["1-2 axis names"],
-   "neutral": ["1-2 axis names"]
+   "higher":   ["1-2 axis names"],
+   "lower":    ["1-2 axis names"],
+   "neutral":  ["1-2 axis names"]
  }
-}`
+}
+
+REQUIREMENTS:
+  • sentiment_volume_14d: EXACTLY 14 daily items.
+  • policy.regions: 6-10 items, lat/lng must be real-world coordinates.
+  • policy.qoq: 6-10 items, one per region above.
+  • policy.active_regulations: 4-8 items.
+  • competitor.diff_timeline: 7-12 items spread over last 7 days.
+  • competitor.pricing_race_30d: EXACTLY 31 daily items.
+  • competitor.events: 4-8 items.
+  • competitor.feature_matrix.features: 5-8 rows, each with EXACTLY 4 boolean values.
+  • sentiment.topic_cluster: 8-14 items.
+  • sentiment.delta_vs_competitors: 4-6 items.
+  • sentiment.word_cloud: 12-22 items.
+  • sentiment.quotes: 4-6 verbatim items.
+  • sentiment.events: 4-8 items.
+  • archetype.axes / you / baseline: EXACTLY 6 elements each.`

@@ -1,11 +1,22 @@
 /* =====================================================================
-   SCOUTT — dashboard.js (full rewrite, v2)
+   SCOUTT — dashboard.js  (v3 — Groq edition)
    Drives every tile from /api/dashboard?day=N. When an Anakin key is
    set, the browser orchestrates the async pipeline so we NEVER hit the
    Vercel 60s cap:
      1. POST /api/anakin/start          → {job_id}
-     2. GET  /api/anakin/poll/:jobId    → {status, raw?}    (loop here)
-     3. POST /api/nvidia/reshape        → final DashboardPayload
+     2. GET  /api/anakin/poll/:jobId    → {status, raw?}   (loop here)
+     3. POST /api/groq/reshape          → final DashboardPayload
+        (Groq `meta-llama/llama-4-scout-17b-16e-instruct`)
+
+   🔥 BUGFIX history:
+     • Old NVIDIA `meta/llama-3.2-3b-instruct` could not emit the full
+       DashboardPayload JSON within 1024 tokens → server returned demo
+       template tagged 'anakin-live' → "green success toast but demo
+       data on dashboard". Switched to Groq llama-4-scout (17B-active
+       MoE) with JSON-mode + 8192 tokens, split into 2 parallel calls.
+     • Frontend now ALWAYS calls renderAll() with the freshly returned
+       live payload (previously a render could be skipped if the auto-
+       kicked pipeline finished before the initial render).
    ===================================================================== */
 
 const $  = (s, p = document) => p.querySelector(s)
@@ -76,7 +87,7 @@ function applyTimeGreeting() {
 }
 
 /* ═════════════════════════ LIVE PIPELINE ═════════════════════════
-   Orchestrates Anakin start → poll → NVIDIA reshape entirely from
+   Orchestrates Anakin start → poll → Groq reshape entirely from
    the browser so no single server call exceeds ~15s.
    ════════════════════════════════════════════════════════════════ */
 async function runLivePipeline() {
@@ -114,14 +125,24 @@ async function runLivePipeline() {
     }
     if (!raw) throw new Error('Anakin polling exceeded 5 minutes')
 
-    // 3) RESHAPE via NVIDIA NIM
+    // 3) RESHAPE via Groq llama-4-scout-17b-16e-instruct
     setLiveLoading(true, 'Generating live briefing…',
-      'Step 3/3 — NVIDIA meta/llama-3.2-3b-instruct reshape…')
-    const payload = await SCOUTT.post('/api/nvidia/reshape', { raw })
-    if (!payload || !payload.briefing) throw new Error('NVIDIA reshape returned empty payload')
+      'Step 3/3 — Groq meta-llama/llama-4-scout-17b-16e-instruct reshape…')
+    const payload = await SCOUTT.post('/api/groq/reshape', { raw })
+    if (!payload || !payload.briefing) throw new Error('Groq reshape returned empty payload')
+
+    // 🔥 GUARD: server marks the payload 'demo-fallback' if Groq failed.
+    // We surface that to the user instead of falsely claiming success.
+    if (payload.source !== 'anakin-live') {
+      showToast('Groq reshape produced no fresh data — showing demo template.', 'error')
+    } else {
+      showToast('✓ Live briefing generated via Anakin → Groq reshape.', 'info')
+    }
 
     STATE.payload = payload
-    showToast('✓ Live briefing generated via Anakin → NVIDIA reshape.', 'info')
+    // 🔥 CRITICAL: force a full re-render of every tab so demo data is
+    // immediately replaced by the new live data the user just generated.
+    try { await renderAll(payload) } catch (e) { console.warn('renderAll after reshape failed:', e) }
     return payload
   } catch (e) {
     showToast('Live pipeline failed: ' + e.message + ' — showing demo.', 'error')
@@ -142,14 +163,17 @@ async function fetchPayload(day = 0) {
   STATE.payload = data; STATE.day = day
 
   // 2) If user has a key but payload is not live yet, kick off pipeline.
+  //    🔥 FIX: ALWAYS re-render after the live payload arrives (regardless
+  //    of whether source is 'anakin-live' or 'demo-fallback') so the UI
+  //    refreshes with whichever data the server returned. Previously the
+  //    render was skipped when the reshape silently returned demo data.
   if (SCOUTT.hasKey && data.source !== 'anakin-live' && day === 0) {
-    // Don't block initial render — fire-and-update.
     runLivePipeline().then(live => {
-      if (live && live.source === 'anakin-live') {
+      if (live) {
         STATE.payload = live
         renderAll(live)
       }
-    })
+    }).catch(e => console.warn('Auto-pipeline error:', e))
   } else if (data.source === 'anakin-live') {
     showToast(day === 0 ? 'Live briefing loaded from cache.' : `Day-${day} snapshot ready.`)
   }
@@ -1101,11 +1125,22 @@ function wireEvents() {
     SCOUTT.apiKey = k; refreshKeyUI(); showStatus('Key saved. Launching live pipeline…', true)
     try { await SCOUTT.post('/api/dashboard/refresh', {}) } catch {}
     try {
-      // Kick off the new 3-step browser-orchestrated pipeline.
+      // Kick off the 3-step browser-orchestrated pipeline.
+      // 🔥 runLivePipeline() already calls renderAll() on success, but
+      //    we ALSO call it here as a belt-and-suspenders guarantee that
+      //    every tab gets refreshed with the live data the moment the
+      //    user clicks Save. This is what previously failed: the toast
+      //    said success but no re-render ran for the demo-fallback path.
       const live = await runLivePipeline()
-      if (live) await renderAll(live)
-      if (live && live.source === 'anakin-live') showStatus('✓ Live Anakin → NVIDIA data flowing.', true)
-      else showStatus('Live call failed — running on demo. Re-try in 10s.', false)
+      if (live) {
+        STATE.payload = live
+        await renderAll(live)
+      }
+      if (live && live.source === 'anakin-live') {
+        showStatus('✓ Live Anakin → Groq llama-4-scout data flowing.', true)
+      } else {
+        showStatus('Live call failed — running on demo. Re-try in 10s.', false)
+      }
       setTimeout(closeKeyModal, 1500)
     } catch (e) { showStatus('Failed: ' + e.message, false) }
   })

@@ -225,7 +225,7 @@ export const landingPage = () =>
     <div class="text-center text-xs text-gray-500 uppercase tracking-widest mb-6 mono">Powered by</div>
     <div class="flex flex-wrap items-center justify-center gap-x-10 gap-y-4 text-gray-400">
       <span class="flex items-center gap-2"><i class="fa-solid fa-magnifying-glass-chart text-policy"></i> Anakin Agentic Search</span>
-      <span class="flex items-center gap-2"><i class="fa-solid fa-microchip text-emerald-400"></i> NVIDIA NIM</span>
+      <span class="flex items-center gap-2"><i class="fa-solid fa-microchip text-emerald-400"></i> Groq llama-4-scout</span>
       <span class="flex items-center gap-2"><i class="fa-solid fa-database text-competitor"></i> Supabase</span>
       <span class="flex items-center gap-2"><i class="fa-brands fa-vercel text-white"></i> Vercel</span>
     </div>
@@ -242,7 +242,7 @@ export const landingPage = () =>
 </section>
 
 <footer class="border-t border-ink-700/40 py-8 text-center text-xs text-gray-500">
-  SCOUTT  Built with Hono  Vercel  Anakin  NVIDIA NIM  Supabase
+  SCOUTT  Built with Hono  Vercel  Anakin  Groq llama-4-scout  Supabase
 </footer>
 
 <!-- Globe + count-up + reveal scripts -->

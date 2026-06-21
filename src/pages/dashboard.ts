@@ -442,7 +442,7 @@ function apiKeyModal() {
       </div>
       <button id="apikey-close" type="button" class="text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
     </div>
-    <p class="text-sm text-gray-400 mb-4">Paste your Anakin API key to switch from demo data to a live Anakin Agentic Search → NVIDIA NIM reshape pipeline. Every card in every tab becomes dynamic.</p>
+    <p class="text-sm text-gray-400 mb-4">Paste your Anakin API key to switch from demo data to a live Anakin Agentic Search → Groq <code class="mono text-policy">llama-4-scout-17b-16e-instruct</code> reshape pipeline. Every card in every tab becomes dynamic.</p>
     <label class="block text-xs mono uppercase text-gray-500 mb-1">Anakin API Key</label>
     <input id="apikey-input" type="password" placeholder="anakin-live-…" class="w-full bg-ink-900 border border-ink-600 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-policy mono" autocomplete="off" />
     <div class="mt-3 text-[11px] text-gray-500 leading-relaxed">
@@ -468,7 +468,7 @@ function liveLoadingOverlay() {
     <div class="w-8 h-8 border-4 border-policy border-t-transparent rounded-full animate-spin"></div>
     <div>
       <div class="font-semibold text-sm" id="live-loading-title">Generating live briefing…</div>
-      <div class="text-[11px] mono text-gray-500 mt-1" id="live-loading-sub">Anakin Agentic Search → NVIDIA reshape.</div>
+      <div class="text-[11px] mono text-gray-500 mt-1" id="live-loading-sub">Anakin Agentic Search → Groq reshape.</div>
     </div>
   </div>
 </div>`
