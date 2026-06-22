@@ -1,36 +1,24 @@
 // src/pages/onboarding.ts
 // =====================================================================
-// 🔥 REWRITTEN — fixes onboarding bug #1 from the user's report:
+// 🔥 v6 — captures the Anakin API key INSIDE the wizard (Step 3) so the
+// flow becomes a true single-shot Save & Go.
 //
-//   "when i add more competitor links in the onboarding process step2,
-//    the logos of previous competitor links disappears"
+// Previously the user finished Step 3, landed on /dashboard, and THEN
+// had to enter the API key in a separate banner / modal. That extra hop
+// is the very gap that confused users — they expected the dashboard to
+// be populated by the time they arrived.
 //
-// Root cause
-// ──────────
-// The previous version set the favicon `background-image` ONLY inside
-// the `input` event handler. When `renderCompList()` rebuilt the DOM
-// (after Add / Remove), all rows were re-created with empty styles —
-// no favicon, no "✓ valid" badge — because `input` never fires on a
-// freshly-rendered <input>. Existing valid domains therefore lost
-// their logos the moment the user added a new row.
+// New flow:
+//   Step 1 → industry + region
+//   Step 2 → competitors
+//   Step 3 → pillars + Anakin API key + Save & Go button
+//   On click → persist everything → POST /api/onboarding/save with the
+//              key → POST /api/anakin/start (warm the job) → redirect
+//              to /dashboard?fresh=1, where dashboard.js immediately
+//              continues the pipeline (poll → reshape → render).
 //
-// Fix
-// ─────
-// `applyRowVisualState(row, value)` is now a single source of truth
-// that paints favicon + badge for whatever value the row currently
-// holds, and it is invoked
-//   (a) immediately after every renderCompList() rebuild, AND
-//   (b) from the `input` handler on every keystroke.
-// So the visual state is always derived from `onboardingState.competitors`
-// and never lost across re-renders.
-//
-// Also preserved from previous fix
-// ──────────────────────────────────
-// 1. Server-side tenant overlay: choices are POSTed to /api/onboarding/save
-//    whenever an Anakin key is already set, so the very next /api/anakin/start
-//    uses the user's competitors / industry / region / pillars.
-// 2. Region-button "selected" state captured properly via .region-selected.
-// 3. Dynamic add/remove (1-10 competitor cap) — unchanged.
+// This guarantees the dashboard NEVER renders demo data after Save & Go
+// when the user provided a valid key.
 // =====================================================================
 
 import { htmlShell } from './shell'
@@ -57,7 +45,7 @@ export const onboardingPage = () =>
       <div id="dot-3" class="step-dot w-8 h-8 rounded-full bg-ink-700 text-gray-500 flex items-center justify-center font-semibold mono text-sm">3</div>
     </div>
 
-    <!-- ━━━━ STEP 1 ━━━━ -->
+    <!-- ━━━━ STEP 1 — Industry + Region ━━━━ -->
     <section id="step-1" class="card p-8 slide-up">
       <div class="text-xs mono text-policy uppercase mb-2">Step 1 of 3</div>
       <h1 class="text-2xl font-bold mb-2">What's your business?</h1>
@@ -94,15 +82,13 @@ export const onboardingPage = () =>
       </div>
     </section>
 
-    <!-- ━━━━ STEP 2 ━━━━ -->
+    <!-- ━━━━ STEP 2 — Competitors ━━━━ -->
     <section id="step-2" class="card p-8 hidden">
       <div class="text-xs mono text-policy uppercase mb-2">Step 2 of 3</div>
       <h1 class="text-2xl font-bold mb-2">Who are your competitors?</h1>
       <p class="text-gray-400 text-sm mb-6">Add 1 to 10 domains. We watch each one's pricing page and flag every change. <span class="text-policy">+ Add competitor</span> to grow the list, ✕ to remove one.</p>
 
-      <div id="comp-list" class="space-y-3">
-        <!-- Three starter rows; JS handles add/remove dynamically. -->
-      </div>
+      <div id="comp-list" class="space-y-3"></div>
 
       <button id="comp-add" type="button" class="mt-4 inline-flex items-center gap-2 text-sm text-policy hover:text-cyan-300 transition">
         <i class="fa-solid fa-plus"></i> Add competitor
@@ -118,19 +104,19 @@ export const onboardingPage = () =>
       </div>
     </section>
 
-    <!-- ━━━━ STEP 3 ━━━━ -->
+    <!-- ━━━━ STEP 3 — Pillars + API key + Save & Go ━━━━ -->
     <section id="step-3" class="card p-8 hidden">
       <div class="text-xs mono text-policy uppercase mb-2">Step 3 of 3</div>
       <h1 class="text-2xl font-bold mb-2">What matters to you?</h1>
       <p class="text-gray-400 text-sm mb-6">Toggle the six signal pillars. You can change these later.</p>
       <div class="grid grid-cols-2 gap-3">
         ${[
-          ['policy', 'fa-scale-balanced', 'Policy'],
-          ['pricing', 'fa-tag', 'Pricing'],
-          ['features', 'fa-puzzle-piece', 'Features'],
-          ['sentiment', 'fa-wave-square', 'Sentiment'],
-          ['supply_chain', 'fa-truck-fast', 'Supply Chain'],
-          ['hiring', 'fa-user-tie', 'Hiring'],
+          ['policy',       'fa-scale-balanced', 'Policy'],
+          ['pricing',      'fa-tag',            'Pricing'],
+          ['features',     'fa-puzzle-piece',   'Features'],
+          ['sentiment',    'fa-wave-square',    'Sentiment'],
+          ['supply_chain', 'fa-truck-fast',     'Supply Chain'],
+          ['hiring',       'fa-user-tie',       'Hiring'],
         ].map(([id, ic, label]) => `
           <label class="pillar-toggle cursor-pointer card step-card p-4 flex items-center gap-3">
             <input type="checkbox" data-pillar="${id}" checked class="w-4 h-4 accent-cyan-500" />
@@ -140,10 +126,23 @@ export const onboardingPage = () =>
         `).join('')}
       </div>
 
+      <!-- 🔥 v6 — Anakin API key field, captured INSIDE the wizard. -->
+      <div class="mt-8 border-t border-ink-700 pt-6">
+        <label class="block text-sm font-medium mb-2">
+          <i class="fa-solid fa-key text-policy mr-1"></i> Your Anakin API key
+        </label>
+        <input id="apikey-input" type="password" placeholder="ak_..." autocomplete="off"
+               class="w-full bg-ink-800 border border-ink-600 rounded-lg px-4 py-3 text-white font-mono text-sm focus:outline-none focus:border-policy" />
+        <p class="text-[11px] text-gray-500 mt-2">
+          Required to scrape live data. Get one at <a href="https://anakin.io" target="_blank" rel="noreferrer" class="text-policy hover:underline">anakin.io</a>. We store it in your browser only.
+        </p>
+        <div id="apikey-error" class="hidden mt-2 text-xs text-red-400"></div>
+      </div>
+
       <div class="flex justify-between mt-8">
         <button type="button" onclick="goStep(2)" class="text-gray-400 hover:text-white px-4 py-2.5">← Back</button>
-        <button type="button" onclick="launchBrief()" class="bg-policy text-ink-950 font-semibold px-5 py-2.5 rounded-lg hover:shadow-glow-cyan transition flex items-center gap-2">
-          <i class="fa-solid fa-rocket"></i> Generate My Briefing
+        <button id="save-and-go" type="button" class="bg-policy text-ink-950 font-semibold px-5 py-2.5 rounded-lg hover:shadow-glow-cyan transition flex items-center gap-2">
+          <i class="fa-solid fa-rocket"></i> Save &amp; Go
         </button>
       </div>
     </section>
@@ -157,9 +156,9 @@ export const onboardingPage = () =>
           <img src="/static/scoutt_logo.png" alt="" class="w-10 h-10 rounded-full object-cover" onerror="this.style.display='none'" />
         </div>
       </div>
-      <h2 class="text-xl font-bold mb-2">Brewing your first briefing</h2>
-      <p id="loading-caption" class="text-gray-400 text-sm transition-opacity duration-500">Reading 1,247 regulations…</p>
-      <div class="mono text-xs text-gray-600 mt-6">SCOUTT • ~12s expected</div>
+      <h2 class="text-xl font-bold mb-2">Brewing your live briefing</h2>
+      <p id="loading-caption" class="text-gray-400 text-sm transition-opacity duration-500">Submitting Anakin Agentic Search…</p>
+      <div class="mono text-xs text-gray-600 mt-6">SCOUTT • 60-120s expected</div>
     </section>
   </main>
 </div>
@@ -178,7 +177,6 @@ export const onboardingPage = () =>
   const DEFAULTS = ['stripe.com', 'adyen.com', 'checkout.com']
   const DOMAIN_RE = /^[a-z0-9.-]+\\.[a-z]{2,}$/i
 
-  // ── Competitor list (dynamic add/remove) ──────────────────────────
   function compRowTemplate(idx, value, placeholder) {
     return \`
       <div class="comp-row flex items-center gap-3" data-idx="\${idx}">
@@ -194,56 +192,28 @@ export const onboardingPage = () =>
       </div>\`
   }
 
-  // 🔥 FIX (bug #1) — single source of truth for the favicon/badge visual
-  //                  state. Applied AFTER every renderCompList() so that
-  //                  existing valid domains keep their logos when the user
-  //                  clicks "+ Add competitor" or removes a row.
   function applyRowVisualState(row, value) {
     if (!row) return
-    const badge = row.querySelector('.comp-badge')
+    const badge  = row.querySelector('.comp-badge')
     const iconEl = row.querySelector('.comp-icon')
-    const iconI = iconEl?.querySelector('i')
+    const iconI  = iconEl?.querySelector('i')
     const v = (value || '').trim()
-
-    // Empty → reset.
     if (!v) {
-      if (badge) {
-        badge.textContent = ''
-        badge.classList.remove('text-emerald-400', 'text-red-400')
-        badge.classList.add('text-gray-500')
-      }
-      if (iconEl) {
-        iconEl.style.backgroundImage = ''
-        iconEl.style.backgroundColor = ''
-      }
+      if (badge) { badge.textContent = ''; badge.classList.remove('text-emerald-400', 'text-red-400'); badge.classList.add('text-gray-500') }
+      if (iconEl) { iconEl.style.backgroundImage = ''; iconEl.style.backgroundColor = '' }
       if (iconI) iconI.style.display = 'inline'
       return
     }
-
-    // Valid domain → paint favicon + ✓ badge.
     if (DOMAIN_RE.test(v)) {
-      if (badge) {
-        badge.textContent = '✓ valid'
-        badge.classList.remove('text-gray-500', 'text-red-400')
-        badge.classList.add('text-emerald-400')
-      }
+      if (badge) { badge.textContent = '✓ valid'; badge.classList.remove('text-gray-500', 'text-red-400'); badge.classList.add('text-emerald-400') }
       if (iconEl) {
-        // Cache-bust safe Google s2 favicon. sz=64 covers HiDPI.
         iconEl.style.backgroundImage = 'url(https://www.google.com/s2/favicons?domain=' + encodeURIComponent(v) + '&sz=64)'
-        iconEl.style.backgroundSize = 'cover'
-        iconEl.style.backgroundPosition = 'center'
-        iconEl.style.backgroundRepeat = 'no-repeat'
+        iconEl.style.backgroundSize = 'cover'; iconEl.style.backgroundPosition = 'center'; iconEl.style.backgroundRepeat = 'no-repeat'
       }
       if (iconI) iconI.style.display = 'none'
       return
     }
-
-    // Invalid syntax → ✗ badge but DON'T wipe favicon (user is still typing).
-    if (badge) {
-      badge.textContent = '✗ invalid'
-      badge.classList.remove('text-emerald-400', 'text-gray-500')
-      badge.classList.add('text-red-400')
-    }
+    if (badge) { badge.textContent = '✗ invalid'; badge.classList.remove('text-emerald-400', 'text-gray-500'); badge.classList.add('text-red-400') }
   }
 
   function renderCompList() {
@@ -253,14 +223,11 @@ export const onboardingPage = () =>
       list.insertAdjacentHTML('beforeend', compRowTemplate(i, v, DEFAULTS[i] || 'yourcompetitor.com'))
     })
     bindCompEvents()
-    // 🔥 FIX (bug #1) — repaint EVERY row's favicon + badge from current state
-    //                  so logos survive Add / Remove operations.
     document.querySelectorAll('#comp-list .comp-row').forEach((row, i) => {
       applyRowVisualState(row, onboardingState.competitors[i] || '')
     })
     updateAddBtnState()
   }
-
   function bindCompEvents() {
     document.querySelectorAll('.comp-input').forEach((input, i) => {
       input.addEventListener('input', (e) => {
@@ -269,78 +236,44 @@ export const onboardingPage = () =>
         applyRowVisualState(e.target.closest('.comp-row'), v)
       })
     })
-
     document.querySelectorAll('.comp-remove').forEach((btn, i) => {
       btn.addEventListener('click', () => {
-        if (onboardingState.competitors.length <= 1) {
-          showCompError('You need at least one competitor domain.')
-          return
-        }
-        onboardingState.competitors.splice(i, 1)
-        renderCompList()
+        if (onboardingState.competitors.length <= 1) { showCompError('You need at least one competitor domain.'); return }
+        onboardingState.competitors.splice(i, 1); renderCompList()
       })
     })
   }
-
   function updateAddBtnState() {
     const addBtn = document.getElementById('comp-add')
-    if (onboardingState.competitors.length >= 10) {
-      addBtn.classList.add('opacity-40', 'pointer-events-none')
-      addBtn.title = 'Maximum of 10 competitors'
-    } else {
-      addBtn.classList.remove('opacity-40', 'pointer-events-none')
-      addBtn.title = ''
-    }
+    if (onboardingState.competitors.length >= 10) { addBtn.classList.add('opacity-40', 'pointer-events-none'); addBtn.title = 'Maximum of 10 competitors' }
+    else { addBtn.classList.remove('opacity-40', 'pointer-events-none'); addBtn.title = '' }
   }
-
   function showCompError(msg) {
-    const el = document.getElementById('comp-error')
-    el.textContent = msg
-    el.classList.remove('hidden')
-    setTimeout(() => el.classList.add('hidden'), 3500)
+    const el = document.getElementById('comp-error'); el.textContent = msg
+    el.classList.remove('hidden'); setTimeout(() => el.classList.add('hidden'), 3500)
   }
-
   document.getElementById('comp-add').addEventListener('click', () => {
     if (onboardingState.competitors.length >= 10) return
-    // Sync DOM values into state BEFORE re-render so existing rows survive.
-    onboardingState.competitors = Array.from(document.querySelectorAll('.comp-input'))
-      .map(i => i.value.trim())
+    onboardingState.competitors = Array.from(document.querySelectorAll('.comp-input')).map(i => i.value.trim())
     onboardingState.competitors.push('')
     renderCompList()
-    // Focus the new (last) input.
-    const inputs = document.querySelectorAll('.comp-input')
-    inputs[inputs.length - 1]?.focus()
+    const inputs = document.querySelectorAll('.comp-input'); inputs[inputs.length - 1]?.focus()
   })
+  onboardingState.competitors = [...DEFAULTS]; renderCompList()
 
-  // Seed the initial 3 rows.
-  onboardingState.competitors = [...DEFAULTS]
-  renderCompList()
-
-  // ── Region buttons ────────────────────────────────────────────────
   document.querySelectorAll('.region-btn').forEach(b => b.addEventListener('click', () => {
-    document.querySelectorAll('.region-btn').forEach(x => {
-      x.classList.remove('bg-policy/10', 'border-policy', 'text-policy', 'region-selected')
-    })
+    document.querySelectorAll('.region-btn').forEach(x => x.classList.remove('bg-policy/10', 'border-policy', 'text-policy', 'region-selected'))
     b.classList.add('bg-policy/10', 'border-policy', 'text-policy', 'region-selected')
     onboardingState.region = b.dataset.region
   }))
-  // Default-select US so step 2 always has a valid region even if user hits Continue immediately.
   document.querySelector('.region-btn[data-region="US"]')?.click()
 
-  // ── Step transitions ──────────────────────────────────────────────
+  // ── Step transitions ───────────────────────────────────────────────
   function goStep(n) {
-    if (n === 2) {
-      onboardingState.industry = document.getElementById('industry').value
-      // region already captured by the click handler; keep last selection
-    }
+    if (n === 2) { onboardingState.industry = document.getElementById('industry').value }
     if (n === 3) {
-      // Sync from inputs (in case user typed but didn't blur)
-      onboardingState.competitors = Array.from(document.querySelectorAll('.comp-input'))
-        .map(i => i.value.trim()).filter(Boolean)
-      if (onboardingState.competitors.length === 0) {
-        showCompError('Add at least one competitor domain to continue.')
-        return
-      }
+      onboardingState.competitors = Array.from(document.querySelectorAll('.comp-input')).map(i => i.value.trim()).filter(Boolean)
+      if (onboardingState.competitors.length === 0) { showCompError('Add at least one competitor domain to continue.'); return }
     }
     step = n
     for (let i = 1; i <= 3; i++) {
@@ -350,43 +283,88 @@ export const onboardingPage = () =>
       else { dot.classList.remove('bg-policy', 'text-ink-950'); dot.classList.add('bg-ink-700', 'text-gray-500') }
     }
   }
-  window.goStep = goStep  // expose for inline onclick
+  window.goStep = goStep
 
-  // ── Final launch ──────────────────────────────────────────────────
+  // ── 🔥 SAVE & GO — full pipeline trigger ───────────────────────────
   const captions = [
-    'Reading regulations for your industry…',
+    'Submitting Anakin Agentic Search…',
+    'Anakin is reading policy + competitor + sentiment sources…',
     'Cross-referencing YOUR competitors…',
-    'Scoring policy impact for your region…',
-    'Synthesising sentiment from the open web…',
-    'Composing your Daily Battle Brief…',
+    'Reshaping the payload via Groq llama-4-scout…',
+    'Painting your live Battle Brief…',
   ]
 
-  async function launchBrief() {
+  async function saveAndGo() {
+    const apikeyInput = document.getElementById('apikey-input')
+    const apikeyError = document.getElementById('apikey-error')
+    const apiKey = (apikeyInput.value || '').trim()
+
+    if (!apiKey || apiKey.length < 8) {
+      apikeyError.textContent = 'Please paste a valid Anakin API key (starts with ak_).'
+      apikeyError.classList.remove('hidden'); return
+    }
+    apikeyError.classList.add('hidden')
+
     onboardingState.pillars = Array.from(document.querySelectorAll('input[data-pillar]:checked'))
       .map(c => c.dataset.pillar)
     onboardingState.completedAt = new Date().toISOString()
 
-    // Persist locally so the dashboard reads it on first paint.
-    try { localStorage.setItem('scoutt_onboarding', JSON.stringify(onboardingState)) } catch (e) {}
-
-    // 🔥 If an API key is already saved, push the tenant straight to the server
-    // so the very next /api/anakin/start uses the user's choices.
+    // 1. Persist API key + onboarding locally so /dashboard sees them on first paint.
+    try { localStorage.setItem('scoutt_anakin_key', apiKey) } catch {}
+    try { localStorage.setItem('scoutt_onboarding', JSON.stringify(onboardingState)) } catch {}
+    // 🔥 Clear ANY old live cache / raw so the dashboard cannot render stale state.
     try {
-      const key = localStorage.getItem('scoutt_anakin_key') || ''
-      if (key) {
-        await fetch('/api/onboarding/save', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Anakin-Key': key },
-          body: JSON.stringify({
-            industry: onboardingState.industry,
-            region: onboardingState.region,
-            competitor_domains: onboardingState.competitors,
-            pillars_enabled: onboardingState.pillars,
-          }),
-        })
-      }
-    } catch (e) { /* non-fatal */ }
+      localStorage.removeItem('scoutt_live_payload_v6')
+      localStorage.removeItem('scoutt_live_raw_v6')
+      // legacy keys
+      localStorage.removeItem('scoutt_live_payload_v5')
+      localStorage.removeItem('scoutt_live_raw_v5')
+    } catch {}
 
+    // 2. Push the tenant to the server bound to this API key.
+    try {
+      await fetch('/api/onboarding/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Anakin-Key': apiKey },
+        body: JSON.stringify({
+          industry: onboardingState.industry,
+          region: onboardingState.region,
+          competitor_domains: onboardingState.competitors,
+          pillars_enabled: onboardingState.pillars,
+        }),
+      })
+    } catch (e) { /* non-fatal — dashboard.js retries */ }
+
+    // 3. Invalidate any stale server cache for this key.
+    try {
+      await fetch('/api/dashboard/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Anakin-Key': apiKey },
+      })
+    } catch {}
+
+    // 4. Warm-start the Anakin job here so the dashboard can immediately
+    //    enter polling phase (saves ~3s of perceived latency).
+    let warmedJobId = null
+    try {
+      const r = await fetch('/api/anakin/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Anakin-Key': apiKey },
+        body: JSON.stringify({
+          industry: onboardingState.industry,
+          region: onboardingState.region,
+          competitor_domains: onboardingState.competitors,
+          pillars_enabled: onboardingState.pillars,
+        }),
+      })
+      const j = await r.json().catch(() => ({}))
+      if (j && j.job_id) warmedJobId = j.job_id
+    } catch {}
+    if (warmedJobId) {
+      try { localStorage.setItem('scoutt_warm_jobid', warmedJobId) } catch {}
+    }
+
+    // 5. Animate loading caption then route to the dashboard.
     document.getElementById('step-3').classList.add('hidden')
     document.getElementById('loading').classList.remove('hidden')
     let i = 0
@@ -396,15 +374,12 @@ export const onboardingPage = () =>
       el.style.opacity = 0
       setTimeout(() => { el.textContent = captions[i]; el.style.opacity = 1 }, 250)
     }, 1700)
-
-    // Route the user into the live dashboard — the dashboard's boot()
-    // will read the persisted onboarding payload and finish syncing it.
     setTimeout(() => {
       clearInterval(t)
       window.location.href = '/dashboard?fresh=1'
-    }, 6500)
+    }, 3500)
   }
-  window.launchBrief = launchBrief
+  document.getElementById('save-and-go').addEventListener('click', saveAndGo)
 </script>
 `,
   })
