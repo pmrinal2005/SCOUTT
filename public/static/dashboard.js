@@ -1,64 +1,26 @@
-/* =====================================================================
-   SCOUTT — dashboard.js  (v7 — restored full renderers + strict live-only)
-
-   This file is the SINGLE source of all client-side interactivity for
-   the SCOUTT dashboard. It replaces the previous v6 file whose renderer
-   bodies had been accidentally stripped to '/(* see full original *)/'
-   stubs — which is why the live deploy was showing empty Pulse Wheel /
-   Threat Meter / Sentiment chart / Sankey / Policy / Competitor /
-   Sentiment / Archetype tabs and why tab-switching was broken.
-
-   What this build delivers
-   ------------------------
-     • Full implementations of every renderer (was stub):
-         renderPulseWheel, renderKPIs, renderThreatMeter, renderSankey,
-         renderSentimentVolume, renderPolicy, renderCompetitor,
-         renderSentiment, renderArchetype, refreshSearchIndex.
-     • Tab switching wiring  (.tab-btn ↔ .tab-pane)               ← key fix
-     • Time-Machine slider (#time-machine)
-     • API-key modal open/close + Save-and-Go pipeline
-     • Read-full-brief modal
-     • Transparency drawer
-     • ⌘K command palette
-     • Theme toggle (dark / paper)
-     • Audio-brief toast (graceful no-op when ElevenLabs not wired)
-     • Quote-rotator prev / next
-     • Scenario simulator (strict live-only, server-refuses-on-409)
-
-   Strict live-only contract (kept from v6)
-   ----------------------------------------
-     • localStorage stores: raw Anakin generatedJson, last live payload,
-       saved API key, onboarding tenant.
-     • Every API call carries X-Anakin-Key + X-Scoutt-Tenant +
-       X-Scoutt-Raw + X-Scoutt-Cache so even cold Vercel lambdas can
-       rebuild the LIVE payload deterministically — no demo fallback
-       once the user has a key.
-     • Once payload.source ∈ {anakin-live, anakin-direct} we LOCK the
-       session so a stale demo response cannot overwrite it.
-     • When the user has a key but no live cache yet, the dashboard
-       paints a SKELETON (no demo content) while runLivePipeline runs.
-
-   Anakin / Groq pipeline
-   ----------------------
-     1. POST /api/anakin/start      → returns job_id
-     2. GET  /api/anakin/poll/{id}  → looped browser-side every 8s
-     3. POST /api/groq/reshape      → DashboardPayload (cached + locked)
-   ===================================================================== */
-
+/* SCOUTT dashboard.js v8 — bulletproof boot, isolated renderers, demo+live both work */
 'use strict'
 
-/* ════════════════════════ tiny DOM helpers ════════════════════════ */
 const $  = (s, p = document) => p.querySelector(s)
 const $$ = (s, p = document) => Array.from(p.querySelectorAll(s))
 
-/* ════════════════════════ localStorage keys ═══════════════════════ */
 const LIVE_PAYLOAD_LS_KEY = 'scoutt_live_payload_v6'
 const LIVE_RAW_LS_KEY     = 'scoutt_live_raw_v6'
 const ONBOARDING_LS_KEY   = 'scoutt_onboarding'
 const API_KEY_LS_KEY      = 'scoutt_anakin_key'
 const THEME_LS_KEY        = 'scoutt_theme'
 
-/* ════════════════════════ persistence helpers ═════════════════════ */
+const LOG = (...a) => { try { console.log('[SCOUTT]', ...a) } catch (_) {} }
+const WARN = (...a) => { try { console.warn('[SCOUTT]', ...a) } catch (_) {} }
+const ERR = (...a) => { try { console.error('[SCOUTT]', ...a) } catch (_) {} }
+
+function safe(label, fn) {
+  try { return fn() } catch (e) { ERR(label + ' failed:', e); return null }
+}
+async function safeAsync(label, fn) {
+  try { return await fn() } catch (e) { ERR(label + ' failed:', e); return null }
+}
+
 function loadCachedLivePayload() {
   try {
     const raw = localStorage.getItem(LIVE_PAYLOAD_LS_KEY)
@@ -69,27 +31,21 @@ function loadCachedLivePayload() {
   return null
 }
 function saveCachedLivePayload(p) {
-  try { localStorage.setItem(LIVE_PAYLOAD_LS_KEY, JSON.stringify(p)) }
-  catch (e) { console.warn('payload persist failed', e) }
+  try { localStorage.setItem(LIVE_PAYLOAD_LS_KEY, JSON.stringify(p)) } catch (e) { WARN('payload persist', e) }
 }
 function loadCachedRaw() {
   try {
-    const r = localStorage.getItem(LIVE_RAW_LS_KEY)
-    if (!r) return null
-    const j = JSON.parse(r)
-    return (j && typeof j === 'object') ? j : null
+    const r = localStorage.getItem(LIVE_RAW_LS_KEY); if (!r) return null
+    const j = JSON.parse(r); return (j && typeof j === 'object') ? j : null
   } catch (_) { return null }
 }
 function saveCachedRaw(raw) {
-  try { localStorage.setItem(LIVE_RAW_LS_KEY, JSON.stringify(raw || {})) }
-  catch (e) { console.warn('raw persist failed', e) }
+  try { localStorage.setItem(LIVE_RAW_LS_KEY, JSON.stringify(raw || {})) } catch (e) { WARN('raw persist', e) }
 }
 function loadCachedTenant() {
   try {
-    const s = localStorage.getItem(ONBOARDING_LS_KEY)
-    if (!s) return null
-    const t = JSON.parse(s)
-    if (!t) return null
+    const s = localStorage.getItem(ONBOARDING_LS_KEY); if (!s) return null
+    const t = JSON.parse(s); if (!t) return null
     return {
       industry: t.industry || 'B2B SaaS Fintech',
       region:   t.region   || 'US',
@@ -99,13 +55,8 @@ function loadCachedTenant() {
   } catch (_) { return null }
 }
 function clearCachedLivePayload() {
-  try {
-    localStorage.removeItem(LIVE_PAYLOAD_LS_KEY)
-    localStorage.removeItem(LIVE_RAW_LS_KEY)
-  } catch (_) {}
+  try { localStorage.removeItem(LIVE_PAYLOAD_LS_KEY); localStorage.removeItem(LIVE_RAW_LS_KEY) } catch (_) {}
 }
-
-/* URL-safe base64 of stringified JSON. */
 function encodeHeaderB64(obj) {
   try {
     const s = JSON.stringify(obj)
@@ -114,56 +65,46 @@ function encodeHeaderB64(obj) {
   } catch (_) { return '' }
 }
 
-/* ════════════════════════ SCOUTT global ════════════════════════ */
 const SCOUTT = {
   apiKey: '',
-  init() {
-    try { this.apiKey = localStorage.getItem(API_KEY_LS_KEY) || '' }
-    catch (_) { this.apiKey = '' }
-  },
+  init() { try { this.apiKey = localStorage.getItem(API_KEY_LS_KEY) || '' } catch (_) { this.apiKey = '' } },
   get hasKey() { return !!this.apiKey },
   headers() {
     const h = this.apiKey ? { 'X-Anakin-Key': this.apiKey } : {}
     const tenant = loadCachedTenant()
-    if (tenant) {
-      const enc = encodeHeaderB64(tenant)
-      if (enc && enc.length < 8000) h['X-Scoutt-Tenant'] = enc
-    }
+    if (tenant) { const enc = encodeHeaderB64(tenant); if (enc && enc.length < 8000) h['X-Scoutt-Tenant'] = enc }
     const rawCached = loadCachedRaw()
-    if (rawCached && Object.keys(rawCached).length) {
-      const enc = encodeHeaderB64(rawCached)
-      if (enc && enc.length < 28000) h['X-Scoutt-Raw'] = enc
-    }
+    if (rawCached && Object.keys(rawCached).length) { const enc = encodeHeaderB64(rawCached); if (enc && enc.length < 28000) h['X-Scoutt-Raw'] = enc }
     const live = loadCachedLivePayload()
     if (live) {
-      const compact = {
-        ...live,
-        briefing: { ...live.briefing, events: (live.briefing.events || []).slice(0, 12) },
-      }
-      const enc = encodeHeaderB64(compact)
-      if (enc && enc.length < 28000) h['X-Scoutt-Cache'] = enc
+      const compact = { ...live, briefing: { ...live.briefing, events: (live.briefing.events || []).slice(0, 12) } }
+      const enc = encodeHeaderB64(compact); if (enc && enc.length < 28000) h['X-Scoutt-Cache'] = enc
     }
     return h
   },
   async fetch(url, opts = {}) {
-    const res = await fetch(url, {
-      ...opts,
-      headers: { 'Content-Type': 'application/json', ...this.headers(), ...(opts.headers || {}) },
-    })
+    const ctrl = new AbortController()
+    const tm = setTimeout(() => ctrl.abort(), opts.timeoutMs || 15000)
+    let res
+    try {
+      res = await fetch(url, {
+        ...opts,
+        signal: ctrl.signal,
+        headers: { 'Content-Type': 'application/json', ...this.headers(), ...(opts.headers || {}) },
+      })
+    } finally { clearTimeout(tm) }
     if (!res.ok) {
-      let body = ''
-      try { body = await res.text() } catch (_) {}
+      let body = ''; try { body = await res.text() } catch (_) {}
       const err = new Error(`${url} → ${res.status}${body ? ' · ' + body.slice(0, 200) : ''}`)
-      err.status = res.status
-      err.body = body
+      err.status = res.status; err.body = body
       try { err.json = JSON.parse(body) } catch (_) {}
       throw err
     }
     const ct = res.headers.get('content-type') || ''
     return ct.includes('application/json') ? res.json() : res.text()
   },
-  async post(url, body) {
-    return this.fetch(url, { method: 'POST', body: JSON.stringify(body || {}) })
+  async post(url, body, opts = {}) {
+    return this.fetch(url, { ...opts, method: 'POST', body: JSON.stringify(body || {}) })
   },
   async syncOnboarding() {
     if (!this.apiKey) return null
@@ -177,27 +118,22 @@ const SCOUTT = {
       pillars_enabled: saved.pillars || saved.pillars_enabled || [],
     }
     try { return await this.post('/api/onboarding/save', payload) }
-    catch (e) { console.warn('onboarding sync failed:', e?.message); return null }
+    catch (e) { WARN('onboarding sync failed:', e?.message); return null }
   },
 }
 SCOUTT.init()
 
-/* ════════════════════════ runtime state ════════════════════════ */
 const STATE = {
   payload: null,
   day: 0,
   quoteIdx: 0,
-  charts: {},          // map of chartId → Chart instance (for destroy-before-recreate)
+  charts: {},
   liveRunInflight: false,
   liveLocked: false,
 }
 let GLOBAL_INDEX = []
 
-function isLiveSource(src) {
-  return src === 'anakin-live' || src === 'anakin-direct'
-}
-
-/* ════════════════════════ utilities ════════════════════════ */
+function isLiveSource(src) { return src === 'anakin-live' || src === 'anakin-direct' }
 function escapeHTML(s) {
   return String(s ?? '').replace(/[&<>"']/g,
     c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
@@ -224,58 +160,46 @@ function setLiveLoading(on, title, sub) {
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms) } }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
-/* Destroy + recreate Chart.js instance keyed by id. */
 function makeChart(canvasId, config) {
   const c = document.getElementById(canvasId)
   if (!c || typeof Chart === 'undefined') return null
-  if (STATE.charts[canvasId]) {
-    try { STATE.charts[canvasId].destroy() } catch (_) {}
-  }
-  try {
-    STATE.charts[canvasId] = new Chart(c.getContext('2d'), config)
-    return STATE.charts[canvasId]
-  } catch (e) { console.warn('chart create failed', canvasId, e); return null }
+  if (STATE.charts[canvasId]) { try { STATE.charts[canvasId].destroy() } catch (_) {} }
+  try { STATE.charts[canvasId] = new Chart(c.getContext('2d'), config); return STATE.charts[canvasId] }
+  catch (e) { WARN('chart create failed', canvasId, e); return null }
 }
 
-/* ════════════════════════ greeting ════════════════════════ */
 function applyTimeGreeting() {
-  const h = new Date().getHours()
-  let label = 'Good evening', icon = 'fa-moon', color = 'text-sentiment'
-  if (h >= 5 && h < 12)       { label = 'Good morning';   icon = 'fa-sun';        color = 'text-policy' }
-  else if (h >= 12 && h < 17) { label = 'Good afternoon'; icon = 'fa-cloud-sun';  color = 'text-competitor' }
-  else if (h >= 17 && h < 21) { label = 'Good evening';   icon = 'fa-cloud-moon'; color = 'text-sentiment' }
-  else                        { label = 'Good night';     icon = 'fa-moon';       color = 'text-sentiment' }
-  const lbl = $('#greeting-text'); if (lbl) lbl.textContent = label
-  const ic  = $('#greeting-icon'); if (ic) ic.className = `fa-solid ${icon} ${color} text-xl`
-  const t   = $('#brief-time')
-  if (t) {
-    const now = new Date()
-    t.textContent = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')} UTC`
-  }
+  const now = new Date()
+  const h = now.getUTCHours()
+  const greet = h < 5 ? 'Good night' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening'
+  const icon  = h < 5 ? 'fa-moon' : h < 12 ? 'fa-sun' : h < 17 ? 'fa-cloud-sun' : 'fa-cloud-moon'
+  const gt = $('#greeting-text'); if (gt) gt.textContent = greet
+  const gi = $('#greeting-icon'); if (gi) gi.className = `fa-solid ${icon} text-policy text-xl`
+  const bt = $('#brief-time')
+  if (bt) bt.textContent = `${String(h).padStart(2,'0')}:${String(now.getUTCMinutes()).padStart(2,'0')} UTC`
 }
 
-/* ════════════════════════ LIVE PIPELINE ════════════════════════ */
 async function runLivePipeline() {
   if (STATE.liveRunInflight) return null
   if (!SCOUTT.hasKey) { showToast('Add your Anakin API key first.', 'error'); return null }
   STATE.liveRunInflight = true
   setLiveLoading(true, 'Generating your live briefing…',
-    'Step 1/3 — Submitting Anakin Agentic Search with your industry, region, and competitors…')
+    'Step 1/3 — Submitting Anakin Agentic Search…')
   try {
     await SCOUTT.syncOnboarding().catch(() => {})
     const tenant = loadCachedTenant() || {}
-    const startResp = await SCOUTT.post('/api/anakin/start', tenant)
+    const startResp = await SCOUTT.post('/api/anakin/start', tenant, { timeoutMs: 25000 })
     if (!startResp.ok || !startResp.job_id) throw new Error(startResp.error || 'Anakin start failed')
     const jobId = startResp.job_id
     setLiveLoading(true, 'Generating your live briefing…',
-      `Step 2/3 — Anakin job ${jobId.slice(0, 8)}… polling every 8s (this typically takes 40-90s).`)
+      `Step 2/3 — Anakin job ${jobId.slice(0, 8)}… polling every 8s.`)
     const startedAt = Date.now()
     const MAX_POLL_MS = 5 * 60_000
     let raw = null
     while (Date.now() - startedAt < MAX_POLL_MS) {
       await sleep(8_000)
       let pollData
-      try { pollData = await SCOUTT.fetch(`/api/anakin/poll/${encodeURIComponent(jobId)}`) }
+      try { pollData = await SCOUTT.fetch(`/api/anakin/poll/${encodeURIComponent(jobId)}`, { timeoutMs: 15000 }) }
       catch (_) { continue }
       if (pollData.status === 'completed' && pollData.raw) { raw = pollData.raw; break }
       if (pollData.status === 'failed') throw new Error(pollData.message || 'Anakin job failed')
@@ -286,25 +210,21 @@ async function runLivePipeline() {
     if (!raw) throw new Error('Anakin polling exceeded 5 minutes')
     saveCachedRaw(raw)
     setLiveLoading(true, 'Generating your live briefing…',
-      'Step 3/3 — Reshaping payload (Groq meta-llama/llama-4-scout-17b-16e-instruct)…')
-    const payload = await SCOUTT.post('/api/groq/reshape', { raw })
+      'Step 3/3 — Reshaping payload via Groq…')
+    const payload = await SCOUTT.post('/api/groq/reshape', { raw }, { timeoutMs: 45000 })
     if (!payload || !payload.briefing) throw new Error('Reshape returned empty payload')
     if (!isLiveSource(payload.source)) {
-      console.warn('Unexpected non-live source from reshape:', payload.source)
+      WARN('Unexpected non-live source from reshape:', payload.source)
       payload.source = 'anakin-direct'
     }
     STATE.liveLocked = true
     saveCachedLivePayload(payload)
     STATE.payload = payload
-    if (payload.source === 'anakin-live') {
-      showToast('✓ Live briefing generated via Anakin → Groq reshape.')
-    } else {
-      showToast('✓ Live briefing rendered from Anakin scrape (Anakin-direct mapper).')
-    }
-    try { await renderAll(payload) } catch (e) { console.warn('renderAll after reshape failed:', e) }
+    showToast(payload.source === 'anakin-live' ? '✓ Live briefing generated.' : '✓ Live briefing rendered (direct mapper).')
+    await safeAsync('renderAll(live)', () => renderAll(payload))
     return payload
   } catch (e) {
-    console.error('Live pipeline failed:', e)
+    ERR('Live pipeline failed:', e)
     showToast('Live pipeline failed: ' + e.message, 'error')
     return null
   } finally {
@@ -313,41 +233,41 @@ async function runLivePipeline() {
   }
 }
 
-/* ════════════════════════ FETCH PAYLOAD ════════════════════════ */
 async function fetchPayload(day = 0) {
   const cachedLive = loadCachedLivePayload()
   if (cachedLive && day === 0) {
-    STATE.payload = cachedLive
-    STATE.day = day
-    STATE.liveLocked = true
+    LOG('Using cached live payload')
+    STATE.payload = cachedLive; STATE.day = day; STATE.liveLocked = true
     return cachedLive
   }
   if (SCOUTT.hasKey && !cachedLive && day === 0) {
     setLiveLoading(true, 'Generating your live briefing…',
-      'Preparing to call Anakin Agentic Search with your onboarding answers…')
-    runLivePipeline().then(live => { if (live) renderAll(live) })
+      'Preparing Anakin Agentic Search…')
+    runLivePipeline().then(live => { if (live) safeAsync('renderAll(live-bg)', () => renderAll(live)) })
+  }
+  // Always also fetch /api/dashboard so we have SOMETHING to render immediately
+  try {
+    const data = await SCOUTT.fetch(`/api/dashboard?day=${day}`, { timeoutMs: 12000 })
+    if (STATE.liveLocked && !isLiveSource(data.source) && STATE.payload && isLiveSource(STATE.payload.source)) {
+      return STATE.payload
+    }
+    STATE.payload = data; STATE.day = day
+    if (isLiveSource(data.source)) { STATE.liveLocked = true; saveCachedLivePayload(data) }
+    return data
+  } catch (e) {
+    WARN('fetchPayload /api/dashboard failed:', e?.message)
     return makeSkeletonPayload()
   }
-  const data = await SCOUTT.fetch(`/api/dashboard?day=${day}`)
-  if (STATE.liveLocked && !isLiveSource(data.source) && STATE.payload && isLiveSource(STATE.payload.source)) {
-    return STATE.payload
-  }
-  STATE.payload = data; STATE.day = day
-  if (isLiveSource(data.source)) {
-    STATE.liveLocked = true
-    saveCachedLivePayload(data)
-  }
-  return data
 }
 
 function makeSkeletonPayload() {
   return {
-    source: 'demo-warming',
+    source: 'skeleton',
     generated_at_iso: new Date().toISOString(),
     briefing: {
       briefing_date: new Date().toISOString().slice(0, 10),
-      headline: 'Your live briefing is being generated…',
-      summary: 'Anakin Agentic Search is scraping policy, competitor, and sentiment signals for your tenant. This screen will update automatically when ready.',
+      headline: 'Loading your briefing…',
+      summary: 'Fetching live policy, competitor, and sentiment signals…',
       threat_level: 0, high_impact_count: 0, events: [], actions: [],
       kpis: { threats_detected: 0, opportunities: 0, action_items: 0, avg_response_time_minutes: 0 },
     },
@@ -368,104 +288,84 @@ function makeSkeletonPayload() {
   }
 }
 
-/* ════════════════════════ RENDER ROOT ════════════════════════ */
 async function renderAll(payload) {
   if (!payload) return
-  applyTimeGreeting()
-  renderBanner(payload)
-  renderTimeline(payload)
-  renderActions(payload)
-  renderPulseWheel(payload)
-  renderKPIs(payload)
-  renderThreatMeter(payload)
-  renderSankey(payload)
-  renderSentimentVolume(payload)
-  renderPolicy(payload)
-  renderCompetitor(payload)
-  renderSentiment(payload)
-  renderArchetype(payload)
-  refreshSearchIndex()
+  LOG('renderAll start, source=', payload.source)
+  safe('applyTimeGreeting',     () => applyTimeGreeting())
+  safe('renderBanner',          () => renderBanner(payload))
+  safe('renderTimeline',        () => renderTimeline(payload))
+  safe('renderActions',         () => renderActions(payload))
+  safe('renderPulseWheel',      () => renderPulseWheel(payload))
+  safe('renderKPIs',            () => renderKPIs(payload))
+  safe('renderThreatMeter',     () => renderThreatMeter(payload))
+  safe('renderSankey',          () => renderSankey(payload))
+  safe('renderSentimentVolume', () => renderSentimentVolume(payload))
+  safe('renderPolicy',          () => renderPolicy(payload))
+  safe('renderCompetitor',      () => renderCompetitor(payload))
+  safe('renderSentiment',       () => renderSentiment(payload))
+  safe('renderArchetype',       () => renderArchetype(payload))
+  await safeAsync('refreshSearchIndex', () => refreshSearchIndex())
+  LOG('renderAll done')
 }
 
-/* ─── Banner / Timeline / Actions ─────────────────────────────── */
 function renderBanner(p) {
   const b = p.briefing || {}
-  const ev = $('#banner-events'); if (ev) ev.textContent = String(b.high_impact_count ?? 0)
-  const th = $('#banner-threat'); if (th) th.textContent = String(b.threat_level ?? 0)
-  const su = $('#banner-summary'); if (su) su.textContent = b.headline || b.summary || ''
-}
-function renderTimeline(p) {
-  const list = $('#timeline-list'); if (!list) return
-  const data = p.timeline || []
-  if (!data.length) {
-    list.innerHTML = '<li class="text-xs text-gray-500">Awaiting live signal…</li>'
-    return
-  }
-  const colors = { policy: '#06b6d4', competitor: '#f97316', sentiment: '#ec4899' }
-  const rgb    = { policy: '6,182,212', competitor: '249,115,22', sentiment: '236,72,153' }
-  list.innerHTML = data.map((e, i) => `
-    <li class="relative slide-up" style="animation-delay:${i * 40}ms">
-      <span class="absolute -left-[1.4rem] top-1 w-2.5 h-2.5 rounded-full"
-            style="background:${colors[e.pillar] || '#a1a8bd'};box-shadow:0 0 0 3px rgba(${rgb[e.pillar] || '161,168,189'},0.18)"></span>
-      <div class="text-[10px] mono text-gray-500 mb-0.5">${escapeHTML(e.date)} • sev ${e.severity}</div>
-      <div class="text-xs leading-snug">${escapeHTML(e.title)}</div>
-    </li>`).join('')
-}
-function renderActions(p) {
-  const wrap = $('#actions-list'); if (!wrap) return
-  const acts = p.briefing?.actions || []
-  if (!acts.length) {
-    wrap.innerHTML = '<div class="text-xs text-gray-500">Awaiting live signal…</div>'
-    return
-  }
-  const colors = { high: 'action', medium: 'competitor', low: 'gray-500' }
-  wrap.innerHTML = acts.map((a, i) => `
-    <div class="card step-card p-3" data-action="${i}">
-      <div class="flex items-start gap-2 mb-2">
-        <input type="checkbox" class="mt-1 accent-emerald-500" />
-        <div class="flex-1">
-          <div class="text-sm font-medium leading-snug">${escapeHTML(a.title)}</div>
-          <div class="text-[11px] text-gray-500 mt-0.5">${escapeHTML(a.why_now || '')}</div>
-        </div>
-      </div>
-      <div class="flex items-center gap-2 mt-2">
-        <span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-${colors[a.impact] || 'gray-500'}/15 text-${colors[a.impact] || 'gray-500'} border border-${colors[a.impact] || 'gray-500'}/40">${escapeHTML(a.impact || 'medium')} impact</span>
-        <button type="button" class="action-draft-btn ml-auto text-[11px] text-policy hover:underline cursor-pointer" data-idx="${i}" data-kind="email"><i class="fa-solid fa-envelope text-[10px]"></i> Email</button>
-        <button type="button" class="action-draft-btn text-[11px] text-policy hover:underline cursor-pointer" data-idx="${i}" data-kind="slack"><i class="fa-brands fa-slack text-[10px]"></i> Slack</button>
-      </div>
-    </div>`).join('')
-  $$('.action-draft-btn').forEach(b => b.addEventListener('click', async () => {
-    try {
-      const data = await SCOUTT.post('/api/action/draft', { action_id: +b.dataset.idx, kind: b.dataset.kind })
-      showDraftModal(data)
-    } catch (e) { showToast('Draft failed: ' + e.message, 'error') }
-  }))
-}
-function showDraftModal(data) {
-  const m = document.createElement('div')
-  m.className = 'fixed inset-0 z-[70] cmdk-backdrop flex items-center justify-center px-4'
-  m.innerHTML = `
-    <div class="card w-full max-w-xl p-5 slide-up">
-      <div class="flex items-center justify-between mb-3">
-        <h3 class="font-semibold">${data.kind === 'email' ? 'Email draft' : 'Slack message'}</h3>
-        <button type="button" class="closeit text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
-      </div>
-      <pre class="whitespace-pre-wrap text-sm bg-ink-900 p-4 rounded-lg border border-ink-700 max-h-[400px] overflow-y-auto">${escapeHTML(data.body || '')}</pre>
-      <div class="flex justify-end gap-2 mt-4">
-        <button type="button" class="closeit text-gray-400 hover:text-white px-3 py-2 text-sm cursor-pointer">Close</button>
-        <button type="button" class="copyit bg-policy text-ink-950 font-semibold px-4 py-2 rounded-lg text-sm cursor-pointer">Copy</button>
-      </div>
-    </div>`
-  document.body.appendChild(m)
-  m.querySelectorAll('.closeit').forEach(b => b.addEventListener('click', () => m.remove()))
-  m.querySelector('.copyit').addEventListener('click', () => {
-    navigator.clipboard.writeText(data.body || '')
-    m.querySelector('.copyit').textContent = '✓ Copied'
-  })
-  m.addEventListener('click', e => { if (e.target === m) m.remove() })
+  const ev = $('#banner-events'); if (ev) ev.textContent = b.high_impact_count ?? (b.events?.length || 0)
+  const th = $('#banner-threat'); if (th) th.textContent = b.threat_level ?? 0
+  const sm = $('#banner-summary'); if (sm) sm.textContent = b.headline || b.summary || ''
 }
 
-/* ════════════════════════ PULSE WHEEL (SVG, 24h) ════════════════════════ */
+function renderTimeline(p) {
+  const list = $('#timeline-list'); if (!list) return
+  const items = p.timeline || []
+  if (!items.length) { list.innerHTML = '<li class="text-xs text-gray-500">No events.</li>'; return }
+  list.innerHTML = items.slice(0, 10).map(it => {
+    const c = it.pillar === 'policy' ? 'policy' : it.pillar === 'competitor' ? 'competitor' : 'sentiment'
+    return `<li class="relative">
+      <span class="absolute -left-[21px] top-1 w-2.5 h-2.5 rounded-full bg-${c}"></span>
+      <div class="text-[10px] mono text-gray-500">${escapeHTML(it.date || '')} • sev ${it.severity ?? '--'}</div>
+      <div class="text-xs leading-snug">${escapeHTML(it.title || '')}</div>
+    </li>`
+  }).join('')
+}
+
+function renderActions(p) {
+  const wrap = $('#actions-list'); if (!wrap) return
+  const acts = (p.briefing?.actions || []).slice(0, 3)
+  if (!acts.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">No actions yet.</div>'; return }
+  wrap.innerHTML = acts.map((a, i) => {
+    const impactColor = a.impact === 'high' ? 'text-policy bg-policy/15 border-policy/40'
+                      : a.impact === 'medium' ? 'text-competitor bg-competitor/15 border-competitor/40'
+                      : 'text-gray-400 bg-ink-800 border-ink-600'
+    return `<label class="card step-card p-3 block cursor-pointer">
+      <div class="flex items-start gap-2">
+        <input type="checkbox" class="mt-1" />
+        <div class="flex-1">
+          <div class="text-sm font-medium">${escapeHTML(a.title || 'Action ' + (i+1))}</div>
+          <div class="text-[11px] text-gray-400 mt-0.5">${escapeHTML(a.description || '')}</div>
+          <div class="flex items-center gap-2 mt-2 flex-wrap">
+            <span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase border ${impactColor}">${escapeHTML(a.impact || 'low')} impact</span>
+            <button type="button" data-act-email="${i}" class="text-[10px] text-policy hover:underline"><i class="fa-solid fa-envelope"></i> Email</button>
+            <button type="button" data-act-slack="${i}" class="text-[10px] text-policy hover:underline"><i class="fa-brands fa-slack"></i> Slack</button>
+          </div>
+        </div>
+      </div>
+    </label>`
+  }).join('')
+  wrap.querySelectorAll('[data-act-email]').forEach(b => b.addEventListener('click', e => {
+    e.preventDefault(); showDraftModal({ kind: 'email', action: acts[+b.dataset.actEmail] })
+  }))
+  wrap.querySelectorAll('[data-act-slack]').forEach(b => b.addEventListener('click', e => {
+    e.preventDefault(); showDraftModal({ kind: 'slack', action: acts[+b.dataset.actSlack] })
+  }))
+}
+
+function showDraftModal({ kind, action }) {
+  const body = `${kind === 'email' ? 'Email' : 'Slack'} draft for: ${action?.title || ''}\n\n${action?.description || ''}`
+  showToast(`${kind === 'email' ? '✉️ Email' : '💬 Slack'} draft copied to clipboard.`)
+  try { navigator.clipboard?.writeText(body) } catch (_) {}
+}
+
 function renderPulseWheel(p) {
   const wrap = $('#pulse-wheel-container'); if (!wrap) return
   const events = (p.pulse_wheel && p.pulse_wheel.length)
@@ -474,12 +374,11 @@ function renderPulseWheel(p) {
         pillar: e.pillar, hour: (i * 2.7) % 24, severity: e.severity || 50,
         title: e.title, source_url: e.source_url,
       }))
-
   const W = 460, H = 460, CX = W / 2, CY = H / 2
   const rings = {
     policy:     { r: 170, color: '#06b6d4' },
     competitor: { r: 130, color: '#f97316' },
-    sentiment: { r:  92, color: '#ec4899' },
+    sentiment:  { r:  92, color: '#ec4899' },
   }
   const hourTicks = Array.from({ length: 24 }, (_, h) => {
     const ang = (h / 24) * Math.PI * 2 - Math.PI / 2
@@ -500,7 +399,6 @@ function renderPulseWheel(p) {
      <text x="${CX}" y="${CY - ring.r + 18}" fill="${ring.color}" font-size="10"
            font-family="JetBrains Mono" text-anchor="middle" opacity="0.7">${k.toUpperCase()}</text>`
   ).join('')
-
   const dots = events.map((e, i) => {
     const ring = rings[e.pillar]; if (!ring) return ''
     const ang = (e.hour / 24) * Math.PI * 2 - Math.PI / 2
@@ -512,25 +410,18 @@ function renderPulseWheel(p) {
         <circle cx="${x}" cy="${y}" r="${radius}" fill="${ring.color}" stroke="#05060a" stroke-width="1.5" />
       </g>`
   }).join('')
-
   wrap.innerHTML = `
     <svg viewBox="0 0 ${W} ${H}" class="w-full h-full">
-      ${ringPaths}
-      ${hourTicks}
-      ${hourLabels}
-      ${dots}
+      ${ringPaths}${hourTicks}${hourLabels}${dots}
       <circle cx="${CX}" cy="${CY}" r="42" fill="#05060a" stroke="#06b6d4" stroke-width="1.5" />
       <text x="${CX}" y="${CY - 4}" text-anchor="middle" fill="#06b6d4" font-size="22"
             font-family="JetBrains Mono" font-weight="700">${p.briefing?.threat_level ?? '--'}</text>
       <text x="${CX}" y="${CY + 14}" text-anchor="middle" fill="#5a607a" font-size="9"
             font-family="JetBrains Mono">THREAT</text>
     </svg>`
-
-  // Hover tooltip
   const tt = $('#wheel-tooltip')
   wrap.querySelectorAll('.pulse-dot').forEach(g => {
-    const i = +g.dataset.i
-    const e = events[i]
+    const i = +g.dataset.i; const e = events[i]
     g.addEventListener('mouseenter', ev => {
       if (!tt || !e) return
       tt.innerHTML = `
@@ -538,16 +429,14 @@ function renderPulseWheel(p) {
         <div class="text-xs leading-snug">${escapeHTML(e.title || '')}</div>`
       tt.style.opacity = '1'
       const box = wrap.getBoundingClientRect()
-      const px = ev.clientX - box.left + 12
-      const py = ev.clientY - box.top  + 12
-      tt.style.left = px + 'px'; tt.style.top = py + 'px'
+      tt.style.left = (ev.clientX - box.left + 12) + 'px'
+      tt.style.top  = (ev.clientY - box.top  + 12) + 'px'
     })
     g.addEventListener('mouseleave', () => { if (tt) tt.style.opacity = '0' })
     g.addEventListener('click', () => { if (e?.source_url) window.open(e.source_url, '_blank', 'noopener') })
   })
 }
 
-/* ════════════════════════ KPIs + sparklines ════════════════════════ */
 function renderKPIs(p) {
   const k = p.briefing?.kpis || {}
   const sparks = p.kpi_sparklines || {}
@@ -583,18 +472,15 @@ function renderKPIs(p) {
   })
 }
 
-/* ════════════════════════ Threat-Level Meter (gauge + sparkline) ════════════════════════ */
 function renderThreatMeter(p) {
   const wrap = $('#threat-meter-container'); if (!wrap) return
   const v = Math.max(0, Math.min(100, Number(p.threat_meter?.value ?? p.briefing?.threat_level ?? 0)))
   const label = p.threat_meter?.label || labelForThreat(v)
   const spark = p.threat_meter?.sparkline_14d || []
-  // Half-donut gauge, needle.
   const W = 240, H = 130
   const CX = W / 2, CY = H - 10, R = 92
   function arc(start, end, color) {
-    const a1 = (Math.PI * (1 + start / 100))
-    const a2 = (Math.PI * (1 + end / 100))
+    const a1 = Math.PI * (1 + start / 100), a2 = Math.PI * (1 + end / 100)
     const x1 = CX + Math.cos(a1) * R, y1 = CY + Math.sin(a1) * R
     const x2 = CX + Math.cos(a2) * R, y2 = CY + Math.sin(a2) * R
     return `<path d="M ${x1} ${y1} A ${R} ${R} 0 0 1 ${x2} ${y2}" fill="none" stroke="${color}" stroke-width="14" stroke-linecap="butt" />`
@@ -602,13 +488,10 @@ function renderThreatMeter(p) {
   const needleAng = Math.PI * (1 + v / 100)
   const nx = CX + Math.cos(needleAng) * (R - 4)
   const ny = CY + Math.sin(needleAng) * (R - 4)
-
   wrap.innerHTML = `
     <div class="flex flex-col items-center">
       <svg viewBox="0 0 ${W} ${H}" class="w-full">
-        ${arc(0, 40, '#10b981')}
-        ${arc(40, 70, '#f97316')}
-        ${arc(70, 100, '#ec4899')}
+        ${arc(0, 40, '#10b981')}${arc(40, 70, '#f97316')}${arc(70, 100, '#ec4899')}
         <line x1="${CX}" y1="${CY}" x2="${nx}" y2="${ny}" stroke="#06b6d4" stroke-width="3" stroke-linecap="round" />
         <circle cx="${CX}" cy="${CY}" r="6" fill="#06b6d4" />
         <text x="${CX}" y="${CY - 30}" text-anchor="middle" font-family="JetBrains Mono" font-size="26" font-weight="700" fill="#e7eaf3">${v}</text>
@@ -641,41 +524,26 @@ function labelForThreat(v) {
   return 'Low'
 }
 
-
-/* ════════════════════════ Sankey (Threats → Actions) ════════════════════════ */
 function renderSankey(p) {
   const wrap = $('#sankey-container'); if (!wrap) return
   const sk = p.threats_to_actions || { sources: [], targets: [], links: [] }
   const W = 360, H = 200, padX = 12, padY = 12
   const srcs = sk.sources || [], tgts = sk.targets || []
   if (!srcs.length || !tgts.length) {
-    wrap.innerHTML = `<div class="text-xs text-gray-500 h-[200px] flex items-center justify-center">Awaiting live signal…</div>`
+    wrap.innerHTML = `<div class="text-xs text-gray-500 h-[200px] flex items-center justify-center">Awaiting signal…</div>`
     return
   }
   const colors = ['#06b6d4', '#f97316', '#ec4899', '#10b981']
   const totalS = srcs.reduce((a, b) => a + (b.count || 1), 0) || 1
   const totalT = tgts.reduce((a, b) => a + (b.count || 1), 0) || 1
-  const sBarW = 14, tBarW = 14
-  const sX = padX, tX = W - padX - tBarW
-  // y positions for sources
+  const sBarW = 14, tBarW = 14, sX = padX, tX = W - padX - tBarW
   let curY = padY
-  const sPos = srcs.map(s => {
-    const h = ((s.count || 1) / totalS) * (H - padY * 2)
-    const y = curY; curY += h
-    return { y, h }
-  })
+  const sPos = srcs.map(s => { const h = ((s.count || 1) / totalS) * (H - padY * 2); const y = curY; curY += h; return { y, h } })
   curY = padY
-  const tPos = tgts.map(t => {
-    const h = ((t.count || 1) / totalT) * (H - padY * 2)
-    const y = curY; curY += h
-    return { y, h }
-  })
-  // links: from source i → target j with value
+  const tPos = tgts.map(t => { const h = ((t.count || 1) / totalT) * (H - padY * 2); const y = curY; curY += h; return { y, h } })
   const links = (sk.links || []).map(l => {
-    const sP = sPos[l.from], tP = tPos[l.to]
-    if (!sP || !tP) return ''
-    const ys = sP.y + sP.h / 2, yt = tP.y + tP.h / 2
-    const mid = (sX + sBarW + tX) / 2
+    const sP = sPos[l.from], tP = tPos[l.to]; if (!sP || !tP) return ''
+    const ys = sP.y + sP.h / 2, yt = tP.y + tP.h / 2, mid = (sX + sBarW + tX) / 2
     return `<path d="M ${sX + sBarW} ${ys} C ${mid} ${ys}, ${mid} ${yt}, ${tX} ${yt}"
                  fill="none" stroke="${colors[l.from] || '#06b6d4'}" stroke-opacity="0.35"
                  stroke-width="${Math.max(2, (l.value || 1) * 4)}" />`
@@ -691,7 +559,6 @@ function renderSankey(p) {
   wrap.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="w-full" style="height:200px">${links}${sBars}${tBars}</svg>`
 }
 
-/* ════════════════════════ Sentiment Volume (stacked area) ════════════════════════ */
 function renderSentimentVolume(p) {
   const data = p.sentiment_volume_14d || []
   if (!data.length) return
@@ -706,23 +573,17 @@ function renderSentimentVolume(p) {
       ] },
     options: { responsive: true, maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: { labels: { color: '#a1a8bd', boxWidth: 8, font: { size: 10 } } },
-        tooltip: { backgroundColor: '#05060a', borderColor: '#262b3a', borderWidth: 1 },
-      },
-      scales: {
-        x: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } },
-        y: { stacked: true, ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } },
-      } },
+      plugins: { legend: { labels: { color: '#a1a8bd', boxWidth: 8, font: { size: 10 } } },
+                 tooltip: { backgroundColor: '#05060a', borderColor: '#262b3a', borderWidth: 1 } },
+      scales: { x: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } },
+                y: { stacked: true, ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } } } },
   })
 }
 
-
-/* ════════════════════════ POLICY RADAR ════════════════════════ */
 function renderPolicy(p) {
-  renderWorldMap(p)
-  renderPolicyQoQ(p)
-  renderActiveRegulations(p)
+  safe('renderWorldMap',           () => renderWorldMap(p))
+  safe('renderPolicyQoQ',          () => renderPolicyQoQ(p))
+  safe('renderActiveRegulations',  () => renderActiveRegulations(p))
 }
 function renderWorldMap(p) {
   const wrap = $('#world-map'); if (!wrap) return
@@ -732,7 +593,6 @@ function renderWorldMap(p) {
   const land = (typeof window !== 'undefined' && window.SCOUTT_WORLD_MAP_PATHS) || ''
   const pinSvg = regions.map((r, i) => {
     const c = r.activity > 70 ? '#06b6d4' : r.activity > 45 ? '#f97316' : '#ec4899'
-    const cls = r.activity > 70 ? '' : r.activity > 45 ? 'orange' : 'magenta'
     const { x, y } = proj(r.lng, r.lat)
     return `<g class="policy-pin" data-i="${i}" transform="translate(${x},${y})" style="cursor:pointer">
         <circle r="14" fill="${c}" opacity="0.18" class="blink" />
@@ -746,8 +606,7 @@ function renderWorldMap(p) {
     </svg>`
   const tt = $('#map-tooltip')
   wrap.querySelectorAll('.policy-pin').forEach(pin => {
-    const i = +pin.dataset.i
-    const r = regions[i]
+    const i = +pin.dataset.i; const r = regions[i]
     pin.addEventListener('mouseenter', ev => {
       if (!tt || !r) return
       tt.innerHTML = `
@@ -767,26 +626,21 @@ function renderPolicyQoQ(p) {
   if (!qoq.length) return
   makeChart('chart-policy-trend', {
     type: 'bar',
-    data: { labels: qoq.map(q => q.country.slice(0, 12)),
+    data: { labels: qoq.map(q => (q.country || '').slice(0, 12)),
       datasets: [
         { label: 'Q1', data: qoq.map(q => q.q1), backgroundColor: '#3a4055', borderRadius: 4 },
         { label: 'Q2', data: qoq.map(q => q.q2), backgroundColor: '#06b6d4', borderRadius: 4 },
       ] },
     options: { responsive: true, maintainAspectRatio: false, indexAxis: 'y',
       plugins: { legend: { labels: { color: '#a1a8bd', boxWidth: 8, font: { size: 10 } } } },
-      scales: {
-        x: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } },
-        y: { ticks: { color: '#a1a8bd', font: { size: 9 } }, grid: { display: false } },
-      } },
+      scales: { x: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } },
+                y: { ticks: { color: '#a1a8bd', font: { size: 9 } }, grid: { display: false } } } },
   })
 }
 function renderActiveRegulations(p) {
   const wrap = $('#reg-cards'); if (!wrap) return
   const regs = p.policy?.active_regulations || []
-  if (!regs.length) {
-    wrap.innerHTML = '<div class="text-xs text-gray-500 col-span-full">Awaiting live signal…</div>'
-    return
-  }
+  if (!regs.length) { wrap.innerHTML = '<div class="text-xs text-gray-500 col-span-full">Awaiting signal…</div>'; return }
   wrap.innerHTML = regs.map(r => {
     const sev = Number(r.severity || 0)
     const sevColor = sev >= 80 ? 'text-policy border-policy/40 bg-policy/15'
@@ -811,252 +665,200 @@ function renderActiveRegulations(p) {
   }).join('')
 }
 
-
-/* ════════════════════════ COMPETITOR PULSE ════════════════════════ */
 function renderCompetitor(p) {
-  renderDiffTimeline(p)
-  renderPricingDiff(p)
-  renderPricingRace(p)
-  renderCompetitorEvents(p)
-  renderFeatureMatrix(p)
+  safe('renderDiffTimeline',     () => renderDiffTimeline(p))
+  safe('renderPricingDiff',      () => renderPricingDiff(p))
+  safe('renderPricingRace',      () => renderPricingRace(p))
+  safe('renderCompetitorEvents', () => renderCompetitorEvents(p))
+  safe('renderFeatureMatrix',    () => renderFeatureMatrix(p))
 }
 function renderDiffTimeline(p) {
   const wrap = $('#diff-timeline'); if (!wrap) return
   const items = p.competitor?.diff_timeline || []
-  if (!items.length) { wrap.innerHTML = '<div class="text-xs text-gray-500 h-full flex items-center justify-center">Awaiting diff signal…</div>'; return }
-  const W = 100 // percent
-  const stepW = W / items.length
-  const colors = { pricing: '#f97316', product: '#06b6d4', hiring: '#10b981' }
-  wrap.innerHTML = items.map((it, i) => `
-    <div title="${escapeHTML(it.kind)} @ ${escapeHTML(it.ts_iso)}" class="absolute top-0 bottom-0"
-         style="left:${i * stepW}%; width:${stepW}%">
-      <div class="absolute inset-y-2 left-1/2 -translate-x-1/2 w-1.5 rounded-full"
-           style="background:${colors[it.kind] || '#5a607a'}"></div>
-      <div class="absolute bottom-0 left-1/2 -translate-x-1/2 text-[9px] mono text-gray-500 mb-0.5">${escapeHTML((it.ts_iso || '').slice(5, 10))}</div>
+  if (!items.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">No recent diffs.</div>'; return }
+  wrap.innerHTML = items.slice(0, 10).map(it => `
+    <div class="text-xs flex items-start gap-2 py-1.5 border-b border-ink-700 last:border-0">
+      <span class="mono text-[10px] text-gray-500 shrink-0 w-16">${escapeHTML(it.date || '')}</span>
+      <span class="flex-1">${escapeHTML(it.title || '')}</span>
+      <span class="text-[10px] mono text-${it.delta > 0 ? 'competitor' : 'action'}">${it.delta > 0 ? '+' : ''}${it.delta ?? 0}</span>
     </div>`).join('')
 }
 function renderPricingDiff(p) {
-  const d = p.competitor?.pricing_diff
-  const titleEl = $('#diff-title')
-  if (titleEl) titleEl.textContent = d?.url ? `Pricing Diff — ${d.url}` : 'Pricing Diff — awaiting'
-  const beforeT = $('#diff-before-time'), afterT = $('#diff-after-time')
-  if (beforeT) beforeT.textContent = d?.before_ts || '--'
-  if (afterT)  afterT.textContent  = d?.after_ts || '--'
-  const before = $('#diff-before'), after = $('#diff-after')
-  const fmtLines = (lines, neg) => (lines || []).map(l => {
-    const c = neg && l.startsWith('-') ? 'text-red-400' : !neg && l.startsWith('+') ? 'text-emerald-400' : 'text-gray-300'
-    return `<div class="${c}">${escapeHTML(l)}</div>`
-  }).join('')
-  if (before) before.innerHTML = fmtLines(d?.before_lines, true)
-  if (after)  after.innerHTML  = fmtLines(d?.after_lines, false)
-  const feeEl = $('#diff-fee-pct'); if (feeEl) feeEl.textContent = (d?.fee_change_pct != null ? `${d.fee_change_pct > 0 ? '+' : ''}${d.fee_change_pct}%` : '--%')
-  const threatEl = $('#diff-threat'); if (threatEl) threatEl.textContent = String(d?.threat_level ?? '--')
+  const wrap = $('#pricing-diff'); if (!wrap) return
+  const d = p.competitor?.pricing_diff || {}
+  const bL = d.before_lines || [], aL = d.after_lines || []
+  wrap.innerHTML = `
+    <div class="grid grid-cols-2 gap-3 text-xs mono">
+      <div>
+        <div class="text-[10px] uppercase text-gray-500 mb-1">Before · ${escapeHTML(d.before_ts || '')}</div>
+        <pre class="bg-ink-900 border border-ink-700 rounded p-2 overflow-auto max-h-48">${bL.map(l => escapeHTML(l)).join('\n')}</pre>
+      </div>
+      <div>
+        <div class="text-[10px] uppercase text-gray-500 mb-1">After · ${escapeHTML(d.after_ts || '')}</div>
+        <pre class="bg-ink-900 border border-ink-700 rounded p-2 overflow-auto max-h-48">${aL.map(l => escapeHTML(l)).join('\n')}</pre>
+      </div>
+    </div>`
 }
 function renderPricingRace(p) {
-  const data = p.competitor?.pricing_race_30d || []
-  if (!data.length) return
-  const labels = data.map(d => d.date?.slice(5) || '')
+  const series = p.competitor?.pricing_race_30d || []
+  if (!series.length) return
+  const colors = ['#06b6d4', '#f97316', '#ec4899', '#10b981', '#a78bfa']
   makeChart('chart-pricing-race', {
     type: 'line',
-    data: { labels,
-      datasets: [
-        { label: 'You',      data: data.map(d => d.you),      borderColor: '#06b6d4', backgroundColor: 'transparent', tension: 0.35, pointRadius: 0, borderWidth: 2 },
-        { label: 'Stripe',   data: data.map(d => d.stripe),   borderColor: '#f97316', backgroundColor: 'transparent', tension: 0.35, pointRadius: 0, borderWidth: 1.5 },
-        { label: 'Adyen',    data: data.map(d => d.adyen),    borderColor: '#ec4899', backgroundColor: 'transparent', tension: 0.35, pointRadius: 0, borderWidth: 1.5 },
-        { label: 'Checkout', data: data.map(d => d.checkout), borderColor: '#10b981', backgroundColor: 'transparent', tension: 0.35, pointRadius: 0, borderWidth: 1.5 },
-      ] },
+    data: { labels: series[0]?.points?.map(pt => pt.date?.slice(5) || '') || [],
+      datasets: series.map((s, i) => ({
+        label: s.competitor, data: s.points.map(pt => pt.price),
+        borderColor: colors[i % colors.length], backgroundColor: colors[i % colors.length] + '22',
+        borderWidth: 2, tension: 0.35, pointRadius: 0, fill: false,
+      })) },
     options: { responsive: true, maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
       plugins: { legend: { labels: { color: '#a1a8bd', boxWidth: 8, font: { size: 10 } } } },
-      scales: {
-        x: { ticks: { color: '#5a607a', font: { size: 9 }, maxTicksLimit: 8 }, grid: { color: '#1a1e2a' } },
-        y: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } },
-      } },
+      scales: { x: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } },
+                y: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } } } },
   })
 }
 function renderCompetitorEvents(p) {
   const wrap = $('#competitor-events'); if (!wrap) return
-  const ev = p.competitor?.events || []
-  if (!ev.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">Awaiting live signal…</div>'; return }
-  wrap.innerHTML = ev.map(e => eventCardHtml(e, 'competitor')).join('')
+  const events = p.competitor?.events || []
+  if (!events.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">No events.</div>'; return }
+  wrap.innerHTML = events.map(e => eventCardHtml(e, 'competitor')).join('')
 }
 function renderFeatureMatrix(p) {
   const wrap = $('#feature-matrix'); if (!wrap) return
-  const fm = p.competitor?.feature_matrix || { competitors: [], features: [] }
-  if (!fm.competitors?.length || !fm.features?.length) {
-    wrap.innerHTML = '<div class="text-xs text-gray-500">Awaiting live signal…</div>'
-    return
-  }
+  const m = p.competitor?.feature_matrix || { competitors: [], features: [] }
+  if (!m.competitors.length || !m.features.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">No data.</div>'; return }
   wrap.innerHTML = `
     <table class="w-full text-xs">
-      <thead>
-        <tr class="border-b border-ink-700">
-          <th class="text-left p-2 text-gray-400 font-medium">Feature</th>
-          ${fm.competitors.map((c, i) => `<th class="p-2 mono text-[10px] uppercase ${i === 0 ? 'text-policy' : 'text-gray-400'}">${escapeHTML(c)}</th>`).join('')}
-        </tr>
-      </thead>
+      <thead><tr class="text-[10px] mono uppercase text-gray-500">
+        <th class="text-left p-2">Feature</th>
+        ${m.competitors.map(c => `<th class="p-2">${escapeHTML(c)}</th>`).join('')}
+      </tr></thead>
       <tbody>
-        ${fm.features.map(f => `
-          <tr class="border-b border-ink-800 hover:bg-ink-800/40">
+        ${m.features.map(f => `
+          <tr class="border-t border-ink-700">
             <td class="p-2 text-gray-300">${escapeHTML(f.name)}</td>
-            ${(f.values || []).map(v => `<td class="p-2 text-center">${v ? '<i class="fa-solid fa-check text-emerald-400"></i>' : '<i class="fa-solid fa-minus text-gray-600"></i>'}</td>`).join('')}
+            ${(f.values || []).map(v => `<td class="p-2 text-center"><i class="fa-solid ${v ? 'fa-check text-action' : 'fa-xmark text-gray-600'}"></i></td>`).join('')}
           </tr>`).join('')}
       </tbody>
     </table>`
 }
 function eventCardHtml(e, pillar) {
-  const c = pillar === 'policy' ? 'policy' : pillar === 'competitor' ? 'competitor' : 'sentiment'
-  return `
-    <a href="${escapeHTML(e.source_url || '#')}" target="_blank" rel="noopener"
-       class="card step-card p-3 block hover:border-${c}/40">
-      <div class="flex items-center justify-between gap-2 mb-2">
-        <span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-${c}/15 text-${c} border border-${c}/40">${escapeHTML(e.pillar || pillar)}</span>
-        <span class="text-[9px] mono text-gray-500">sev ${e.severity ?? '--'}</span>
-      </div>
-      <div class="text-sm font-medium leading-snug mb-1">${escapeHTML(e.title || '')}</div>
-      <div class="text-[11px] text-gray-400 leading-relaxed line-clamp-3">${escapeHTML(e.summary || '')}</div>
-      <div class="text-[10px] mono text-gray-500 mt-2">${escapeHTML(e.source_name || '')}</div>
-    </a>`
+  const c = pillar || e.pillar || 'policy'
+  return `<a href="${escapeHTML(e.source_url || '#')}" target="_blank" rel="noopener"
+     class="card step-card p-3 block hover:border-${c}/40">
+    <div class="flex items-center justify-between gap-2 mb-1">
+      <span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-${c}/15 text-${c} border border-${c}/40">${escapeHTML(c)}</span>
+      <span class="text-[9px] mono text-gray-500">sev ${e.severity ?? '--'}</span>
+    </div>
+    <div class="text-sm font-medium leading-snug">${escapeHTML(e.title || '')}</div>
+    <div class="text-[11px] text-gray-400 mt-1 line-clamp-2">${escapeHTML(e.summary || '')}</div>
+  </a>`
 }
 
-/* ════════════════════════ SENTIMENT STORM ════════════════════════ */
 function renderSentiment(p) {
-  renderBubbleChart(p)
-  renderDivergingChart(p)
-  renderWordCloud(p)
-  renderQuotes(p)
-  renderSentimentEvents(p)
+  safe('renderBubbleChart',     () => renderBubbleChart(p))
+  safe('renderDivergingChart',  () => renderDivergingChart(p))
+  safe('renderWordCloud',       () => renderWordCloud(p))
+  safe('renderQuotes',          () => renderQuotes(p))
+  safe('renderSentimentEvents', () => renderSentimentEvents(p))
 }
 function renderBubbleChart(p) {
-  const wrap = $('#bubble-chart'); if (!wrap) return
-  const topics = p.sentiment?.topic_cluster || []
-  if (!topics.length) { wrap.innerHTML = '<div class="text-xs text-gray-500 h-full flex items-center justify-center">Awaiting live signal…</div>'; return }
-  const maxM = Math.max(...topics.map(t => t.mentions || 1), 1)
-  // Pack into a grid-ish layout with golden-ratio scattering
-  const W = 600, H = 420
-  const cx = W / 2, cy = H / 2
-  const phi = Math.PI * (3 - Math.sqrt(5))
-  const bubbles = topics.map((t, i) => {
-    const r = Math.max(18, ((t.mentions || 1) / maxM) * 60)
-    const ang = i * phi
-    const dist = Math.sqrt(i / topics.length) * Math.min(W, H) * 0.42
-    const x = cx + Math.cos(ang) * dist
-    const y = cy + Math.sin(ang) * dist
-    const sent = Number(t.sentiment || 0)
-    const color = sent > 0.2 ? '#10b981' : sent < -0.2 ? '#ec4899' : '#a1a8bd'
-    return `<g class="bubble" style="cursor:default">
-        <circle cx="${x}" cy="${y}" r="${r}" fill="${color}" fill-opacity="0.22" stroke="${color}" stroke-opacity="0.65" stroke-width="1.2" />
-        <text x="${x}" y="${y - 2}" text-anchor="middle" fill="#e7eaf3" font-size="${Math.max(9, r / 5)}" font-family="Inter" font-weight="500">${escapeHTML(t.topic.slice(0, 18))}</text>
-        <text x="${x}" y="${y + 12}" text-anchor="middle" fill="${color}" font-size="9" font-family="JetBrains Mono">${t.mentions} · ${sent.toFixed(2)}</text>
-      </g>`
-  }).join('')
-  wrap.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="w-full h-full">${bubbles}</svg>`
+  const data = p.sentiment?.topic_cluster || []
+  if (!data.length) return
+  makeChart('chart-bubbles', {
+    type: 'bubble',
+    data: { datasets: [{
+      data: data.map(d => ({ x: d.x, y: d.y, r: Math.max(6, Math.min(30, (d.size || 10))), label: d.label })),
+      backgroundColor: data.map(d => d.sentiment > 0 ? 'rgba(16,185,129,0.45)' : d.sentiment < 0 ? 'rgba(236,72,153,0.45)' : 'rgba(161,168,189,0.35)'),
+      borderColor: '#262b3a', borderWidth: 1,
+    }] },
+    options: { responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false },
+                 tooltip: { callbacks: { label: c => c.raw.label + ' (' + c.raw.r + ')' } } },
+      scales: { x: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } },
+                y: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } } } },
+  })
 }
 function renderDivergingChart(p) {
   const data = p.sentiment?.delta_vs_competitors || []
   if (!data.length) return
   makeChart('chart-diverging', {
     type: 'bar',
-    data: { labels: data.map(d => d.name),
+    data: { labels: data.map(d => d.label),
       datasets: [{
-        data: data.map(d => d.value),
-        backgroundColor: data.map(d => (d.value || 0) >= 0 ? '#10b981' : '#ec4899'),
+        data: data.map(d => d.delta),
+        backgroundColor: data.map(d => d.delta >= 0 ? '#10b981' : '#ec4899'),
         borderRadius: 4,
       }] },
     options: { responsive: true, maintainAspectRatio: false, indexAxis: 'y',
       plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } },
-        y: { ticks: { color: '#a1a8bd', font: { size: 10 } }, grid: { display: false } },
-      } },
+      scales: { x: { ticks: { color: '#5a607a', font: { size: 9 } }, grid: { color: '#1a1e2a' } },
+                y: { ticks: { color: '#a1a8bd', font: { size: 9 } }, grid: { display: false } } } },
   })
 }
 function renderWordCloud(p) {
   const wrap = $('#word-cloud'); if (!wrap) return
   const words = p.sentiment?.word_cloud || []
-  if (!words.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">Awaiting live signal…</div>'; return }
-  const maxV = Math.max(...words.map(w => w.value || 1), 1)
+  if (!words.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">No words yet.</div>'; return }
   wrap.innerHTML = words.map(w => {
-    const size = 11 + (w.value / maxV) * 22
-    const hue = Math.round((w.value / maxV) * 60 + 170) // cyan→magenta
-    return `<span style="font-size:${size.toFixed(1)}px; color:hsl(${hue},70%,65%)" class="font-medium">${escapeHTML(w.text)}</span>`
-  }).join(' ')
+    const size = Math.max(11, Math.min(28, (w.weight || 10)))
+    const color = w.sentiment > 0 ? '#10b981' : w.sentiment < 0 ? '#ec4899' : '#a1a8bd'
+    return `<span class="inline-block mx-1.5 my-1 align-middle" style="font-size:${size}px;color:${color}">${escapeHTML(w.text)}</span>`
+  }).join('')
 }
 function renderQuotes(p) {
-  const wrap = $('#quote-card'); if (!wrap) return
   const quotes = p.sentiment?.quotes || []
-  const counter = $('#quote-counter')
-  if (!quotes.length) {
-    wrap.innerHTML = '<div class="text-xs text-gray-500">Awaiting verbatim quotes…</div>'
-    if (counter) counter.textContent = '0 / 0'
-    return
-  }
-  if (STATE.quoteIdx >= quotes.length) STATE.quoteIdx = 0
-  const q = quotes[STATE.quoteIdx]
-  if (counter) counter.textContent = `${STATE.quoteIdx + 1} / ${quotes.length}`
+  const wrap = $('#quote-display'); if (!wrap) return
+  if (!quotes.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">No quotes.</div>'; return }
+  const q = quotes[STATE.quoteIdx % quotes.length]
   wrap.innerHTML = `
-    <div class="card step-card p-4">
-      <div class="text-amber-400 mb-2 text-sm">${escapeHTML(q.stars || '★★★☆☆')}</div>
-      <blockquote class="text-sm text-gray-200 leading-relaxed">"${escapeHTML(q.text)}"</blockquote>
-      <div class="text-[10px] mono text-gray-500 mt-3 uppercase">— ${escapeHTML(q.src || 'source')}</div>
-    </div>`
+    <div class="text-sm italic leading-relaxed">"${escapeHTML(q.text)}"</div>
+    <div class="text-[11px] mono text-gray-500 mt-2">— ${escapeHTML(q.source || 'anon')} · ${escapeHTML(q.date || '')}</div>`
+  const counter = $('#quote-counter'); if (counter) counter.textContent = `${(STATE.quoteIdx % quotes.length) + 1} / ${quotes.length}`
 }
 function renderSentimentEvents(p) {
-  const wrap = $('#sentiment-events-feed'); if (!wrap) return
-  const ev = p.sentiment?.events || []
-  if (!ev.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">Awaiting live signal…</div>'; return }
-  wrap.innerHTML = ev.map(e => eventCardHtml(e, 'sentiment')).join('')
+  const wrap = $('#sentiment-events'); if (!wrap) return
+  const events = p.sentiment?.events || []
+  if (!events.length) { wrap.innerHTML = '<div class="text-xs text-gray-500">No events.</div>'; return }
+  wrap.innerHTML = events.map(e => eventCardHtml(e, 'sentiment')).join('')
 }
 
-/* ════════════════════════ ARCHETYPE ════════════════════════ */
 function renderArchetype(p) {
   const a = p.archetype || {}
-  const ind = $('#archetype-industry'); if (ind) ind.textContent = a.industry || '--'
-  const setList = (sel, arr) => { const el = $(sel); if (el) el.textContent = (arr || []).join(', ') || '--' }
-  setList('#archetype-higher',  a.higher)
-  setList('#archetype-lower',   a.lower)
-  setList('#archetype-neutral', a.neutral)
-  if (!a.axes?.length) return
+  const indEl = $('#archetype-industry'); if (indEl) indEl.textContent = a.industry || '--'
+  const hi = $('#archetype-higher'); if (hi) hi.textContent = (a.higher || []).join(', ') || '—'
+  const lo = $('#archetype-lower');  if (lo) lo.textContent = (a.lower  || []).join(', ') || '—'
+  const ne = $('#archetype-neutral'); if (ne) ne.textContent = (a.neutral || []).join(', ') || '—'
+  const axes = a.axes || []
+  if (!axes.length) return
   makeChart('chart-radar', {
     type: 'radar',
-    data: { labels: a.axes,
+    data: { labels: axes,
       datasets: [
         { label: 'You',      data: a.you || [],      backgroundColor: 'rgba(6,182,212,0.20)', borderColor: '#06b6d4', borderWidth: 2, pointBackgroundColor: '#06b6d4' },
-        { label: 'Baseline', data: a.baseline || [], backgroundColor: 'rgba(161,168,189,0.12)', borderColor: '#a1a8bd', borderWidth: 1.5, borderDash: [4, 4], pointBackgroundColor: '#a1a8bd' },
+        { label: 'Baseline', data: a.baseline || [], backgroundColor: 'rgba(161,168,189,0.10)', borderColor: '#a1a8bd', borderWidth: 1.5, borderDash: [4,4], pointBackgroundColor: '#a1a8bd' },
       ] },
     options: { responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { labels: { color: '#a1a8bd', boxWidth: 10, font: { size: 11 } } } },
-      scales: {
-        r: {
-          angleLines: { color: '#262b3a' }, grid: { color: '#1a1e2a' },
-          pointLabels: { color: '#a1a8bd', font: { size: 11 } },
-          ticks: { color: '#5a607a', backdropColor: 'transparent', font: { size: 9 } },
-          suggestedMin: 0, suggestedMax: 100,
-        },
-      } },
+      plugins: { legend: { labels: { color: '#a1a8bd', boxWidth: 8, font: { size: 10 } } } },
+      scales: { r: {
+        angleLines: { color: '#262b3a' }, grid: { color: '#1a1e2a' },
+        pointLabels: { color: '#a1a8bd', font: { size: 10 } },
+        ticks: { color: '#5a607a', backdropColor: 'transparent', font: { size: 9 } },
+        suggestedMin: 0, suggestedMax: 100,
+      } } },
   })
 }
 
-/* ════════════════════════ SEARCH INDEX ════════════════════════ */
 async function refreshSearchIndex() {
-  try {
-    const d = await SCOUTT.fetch('/api/search-index')
-    GLOBAL_INDEX = d?.index || []
-  } catch (_) { GLOBAL_INDEX = [] }
+  try { const d = await SCOUTT.fetch('/api/search-index', { timeoutMs: 8000 }); GLOBAL_INDEX = d?.index || [] }
+  catch (_) { GLOBAL_INDEX = [] }
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════
-   SCENARIO SIMULATOR — strict LIVE-only
-   ═══════════════════════════════════════════════════════════════════════ */
 window.runScenario = async function () {
   const input = $('#scenario-input')
   const scenario = (input?.value || '').trim()
   if (!scenario) { showToast('Type a hypothetical to simulate.', 'error'); return }
-
-  const btn = $('#scenario-run')
-  const err = $('#scenario-error')
-  const result = $('#scenario-result')
+  const btn = $('#scenario-run'), err = $('#scenario-error'), result = $('#scenario-result')
   if (btn) {
     btn.disabled = true
     btn.dataset.origHtml = btn.dataset.origHtml || btn.innerHTML
@@ -1064,50 +866,34 @@ window.runScenario = async function () {
   }
   if (err) err.classList.add('hidden')
   if (result) result.classList.add('hidden')
-
-  if (!SCOUTT.hasKey) {
-    showToast('Add your Anakin API key first — Scenario Simulator requires live data.', 'error')
-    resetScenarioBtn(btn); return
-  }
-  let cachedLive = loadCachedLivePayload()
-  if (!cachedLive || !isLiveSource(cachedLive.source)) {
-    showToast('Generating your live briefing first — Scenario Simulator requires it.')
-    cachedLive = await runLivePipeline()
-    if (!cachedLive || !isLiveSource(cachedLive.source)) {
-      showToast('Could not generate a live briefing — please retry.', 'error')
-      resetScenarioBtn(btn); return
-    }
-  }
+  const cachedLive = loadCachedLivePayload()
+  const payloadForScenario = (cachedLive && isLiveSource(cachedLive.source)) ? cachedLive : (STATE.payload || makeSkeletonPayload())
   try {
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), 30_000)
     const res = await fetch('/api/scenario', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...SCOUTT.headers() },
-      body: JSON.stringify({
-        scenario,
-        cached_payload: cachedLive,
-        raw: loadCachedRaw(),
-        tenant: loadCachedTenant(),
-      }),
+      body: JSON.stringify({ scenario, cached_payload: payloadForScenario, raw: loadCachedRaw(), tenant: loadCachedTenant() }),
       signal: ctrl.signal,
     })
     clearTimeout(timer)
     if (res.status === 409) {
-      showToast('Live data not synced server-side — re-running pipeline.')
+      if (!SCOUTT.hasKey) {
+        showToast('Scenario unavailable — backend requires live data. Add API key to enable.', 'error')
+        resetScenarioBtn(btn); return
+      }
+      showToast('Live data not synced — re-running pipeline.')
       const fresh = await runLivePipeline()
       if (fresh) return window.runScenario()
       resetScenarioBtn(btn); return
     }
     if (!res.ok) throw new Error('scenario ' + res.status)
     const data = await res.json()
-    if (!data.is_live) {
-      showToast('Scenario returned non-live response — please refresh your briefing.', 'error')
-    }
     if (result) result.classList.remove('hidden')
     const set = (id, v) => { const el = $(id); if (el) el.textContent = v }
-    set('#s-before',  data.threat_level_before)
-    set('#s-after',   data.threat_level_after)
+    set('#s-before',  data.threat_level_before ?? '--')
+    set('#s-after',   data.threat_level_after  ?? '--')
     set('#s-threats', '+' + (data.delta_threats || 0))
     set('#s-actions', '+' + (data.delta_actions || 0))
     const n = $('#s-narrative')
@@ -1115,7 +901,7 @@ window.runScenario = async function () {
       const badge = data.mode === 'groq-live'
         ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-400/30">Groq · Live</span>'
         : (data.mode === 'offline-fallback' || data.mode === 'offline-no-groq')
-        ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-amber-500/15 text-amber-400 border border-amber-400/30">Offline analyser · Live data</span>'
+        ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-amber-500/15 text-amber-400 border border-amber-400/30">Offline · Demo data</span>'
         : ''
       n.innerHTML = escapeHTML(data.narrative || '') + badge
     }
@@ -1124,17 +910,16 @@ window.runScenario = async function () {
       ev.innerHTML = (data.impacted_events || []).map(e => {
         const colors = { policy: 'policy', competitor: 'competitor', sentiment: 'sentiment' }
         const c = colors[e.pillar] || 'gray-500'
-        return `
-          <a href="${escapeHTML(e.source_url || '#')}" target="_blank" rel="noopener"
-             class="card step-card p-3 block hover:border-${c}/40">
-            <div class="flex items-center justify-between gap-2 mb-1">
-              <span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-${c}/15 text-${c} border border-${c}/40">${escapeHTML(e.pillar)}</span>
-              <i class="fa-solid fa-arrow-trend-up text-${c} text-xs"></i>
-            </div>
-            <div class="text-sm font-medium leading-snug">${escapeHTML(e.title)}</div>
-            <div class="text-[10px] mono text-gray-500 mt-1">sev ${e.severity}</div>
-          </a>`
-      }).join('') || '<div class="text-xs text-gray-500 col-span-2">No events impacted by this scenario.</div>'
+        return `<a href="${escapeHTML(e.source_url || '#')}" target="_blank" rel="noopener"
+           class="card step-card p-3 block hover:border-${c}/40">
+          <div class="flex items-center justify-between gap-2 mb-1">
+            <span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-${c}/15 text-${c} border border-${c}/40">${escapeHTML(e.pillar)}</span>
+            <i class="fa-solid fa-arrow-trend-up text-${c} text-xs"></i>
+          </div>
+          <div class="text-sm font-medium leading-snug">${escapeHTML(e.title)}</div>
+          <div class="text-[10px] mono text-gray-500 mt-1">sev ${e.severity}</div>
+        </a>`
+      }).join('') || '<div class="text-xs text-gray-500 col-span-2">No events impacted.</div>'
     }
   } catch (e) {
     if (err) { err.textContent = 'Scenario failed: ' + e.message; err.classList.remove('hidden') }
@@ -1147,9 +932,6 @@ function resetScenarioBtn(btn) {
   btn.innerHTML = btn.dataset.origHtml || '<i class="fa-solid fa-play"></i> Run scenario'
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   SAVE-AND-GO  (API key)
-   ═══════════════════════════════════════════════════════════════════════ */
 window.saveApiKeyAndGo = async function saveApiKeyAndGo(rawKey) {
   const k = String(rawKey || '').trim()
   if (!k) { showToast('Paste your Anakin API key first.', 'error'); return }
@@ -1163,31 +945,18 @@ window.saveApiKeyAndGo = async function saveApiKeyAndGo(rawKey) {
   closeApiKeyModal()
   updateApiKeyButtonUI()
   const live = await runLivePipeline()
-  if (live) {
-    await renderAll(live)
-    showToast('✓ Dashboard fully swapped to your live data.')
-  }
+  if (live) { await safeAsync('renderAll(after-save)', () => renderAll(live)); showToast('✓ Dashboard swapped to your live data.') }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   API-KEY MODAL  (open / close / clear)
-   ═══════════════════════════════════════════════════════════════════════ */
 function openApiKeyModal() {
   const m = $('#apikey-modal'); if (!m) return
   m.classList.remove('hidden')
   const i = $('#apikey-input'); if (i) { i.value = SCOUTT.apiKey || ''; setTimeout(() => i.focus(), 50) }
   const status = $('#apikey-status')
-  if (status && SCOUTT.hasKey) {
-    status.classList.remove('hidden')
-    status.innerHTML = '<span class="text-emerald-400">✓ Live key currently active.</span>'
-  } else if (status) {
-    status.classList.add('hidden')
-  }
+  if (status && SCOUTT.hasKey) { status.classList.remove('hidden'); status.innerHTML = '<span class="text-emerald-400">✓ Live key currently active.</span>' }
+  else if (status) status.classList.add('hidden')
 }
-function closeApiKeyModal() {
-  const m = $('#apikey-modal'); if (!m) return
-  m.classList.add('hidden')
-}
+function closeApiKeyModal() { const m = $('#apikey-modal'); if (m) m.classList.add('hidden') }
 function updateApiKeyButtonUI() {
   const lbl = $('#apikey-label'); const ic = $('#apikey-icon')
   if (SCOUTT.hasKey) {
@@ -1199,13 +968,9 @@ function updateApiKeyButtonUI() {
   }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   READ-FULL-BRIEF MODAL
-   ═══════════════════════════════════════════════════════════════════════ */
 function openBriefModal() {
   const m = $('#brief-modal'); if (!m) return
-  const p = STATE.payload || {}
-  const b = p.briefing || {}
+  const p = STATE.payload || {}, b = p.briefing || {}
   const title = $('#brief-modal-title'); if (title) title.textContent = b.headline || 'Today\'s Battle Brief'
   const body = $('#brief-modal-body')
   if (body) {
@@ -1228,99 +993,57 @@ function openBriefModal() {
 }
 function closeBriefModal() { const m = $('#brief-modal'); if (m) m.classList.add('hidden') }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   TRANSPARENCY DRAWER
-   ═══════════════════════════════════════════════════════════════════════ */
 async function openTransparency() {
-  const dr = $('#transparency-drawer'); const bd = $('#transparency-backdrop')
+  const dr = $('#transparency-drawer'), bd = $('#transparency-backdrop')
   if (!dr) return
   dr.classList.add('open')
   if (bd) bd.classList.remove('hidden')
   const body = $('#transparency-body')
   if (body) body.innerHTML = '<div class="text-xs text-gray-500">Loading transparency report…</div>'
   try {
-    const t = await SCOUTT.fetch('/api/transparency')
+    const t = await SCOUTT.fetch('/api/transparency', { timeoutMs: 8000 })
     if (body) {
       body.innerHTML = `
-        <section>
-          <div class="text-xs mono uppercase text-policy">Daily briefing</div>
-          <div class="text-[11px] text-gray-400 mt-1">${escapeHTML(t.daily_briefing?.endpoint || '')}</div>
-          <pre class="code mt-2 max-h-48 overflow-y-auto">${escapeHTML(t.daily_briefing?.user_prompt || '')}</pre>
-        </section>
-        <section>
-          <div class="text-xs mono uppercase text-policy">Groq reshape</div>
-          <div class="text-[11px] text-gray-400 mt-1">${escapeHTML(t.groq_reshape?.endpoint || '')}</div>
-          <div class="text-[11px] text-gray-500 mt-1">model: <span class="mono text-policy">${escapeHTML(t.groq_reshape?.model || '')}</span></div>
-          <div class="text-[11px] text-gray-400 mt-1">${escapeHTML(t.groq_reshape?.strategy || '')}</div>
-        </section>
-        <section>
-          <div class="text-xs mono uppercase text-policy">Competitor scraper</div>
-          <div class="text-[11px] text-gray-400 mt-1">${escapeHTML(t.competitor_scraper?.endpoint || '')}</div>
-          <pre class="code mt-2 max-h-36 overflow-y-auto">${escapeHTML(t.competitor_scraper?.prompt || '')}</pre>
-        </section>
-        <section>
-          <div class="text-xs mono uppercase text-policy">Scenario simulator</div>
-          <div class="text-[11px] text-gray-400 mt-1">${escapeHTML(t.scenario_simulator?.endpoint || '')}</div>
-          <div class="text-[11px] text-gray-500 mt-1">model: <span class="mono text-policy">${escapeHTML(t.scenario_simulator?.model || '')}</span></div>
-          <div class="text-[11px] text-amber-400 mt-1">${escapeHTML(t.scenario_simulator?.strict_mode || '')}</div>
-        </section>`
+        <div class="space-y-3 text-sm">
+          <div><div class="text-[10px] mono uppercase text-gray-500">Source</div><div>${escapeHTML(t?.source || 'unknown')}</div></div>
+          <div><div class="text-[10px] mono uppercase text-gray-500">Generated</div><div class="mono text-xs">${escapeHTML(t?.generated_at || '')}</div></div>
+          <div><div class="text-[10px] mono uppercase text-gray-500">Pipeline</div><pre class="text-[11px] mono bg-ink-900 border border-ink-700 rounded p-2 overflow-auto">${escapeHTML(JSON.stringify(t || {}, null, 2))}</pre></div>
+        </div>`
     }
   } catch (e) {
-    if (body) body.innerHTML = `<div class="text-xs text-red-400">Failed: ${escapeHTML(e.message)}</div>`
+    if (body) body.innerHTML = `<div class="text-xs text-red-400">Could not load transparency: ${escapeHTML(e.message)}</div>`
   }
 }
 function closeTransparency() {
-  const dr = $('#transparency-drawer'); const bd = $('#transparency-backdrop')
+  const dr = $('#transparency-drawer'), bd = $('#transparency-backdrop')
   if (dr) dr.classList.remove('open')
   if (bd) bd.classList.add('hidden')
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   ⌘K COMMAND PALETTE
-   ═══════════════════════════════════════════════════════════════════════ */
 function openCmdK() {
   const c = $('#cmdk'); if (!c) return
   c.classList.remove('hidden')
-  const i = $('#cmdk-input'); if (i) { i.value = ''; setTimeout(() => i.focus(), 50) }
-  const sug = $('#cmdk-suggestions'); if (sug) sug.classList.remove('hidden')
-  const res = $('#cmdk-results'); if (res) res.classList.add('hidden')
-  const out = $('#cmdk-output'); if (out) out.classList.add('hidden')
+  setTimeout(() => $('#cmdk-input')?.focus(), 30)
 }
 function closeCmdK() { const c = $('#cmdk'); if (c) c.classList.add('hidden') }
 function runCmdKSearch(q) {
-  const term = String(q || '').toLowerCase().trim()
-  const sug = $('#cmdk-suggestions')
-  const res = $('#cmdk-results')
-  if (!term) {
-    if (sug) sug.classList.remove('hidden')
-    if (res) res.classList.add('hidden')
-    return
-  }
-  if (sug) sug.classList.add('hidden')
-  if (res) res.classList.remove('hidden')
-  const hits = GLOBAL_INDEX.filter(x =>
-    (x.title || '').toLowerCase().includes(term) ||
-    (x.subtitle || '').toLowerCase().includes(term) ||
-    (x.section || '').toLowerCase().includes(term)
-  ).slice(0, 18)
-  if (!res) return
+  const list = $('#cmdk-results'); if (!list) return
+  const query = String(q || '').toLowerCase().trim()
+  if (!query) { list.classList.add('hidden'); return }
+  const hits = GLOBAL_INDEX.filter(it => (it.text || '').toLowerCase().includes(query)).slice(0, 12)
   if (!hits.length) {
-    res.innerHTML = `<div class="px-4 py-6 text-xs text-gray-500">No matches in current briefing.</div>`
+    list.classList.remove('hidden')
+    list.innerHTML = '<div class="px-4 py-3 text-xs text-gray-500">No matches.</div>'
     return
   }
-  res.innerHTML = hits.map(h => `
-    <a href="${escapeHTML(h.url || '#')}" target="_blank" rel="noopener"
-       class="block px-4 py-3 border-b border-ink-800 hover:bg-ink-800/60">
-      <div class="text-[10px] mono uppercase text-gray-500">${escapeHTML(h.section || '')}</div>
-      <div class="text-sm font-medium">${escapeHTML(h.title || '')}</div>
-      <div class="text-[11px] text-gray-400 line-clamp-1">${escapeHTML(h.subtitle || '')}</div>
+  list.classList.remove('hidden')
+  list.innerHTML = hits.map(h => `
+    <a href="${escapeHTML(h.url || '#')}" target="_blank" rel="noopener" class="block px-4 py-2.5 border-b border-ink-700 hover:bg-ink-800">
+      <div class="text-[10px] mono uppercase text-gray-500">${escapeHTML(h.kind || '')}</div>
+      <div class="text-sm">${escapeHTML(h.text || '')}</div>
     </a>`).join('')
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════
-   TAB SWITCHING  (the key fix for image-1 — Policy Radar / Archetype etc not opening)
-   ═══════════════════════════════════════════════════════════════════════ */
 function activateTab(name) {
   $$('.tab-btn').forEach(b => {
     const active = b.dataset.tab === name
@@ -1330,36 +1053,30 @@ function activateTab(name) {
   $$('.tab-pane').forEach(p => {
     p.classList.toggle('hidden', p.dataset.pane !== name)
   })
-  // Re-trigger render of charts now-visible (Chart.js needs to lay out into newly-shown canvas)
   if (STATE.payload) {
-    try {
-      if (name === 'policy')      renderPolicy(STATE.payload)
-      if (name === 'competitor')  renderCompetitor(STATE.payload)
-      if (name === 'sentiment')   renderSentiment(STATE.payload)
-      if (name === 'archetype')   renderArchetype(STATE.payload)
-    } catch (e) { console.warn('tab re-render failed', name, e) }
+    if (name === 'policy')     safe('renderPolicy(tab)',     () => renderPolicy(STATE.payload))
+    if (name === 'competitor') safe('renderCompetitor(tab)', () => renderCompetitor(STATE.payload))
+    if (name === 'sentiment')  safe('renderSentiment(tab)',  () => renderSentiment(STATE.payload))
+    if (name === 'archetype')  safe('renderArchetype(tab)',  () => renderArchetype(STATE.payload))
   }
 }
 function wireTabs() {
   $$('.tab-btn').forEach(b => {
-    b.addEventListener('click', () => activateTab(b.dataset.tab))
+    b.addEventListener('click', () => safe('activateTab', () => activateTab(b.dataset.tab)))
   })
+  LOG('wireTabs done, tabs=', $$('.tab-btn').length)
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   TIME-MACHINE SLIDER
-   ═══════════════════════════════════════════════════════════════════════ */
 function wireTimeMachine() {
-  const slider = $('#time-machine'); const label = $('#time-machine-label')
-  const reset = $('#time-machine-reset')
+  const slider = $('#time-machine'), label = $('#time-machine-label'), reset = $('#time-machine-reset')
   if (slider) {
     const update = debounce(async () => {
       const day = +slider.value || 0
       if (label) label.textContent = day === 0 ? 'Today — live' : `${day} day${day === 1 ? '' : 's'} ago`
       try {
-        const data = await SCOUTT.fetch(`/api/dashboard?day=${day}`)
+        const data = await SCOUTT.fetch(`/api/dashboard?day=${day}`, { timeoutMs: 12000 })
         STATE.payload = data; STATE.day = day
-        renderAll(data)
+        await safeAsync('renderAll(time-machine)', () => renderAll(data))
       } catch (e) { showToast('Time-machine fetch failed', 'error') }
     }, 250)
     slider.addEventListener('input', () => {
@@ -1368,124 +1085,82 @@ function wireTimeMachine() {
     })
     slider.addEventListener('change', update)
   }
-  if (reset) reset.addEventListener('click', () => {
-    if (slider) { slider.value = '0'; slider.dispatchEvent(new Event('change')) }
-  })
+  if (reset) reset.addEventListener('click', () => { if (slider) { slider.value = '0'; slider.dispatchEvent(new Event('change')) } })
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   THEME TOGGLE (light <-> dark)
-   ═══════════════════════════════════════════════════════════════════════ */
 function applyTheme(theme) {
-  const html = document.documentElement
-  if (theme === 'light') {
-    html.classList.remove('dark'); html.classList.add('light')
-    document.body.style.background = '#f4f5f8'
-    document.body.style.color = '#0a0c14'
-  } else {
-    html.classList.add('dark'); html.classList.remove('light')
-    document.body.style.background = '#05060a'
-    document.body.style.color = '#e7eaf3'
+  document.documentElement.classList.toggle('paper', theme === 'paper')
+  try { localStorage.setItem(THEME_LS_KEY, theme) } catch (_) {}
+  const btn = $('#theme-toggle'); if (btn) {
+    const ic = btn.querySelector('i')
+    if (ic) ic.className = theme === 'paper' ? 'fa-solid fa-sun text-xs' : 'fa-solid fa-moon text-xs'
   }
 }
 function wireThemeToggle() {
-  const btn = $('#theme-toggle'); if (!btn) return
-  let saved = 'dark'
-  try { saved = localStorage.getItem(THEME_LS_KEY) || 'dark' } catch (_) {}
-  applyTheme(saved)
-  btn.addEventListener('click', () => {
-    const cur = document.documentElement.classList.contains('light') ? 'light' : 'dark'
-    const next = cur === 'light' ? 'dark' : 'light'
-    applyTheme(next)
-    try { localStorage.setItem(THEME_LS_KEY, next) } catch (_) {}
+  let theme = 'dark'; try { theme = localStorage.getItem(THEME_LS_KEY) || 'dark' } catch (_) {}
+  applyTheme(theme)
+  $('#theme-toggle')?.addEventListener('click', () => {
+    let t = 'dark'; try { t = localStorage.getItem(THEME_LS_KEY) || 'dark' } catch (_) {}
+    applyTheme(t === 'dark' ? 'paper' : 'dark')
   })
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   AUDIO BRIEF (graceful no-op when /api/audio/* unwired)
-   ═══════════════════════════════════════════════════════════════════════ */
 function wireAudio() {
-  const play = $('#play-audio'); const stop = $('#audio-stop'); const toast = $('#audio-toast')
-  const audio = $('#audio-el')
-  if (play) {
-    play.addEventListener('click', async () => {
-      // Best-effort hit; if endpoint absent, gracefully degrade.
-      try {
-        const res = await fetch('/api/audio/brief', { method: 'POST', headers: SCOUTT.headers() })
-        if (!res.ok) throw new Error('audio endpoint not available')
-        const blob = await res.blob()
-        if (audio) {
-          audio.src = URL.createObjectURL(blob)
-          audio.play()
-          if (toast) toast.classList.remove('hidden')
-        }
-      } catch (_) {
-        showToast('Audio brief is not wired in this environment.', 'error')
+  const btn = $('#play-audio'); const audio = $('#audio-el'); const toast = $('#audio-toast')
+  if (!btn) return
+  btn.addEventListener('click', async () => {
+    if (toast) toast.classList.remove('hidden')
+    try {
+      const r = await SCOUTT.post('/api/audio/brief', {}, { timeoutMs: 30000 })
+      if (r?.url && audio) {
+        audio.src = r.url; audio.classList.remove('hidden')
+        await audio.play().catch(() => {})
+      } else {
+        showToast('Audio brief not available (ElevenLabs key not configured).', 'error')
       }
-    })
-  }
-  if (stop) stop.addEventListener('click', () => {
-    if (audio) { audio.pause(); audio.src = '' }
-    if (toast) toast.classList.add('hidden')
+    } catch (e) {
+      showToast('Audio fetch failed', 'error')
+    } finally {
+      setTimeout(() => toast?.classList.add('hidden'), 3000)
+    }
   })
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   QUOTE ROTATOR
-   ═══════════════════════════════════════════════════════════════════════ */
 function wireQuoteRotator() {
-  const prev = $('#quote-prev'); const next = $('#quote-next')
-  const move = (dir) => {
-    const q = STATE.payload?.sentiment?.quotes || []
-    if (!q.length) return
-    STATE.quoteIdx = ((STATE.quoteIdx + dir) % q.length + q.length) % q.length
-    renderQuotes(STATE.payload)
-  }
-  if (prev) prev.addEventListener('click', () => move(-1))
-  if (next) next.addEventListener('click', () => move(1))
+  $('#quote-prev')?.addEventListener('click', () => { STATE.quoteIdx = Math.max(0, STATE.quoteIdx - 1); safe('renderQuotes', () => renderQuotes(STATE.payload || {})) })
+  $('#quote-next')?.addEventListener('click', () => { STATE.quoteIdx += 1; safe('renderQuotes', () => renderQuotes(STATE.payload || {})) })
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   GLOBAL WIRING (modals, palette, etc.)
-   ═══════════════════════════════════════════════════════════════════════ */
 function wireApiKeyModal() {
   $('#apikey-btn')?.addEventListener('click', openApiKeyModal)
   $('#apikey-close')?.addEventListener('click', closeApiKeyModal)
-  $('#apikey-cancel')?.addEventListener('click', closeApiKeyModal)
-  $('#apikey-modal')?.addEventListener('click', e => {
-    if (e.target?.id === 'apikey-modal') closeApiKeyModal()
-  })
+  $('#apikey-modal')?.addEventListener('click', e => { if (e.target?.id === 'apikey-modal') closeApiKeyModal() })
+  $('#apikey-save')?.addEventListener('click', () => { const i = $('#apikey-input'); window.saveApiKeyAndGo(i?.value || '') })
   $('#apikey-clear')?.addEventListener('click', () => {
     try { localStorage.removeItem(API_KEY_LS_KEY) } catch (_) {}
     SCOUTT.apiKey = ''
     clearCachedLivePayload()
-    STATE.liveLocked = false
-    STATE.payload = null
     updateApiKeyButtonUI()
     closeApiKeyModal()
-    showToast('Stored API key cleared. Reloading…')
-    setTimeout(() => location.reload(), 600)
-  })
-  $('#apikey-save')?.addEventListener('click', () => {
-    const v = $('#apikey-input')?.value
-    window.saveApiKeyAndGo(v)
+    showToast('API key cleared.')
   })
   $('#apikey-input')?.addEventListener('keydown', e => {
-    if (e.key === 'Enter') window.saveApiKeyAndGo(e.target.value)
+    if (e.key === 'Enter') { e.preventDefault(); window.saveApiKeyAndGo(e.target.value || '') }
   })
 }
+
 function wireBriefModal() {
   $('#read-full-brief')?.addEventListener('click', openBriefModal)
   $('#brief-modal-close')?.addEventListener('click', closeBriefModal)
-  $('#brief-modal')?.addEventListener('click', e => {
-    if (e.target?.id === 'brief-modal') closeBriefModal()
-  })
+  $('#brief-modal')?.addEventListener('click', e => { if (e.target?.id === 'brief-modal') closeBriefModal() })
 }
+
 function wireTransparency() {
   $('#transparency-trigger')?.addEventListener('click', openTransparency)
-  $('#transparency-close')?.addEventListener('click', closeTransparency)
   $('#transparency-backdrop')?.addEventListener('click', closeTransparency)
+  $('#transparency-close')?.addEventListener('click', closeTransparency)
 }
+
 function wireCmdK() {
   $('#cmdk-trigger')?.addEventListener('click', openCmdK)
   $('#cmdk-input')?.addEventListener('input', e => runCmdKSearch(e.target.value))
@@ -1495,44 +1170,60 @@ function wireCmdK() {
   }))
   document.addEventListener('keydown', e => {
     if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); openCmdK() }
-    if (e.key === 'Escape') {
-      closeCmdK(); closeApiKeyModal(); closeBriefModal(); closeTransparency()
-    }
+    if (e.key === 'Escape') { closeCmdK(); closeApiKeyModal(); closeBriefModal(); closeTransparency() }
   })
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   BOOT
-   ═══════════════════════════════════════════════════════════════════════ */
-async function boot() {
-  applyTimeGreeting()
-  updateApiKeyButtonUI()
-
-  // Wire everything BEFORE first paint so even the skeleton screen is interactive.
-  wireTabs()
-  wireTimeMachine()
-  wireThemeToggle()
-  wireAudio()
-  wireQuoteRotator()
-  wireApiKeyModal()
-  wireBriefModal()
-  wireTransparency()
-  wireCmdK()
-
-  // Scenario simulator wiring
+function wireScenario() {
   $('#scenario-run')?.addEventListener('click', () => window.runScenario())
   $('#scenario-input')?.addEventListener('keydown', e => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') window.runScenario()
   })
+}
 
-  // First paint
+async function boot() {
+  LOG('boot start, hasKey=', SCOUTT.hasKey)
+  safe('applyTimeGreeting',  () => applyTimeGreeting())
+  safe('updateApiKeyButtonUI', () => updateApiKeyButtonUI())
+  safe('wireTabs',           () => wireTabs())
+  safe('wireTimeMachine',    () => wireTimeMachine())
+  safe('wireThemeToggle',    () => wireThemeToggle())
+  safe('wireAudio',          () => wireAudio())
+  safe('wireQuoteRotator',   () => wireQuoteRotator())
+  safe('wireApiKeyModal',    () => wireApiKeyModal())
+  safe('wireBriefModal',     () => wireBriefModal())
+  safe('wireTransparency',   () => wireTransparency())
+  safe('wireCmdK',           () => wireCmdK())
+  safe('wireScenario',       () => wireScenario())
+  LOG('wiring complete')
+
+  let payload = null
   try {
-    const payload = await fetchPayload(0)
-    await renderAll(payload)
-  } catch (e) {
-    console.error('boot first-paint failed:', e)
-    showToast('Failed to load dashboard data.', 'error')
+    payload = await Promise.race([
+      fetchPayload(0),
+      new Promise(resolve => setTimeout(() => resolve(null), 14000)),
+    ])
+  } catch (e) { ERR('fetchPayload threw', e) }
+
+  if (!payload) {
+    WARN('fetchPayload timed out / failed — rendering skeleton')
+    payload = makeSkeletonPayload()
+    showToast('Backend slow — rendering skeleton. Will refresh when available.', 'error')
+  }
+  STATE.payload = payload
+  await safeAsync('renderAll(first-paint)', () => renderAll(payload))
+
+  if (payload?.source === 'skeleton' || payload?.source === 'demo-warming') {
+    setTimeout(async () => {
+      try {
+        const fresh = await SCOUTT.fetch('/api/dashboard?day=0', { timeoutMs: 15000 })
+        if (fresh && fresh.briefing) {
+          STATE.payload = fresh
+          await safeAsync('renderAll(refresh)', () => renderAll(fresh))
+        }
+      } catch (_) {}
+    }, 6000)
   }
 }
 
-document.addEventListener('DOMContentLoaded', boot)
+document.addEventListener('DOMContentLoaded', () => safeAsync('boot', boot))

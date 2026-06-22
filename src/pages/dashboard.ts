@@ -60,7 +60,7 @@ export const dashboardPage = (isPublicThreatIndex = false) =>
   </div>
 </nav>
 
-<main class="max-w-[1500px] mx-auto px-6 py-6">
+<main id="dashboard-main" class="max-w-[1500px] mx-auto px-6 py-6">
   ${commandCenterTab()}
   ${policyTab()}
   ${competitorTab()}
