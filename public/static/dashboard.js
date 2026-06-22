@@ -1,22 +1,27 @@
 /* =====================================================================
-   SCOUTT — dashboard.js  (v3 — Groq edition)
+   SCOUTT — dashboard.js  (v4 — Anakin-direct edition)
    Drives every tile from /api/dashboard?day=N. When an Anakin key is
    set, the browser orchestrates the async pipeline so we NEVER hit the
    Vercel 60s cap:
      1. POST /api/anakin/start          → {job_id}
      2. GET  /api/anakin/poll/:jobId    → {status, raw?}   (loop here)
      3. POST /api/groq/reshape          → final DashboardPayload
-        (Groq `meta-llama/llama-4-scout-17b-16e-instruct`)
+        (Groq `meta-llama/llama-4-scout-17b-16e-instruct`,
+         with NEW Anakin-direct fallback so live data shows even if
+         Groq is missing or fails — fixes bug #2)
 
-   🔥 BUGFIX history:
-     • Old NVIDIA `meta/llama-3.2-3b-instruct` could not emit the full
-       DashboardPayload JSON within 1024 tokens → server returned demo
-       template tagged 'anakin-live' → "green success toast but demo
-       data on dashboard". Switched to Groq llama-4-scout (17B-active
-       MoE) with JSON-mode + 8192 tokens, split into 2 parallel calls.
-     • Frontend now ALWAYS calls renderAll() with the freshly returned
-       live payload (previously a render could be skipped if the auto-
-       kicked pipeline finished before the initial render).
+   🔥 BUGFIX history (v4):
+     • Bug #2: After the user set the API key, Anakin credits were
+       spent but the dashboard kept showing demo data because Groq
+       reshape returned empty {} when GROQ_API_KEY wasn't set on the
+       Vercel deployment. Server now ALWAYS hydrates from the Anakin
+       raw output (live-pipeline.buildPayloadFromAnakinRaw). Frontend
+       now treats BOTH 'anakin-live' AND 'anakin-direct' as LIVE — and
+       suppresses every demo-template path while a live scrape is
+       cached for the session.
+     • Bug #3: Scenario simulator no longer falls back to demo events.
+       Server picks live or anakin-direct payload, then runs Groq OR
+       the new tenant-aware offline analyser — both query-specific.
    ===================================================================== */
 
 const $  = (s, p = document) => p.querySelector(s)
@@ -43,8 +48,17 @@ const SCOUTT = {
 }
 SCOUTT.init()
 
-const STATE = { payload: null, day: 0, quoteIdx: 0, charts: {}, liveRunInflight: false }
+const STATE = { payload: null, day: 0, quoteIdx: 0, charts: {}, liveRunInflight: false, liveLocked: false }
 let GLOBAL_INDEX = []
+
+// 🔥 v4 FIX — A payload counts as LIVE if its source is either:
+//   • 'anakin-live'   → Anakin + Groq reshape succeeded
+//   • 'anakin-direct' → Anakin scraped, Groq absent/failed → server-side
+//                       deterministic mapper built payload from raw scrape.
+// Both must override demo data EVERYWHERE in the UI.
+function isLiveSource(src) {
+  return src === 'anakin-live' || src === 'anakin-direct'
+}
 
 /* ═════════════════════════ UTILITIES ═════════════════════════ */
 function escapeHTML(s) {
@@ -131,12 +145,19 @@ async function runLivePipeline() {
     const payload = await SCOUTT.post('/api/groq/reshape', { raw })
     if (!payload || !payload.briefing) throw new Error('Groq reshape returned empty payload')
 
-    // 🔥 GUARD: server marks the payload 'demo-fallback' if Groq failed.
-    // We surface that to the user instead of falsely claiming success.
-    if (payload.source !== 'anakin-live') {
-      showToast('Groq reshape produced no fresh data — showing demo template.', 'error')
+    // 🔥 v4 GUARD: live now means anakin-live OR anakin-direct.
+    // Surface accurate provenance to the user.
+    if (isLiveSource(payload.source)) {
+      STATE.liveLocked = true  // lock out future demo fallback for this session
+      if (payload.source === 'anakin-live') {
+        showToast('✓ Live briefing generated via Anakin → Groq reshape.', 'info')
+      } else {
+        showToast('✓ Live briefing rendered from Anakin scrape (Groq unavailable — using direct mapper).', 'info')
+      }
+    } else if (payload.source === 'demo-warming') {
+      showToast('Anakin scrape still warming — refreshing shortly.', 'info')
     } else {
-      showToast('✓ Live briefing generated via Anakin → Groq reshape.', 'info')
+      showToast('Live pipeline returned no fresh data — showing demo template.', 'error')
     }
 
     STATE.payload = payload
@@ -157,24 +178,29 @@ async function runLivePipeline() {
 
 /* ═════════════════════════ FETCH PAYLOAD ═════════════════════════ */
 async function fetchPayload(day = 0) {
-  // 1) Always hit /api/dashboard first — returns instantly with either
-  //    warm-cache live data, demo data, or 'demo-warming' marker.
+  // 1) Always hit /api/dashboard first.
   const data = await SCOUTT.fetch(`/api/dashboard?day=${day}`)
+
+  // 🔥 v4 FIX — once we've rendered a LIVE payload in this session, never
+  // overwrite it with a demo/demo-warming reply that the server may return
+  // (e.g. after cache TTL but before the next pipeline run completes).
+  if (STATE.liveLocked && !isLiveSource(data.source) && STATE.payload && isLiveSource(STATE.payload.source)) {
+    console.debug('[scoutt] suppressing demo reply because session has live data')
+    return STATE.payload
+  }
+
   STATE.payload = data; STATE.day = day
+  if (isLiveSource(data.source)) STATE.liveLocked = true
 
   // 2) If user has a key but payload is not live yet, kick off pipeline.
-  //    🔥 FIX: ALWAYS re-render after the live payload arrives (regardless
-  //    of whether source is 'anakin-live' or 'demo-fallback') so the UI
-  //    refreshes with whichever data the server returned. Previously the
-  //    render was skipped when the reshape silently returned demo data.
-  if (SCOUTT.hasKey && data.source !== 'anakin-live' && day === 0) {
+  if (SCOUTT.hasKey && !isLiveSource(data.source) && day === 0) {
     runLivePipeline().then(live => {
       if (live) {
         STATE.payload = live
         renderAll(live)
       }
     }).catch(e => console.warn('Auto-pipeline error:', e))
-  } else if (data.source === 'anakin-live') {
+  } else if (isLiveSource(data.source)) {
     showToast(day === 0 ? 'Live briefing loaded from cache.' : `Day-${day} snapshot ready.`)
   }
   return data
@@ -1136,8 +1162,9 @@ function wireEvents() {
         STATE.payload = live
         await renderAll(live)
       }
-      if (live && live.source === 'anakin-live') {
-        showStatus('✓ Live Anakin → Groq llama-4-scout data flowing.', true)
+      if (live && isLiveSource(live.source)) {
+        const tag = live.source === 'anakin-live' ? 'Anakin → Groq llama-4-scout' : 'Anakin direct (Groq unavailable)'
+        showStatus('✓ Live data flowing — ' + tag + '.', true)
       } else {
         showStatus('Live call failed — running on demo. Re-try in 10s.', false)
       }
@@ -1285,8 +1312,9 @@ if (document.readyState === 'loading') {
           STATE.payload = live
           if (typeof renderAll === 'function') await renderAll(live)
         }
-        if (live && live.source === 'anakin-live') {
-          setStatus('✓ Live Anakin → Groq llama-4-scout data flowing.', true)
+        if (live && isLiveSource(live.source)) {
+          const tag = live.source === 'anakin-live' ? 'Anakin → Groq llama-4-scout' : 'Anakin direct mapper (Groq unavailable)'
+          setStatus('✓ Live data flowing — ' + tag + '.', true)
         } else {
           setStatus('Live call did not complete — showing demo. Try again in 10s.', false)
         }
@@ -1334,11 +1362,27 @@ if (document.readyState === 'loading') {
       set('#s-actions', '+' + (data.delta_actions || 0))
 
       // Narrative + provenance badge
+      // 🔥 v4 FIX (bug #3) — show provenance honestly:
+      //  • groq-live          → Groq reshape against live briefing
+      //  • offline-fallback   → Groq absent/failed, used tenant-aware analyser
+      //  • offline-no-groq    → No GROQ_API_KEY, deterministic analyser
+      // Each variant produces a query-specific answer, NOT generic demo data.
       const n = $('#s-narrative')
       if (n) {
-        const badge = data.mode === 'groq-live'
-          ? '<span class="ml-2 inline-block text-[10px] mono uppercase px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">live · ' + escapeHTML(data.model || 'groq') + '</span>'
-          : '<span class="ml-2 inline-block text-[10px] mono uppercase px-1.5 py-0.5 rounded bg-gray-500/15 text-gray-300 border border-gray-500/30">' + escapeHTML(data.mode || 'offline') + '</span>'
+        let badgeCls = 'bg-gray-500/15 text-gray-300 border-gray-500/30'
+        let badgeText = escapeHTML(data.mode || 'offline')
+        if (data.mode === 'groq-live') {
+          badgeCls = 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+          badgeText = 'live · ' + escapeHTML(data.model || 'groq')
+        } else if (data.mode === 'offline-fallback' || data.mode === 'offline-no-groq') {
+          // Still query-specific, against live payload — flag as tenant-aware
+          const isLivePayload = data.source === 'anakin-live' || data.source === 'anakin-direct'
+          if (isLivePayload) {
+            badgeCls = 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+            badgeText = 'live-tenant · offline-analyser'
+          }
+        }
+        const badge = '<span class="ml-2 inline-block text-[10px] mono uppercase px-1.5 py-0.5 rounded border ' + badgeCls + '">' + badgeText + '</span>'
         n.innerHTML = escapeHTML(data.narrative || '') + badge
       }
 

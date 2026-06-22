@@ -2,21 +2,35 @@
 // =====================================================================
 // 🔥 REWRITTEN — fixes onboarding bug #1 from the user's report:
 //
-//   "even after selecting different options & adding specific competitor
-//    links… the api scraping is done only on stripe/adyen/checkout"
+//   "when i add more competitor links in the onboarding process step2,
+//    the logos of previous competitor links disappears"
 //
-// Root cause was that the wizard's choices were saved only to localStorage
-// and the server-side Anakin prompt always read DEMO_TENANT. This page
-// now:
-//   1. Renders a DYNAMIC competitor list — Add / Delete buttons let the
-//      operator enter 1-10 domains (cap chosen to keep prompts compact).
-//   2. Hands the active region button click a visible "selected" state
-//      AND captures it correctly (previously the goStep(2) selector used
-//      an over-escaped CSS class that never matched).
-//   3. On launch: (a) persists choices to localStorage for the dashboard
-//      to read, (b) ALSO POSTs them to /api/onboarding/save so the server
-//      can use them BEFORE the user even sets their Anakin key — and so
-//      they're applied the moment the key is set.
+// Root cause
+// ──────────
+// The previous version set the favicon `background-image` ONLY inside
+// the `input` event handler. When `renderCompList()` rebuilt the DOM
+// (after Add / Remove), all rows were re-created with empty styles —
+// no favicon, no "✓ valid" badge — because `input` never fires on a
+// freshly-rendered <input>. Existing valid domains therefore lost
+// their logos the moment the user added a new row.
+//
+// Fix
+// ─────
+// `applyRowVisualState(row, value)` is now a single source of truth
+// that paints favicon + badge for whatever value the row currently
+// holds, and it is invoked
+//   (a) immediately after every renderCompList() rebuild, AND
+//   (b) from the `input` handler on every keystroke.
+// So the visual state is always derived from `onboardingState.competitors`
+// and never lost across re-renders.
+//
+// Also preserved from previous fix
+// ──────────────────────────────────
+// 1. Server-side tenant overlay: choices are POSTed to /api/onboarding/save
+//    whenever an Anakin key is already set, so the very next /api/anakin/start
+//    uses the user's competitors / industry / region / pillars.
+// 2. Region-button "selected" state captured properly via .region-selected.
+// 3. Dynamic add/remove (1-10 competitor cap) — unchanged.
 // =====================================================================
 
 import { htmlShell } from './shell'
@@ -162,12 +176,13 @@ export const onboardingPage = () =>
     pillars: [],
   }
   const DEFAULTS = ['stripe.com', 'adyen.com', 'checkout.com']
+  const DOMAIN_RE = /^[a-z0-9.-]+\\.[a-z]{2,}$/i
 
   // ── Competitor list (dynamic add/remove) ──────────────────────────
   function compRowTemplate(idx, value, placeholder) {
     return \`
       <div class="comp-row flex items-center gap-3" data-idx="\${idx}">
-        <div class="comp-icon w-9 h-9 rounded-lg bg-ink-700 border border-ink-600 flex items-center justify-center">
+        <div class="comp-icon w-9 h-9 rounded-lg bg-ink-700 border border-ink-600 flex items-center justify-center overflow-hidden">
           <i class="fa-solid fa-globe text-gray-500"></i>
         </div>
         <input type="text" value="\${value || ''}" placeholder="\${placeholder || 'yourcompetitor.com'}"
@@ -179,6 +194,58 @@ export const onboardingPage = () =>
       </div>\`
   }
 
+  // 🔥 FIX (bug #1) — single source of truth for the favicon/badge visual
+  //                  state. Applied AFTER every renderCompList() so that
+  //                  existing valid domains keep their logos when the user
+  //                  clicks "+ Add competitor" or removes a row.
+  function applyRowVisualState(row, value) {
+    if (!row) return
+    const badge = row.querySelector('.comp-badge')
+    const iconEl = row.querySelector('.comp-icon')
+    const iconI = iconEl?.querySelector('i')
+    const v = (value || '').trim()
+
+    // Empty → reset.
+    if (!v) {
+      if (badge) {
+        badge.textContent = ''
+        badge.classList.remove('text-emerald-400', 'text-red-400')
+        badge.classList.add('text-gray-500')
+      }
+      if (iconEl) {
+        iconEl.style.backgroundImage = ''
+        iconEl.style.backgroundColor = ''
+      }
+      if (iconI) iconI.style.display = 'inline'
+      return
+    }
+
+    // Valid domain → paint favicon + ✓ badge.
+    if (DOMAIN_RE.test(v)) {
+      if (badge) {
+        badge.textContent = '✓ valid'
+        badge.classList.remove('text-gray-500', 'text-red-400')
+        badge.classList.add('text-emerald-400')
+      }
+      if (iconEl) {
+        // Cache-bust safe Google s2 favicon. sz=64 covers HiDPI.
+        iconEl.style.backgroundImage = 'url(https://www.google.com/s2/favicons?domain=' + encodeURIComponent(v) + '&sz=64)'
+        iconEl.style.backgroundSize = 'cover'
+        iconEl.style.backgroundPosition = 'center'
+        iconEl.style.backgroundRepeat = 'no-repeat'
+      }
+      if (iconI) iconI.style.display = 'none'
+      return
+    }
+
+    // Invalid syntax → ✗ badge but DON'T wipe favicon (user is still typing).
+    if (badge) {
+      badge.textContent = '✗ invalid'
+      badge.classList.remove('text-emerald-400', 'text-gray-500')
+      badge.classList.add('text-red-400')
+    }
+  }
+
   function renderCompList() {
     const list = document.getElementById('comp-list')
     list.innerHTML = ''
@@ -186,6 +253,11 @@ export const onboardingPage = () =>
       list.insertAdjacentHTML('beforeend', compRowTemplate(i, v, DEFAULTS[i] || 'yourcompetitor.com'))
     })
     bindCompEvents()
+    // 🔥 FIX (bug #1) — repaint EVERY row's favicon + badge from current state
+    //                  so logos survive Add / Remove operations.
+    document.querySelectorAll('#comp-list .comp-row').forEach((row, i) => {
+      applyRowVisualState(row, onboardingState.competitors[i] || '')
+    })
     updateAddBtnState()
   }
 
@@ -194,23 +266,7 @@ export const onboardingPage = () =>
       input.addEventListener('input', (e) => {
         const v = e.target.value.trim()
         onboardingState.competitors[i] = v
-        const row = e.target.closest('.comp-row')
-        const badge = row.querySelector('.comp-badge')
-        const iconEl = row.querySelector('.comp-icon')
-        if (/^[a-z0-9.-]+\\.[a-z]{2,}$/i.test(v)) {
-          badge.textContent = '✓ valid'
-          badge.classList.remove('text-gray-500', 'text-red-400'); badge.classList.add('text-emerald-400')
-          iconEl.style.backgroundImage = 'url(https://www.google.com/s2/favicons?domain=' + v + '&sz=64)'
-          iconEl.style.backgroundSize = 'cover'; iconEl.style.backgroundPosition = 'center'
-          iconEl.querySelector('i').style.display = 'none'
-        } else if (v.length === 0) {
-          badge.textContent = ''
-          iconEl.style.backgroundImage = ''
-          iconEl.querySelector('i').style.display = 'inline'
-        } else {
-          badge.textContent = '✗ invalid'
-          badge.classList.remove('text-emerald-400', 'text-gray-500'); badge.classList.add('text-red-400')
-        }
+        applyRowVisualState(e.target.closest('.comp-row'), v)
       })
     })
 
@@ -246,9 +302,12 @@ export const onboardingPage = () =>
 
   document.getElementById('comp-add').addEventListener('click', () => {
     if (onboardingState.competitors.length >= 10) return
+    // Sync DOM values into state BEFORE re-render so existing rows survive.
+    onboardingState.competitors = Array.from(document.querySelectorAll('.comp-input'))
+      .map(i => i.value.trim())
     onboardingState.competitors.push('')
     renderCompList()
-    // Focus the new input
+    // Focus the new (last) input.
     const inputs = document.querySelectorAll('.comp-input')
     inputs[inputs.length - 1]?.focus()
   })
