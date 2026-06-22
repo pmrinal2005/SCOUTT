@@ -2,26 +2,30 @@
 // =============================================================================
 // SCOUTT — Express serverless handler for Vercel.
 //
-// 🔥 REWRITTEN (Groq edition).
-// Pipeline is still split across THREE short serverless calls so we never
-// hit the Vercel Hobby 60-second cap, but the LLM reshape stage now uses
-// Groq `meta-llama/llama-4-scout-17b-16e-instruct` instead of NVIDIA NIM
-// `meta/llama-3.2-3b-instruct`. This fixes the bug where the dashboard
-// showed a green "success" toast yet kept rendering demo data — the old
-// 3B model could not emit the full DashboardPayload JSON in 1024 tokens.
+// 🔥 REWRITTEN to fix two reported bugs and add three new capabilities:
 //
-//   POST /api/anakin/start       → submit Anakin job        (~2s)
-//   GET  /api/anakin/poll/:jobId → one Anakin poll          (~1-2s)
-//   POST /api/groq/reshape       → two parallel Groq calls  (~8-15s)
+// BUG FIX #1 — "scraping always uses stripe/adyen/checkout no matter what the
+// user picks during onboarding"
+//   ▸ /api/anakin/start now derives the Anakin prompt from the user's own
+//     onboarding tenant (stored per-API-key in src/onboarding-store.ts).
+//   ▸ payloadFor(req) and every legacy endpoint downstream of it use that
+//     tenant when building the demo template, so even the warming/fallback
+//     state reflects the user's industry / region / competitors / pillars.
+//   ▸ New endpoints /api/onboarding/save and /api/onboarding/get bridge the
+//     wizard's localStorage to the server.
 //
-// The browser orchestrates the loop. Once the reshape completes, every
-// legacy endpoint (/api/dashboard, /api/briefing/today, /api/charts/*, …)
-// serves from the warm cache dynamically — so every section of every tab
-// is data-driven.
+// BUG FIX #2 — "scenario simulator always shows demo data, even after API key
+// is set"
+//   ▸ /api/scenario now calls Groq llama-4-scout-17b (groqScenario) with the
+//     user's full cached live briefing + tenant context, so the narrative and
+//     impacted-events list are dynamic per query. The old regex math is kept
+//     only as a graceful offline fallback when GROQ_API_KEY is missing.
 //
-// BACKWARDS-COMPAT: /api/nvidia/reshape still works (it transparently calls
-// the new Groq reshape) so any third-party that hard-coded that path keeps
-// functioning. New clients should use /api/groq/reshape.
+// NEW — Anakin Crawl API integration
+//   ▸ POST /api/competitor/scrape uses /v1/crawl + /v1/crawl/{id} (see
+//     https://anakin.io/docs/api-reference/crawl/submit-crawl-job and
+//     https://anakin.io/docs/api-reference/crawl/get-crawl-result) to scrape
+//     the user's own competitor pricing pages end-to-end.
 // =============================================================================
 import express, { Request, Response, NextFunction } from 'express'
 import path from 'path'
@@ -43,8 +47,13 @@ import {
 import {
   anakinSubmit, anakinPollOnce, buildAndCachePayload, groqReshape,
   getDashboardPayload, invalidateCacheFor, peekCacheFor, peekRawFor,
-  buildBriefingPrompt, groqAsk,
+  buildBriefingPrompt, groqAsk, groqScenario,
+  anakinCrawlAndWait,
 } from '../src/live-pipeline'
+
+import {
+  setTenantFor, getTenantFor, effectiveTenant, clearTenantFor,
+} from '../src/onboarding-store'
 
 const app = express()
 app.use(express.json({ limit: '2mb' }))
@@ -112,7 +121,7 @@ app.get('/threat-index', (_req, res) => { res.setHeader('Content-Type', 'text/ht
 app.get('/onboarding', (_req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.status(200).send(onboardingPage()) })
 
 // =============================================================================
-// HELPERS
+// HELPERS — every request now resolves to the USER's tenant when possible.
 // =============================================================================
 function anakinKey(req: Request): string | null {
   return (req.header('x-anakin-key') as string) || process.env.ANAKIN_API_KEY || null
@@ -121,9 +130,22 @@ function parseDay(req: Request): number {
   const v = Number((req.query?.day as string) ?? '0')
   return Number.isFinite(v) ? Math.max(0, Math.min(7, v)) : 0
 }
+
+/**
+ * Resolve the effective tenant for THIS request.
+ *   1. If the caller has an Anakin key AND has POSTed /api/onboarding/save,
+ *      use that overlay.
+ *   2. Otherwise, fall back to DEMO_TENANT (so anonymous demo visitors still
+ *      see something meaningful).
+ */
+function tenantForRequest(req: Request) {
+  const key = anakinKey(req)
+  return effectiveTenant(key)
+}
+
 async function payloadFor(req: Request) {
   const key = anakinKey(req)
-  const tenant = DEMO_TENANT
+  const tenant = tenantForRequest(req)
   const day = parseDay(req)
   return getDashboardPayload({ anakinKey: key, tenant, day })
 }
@@ -139,28 +161,76 @@ app.get('/api/health', (req, res) => res.status(200).json({
   elevenlabs:       Boolean(process.env.ELEVENLABS_API_KEY),
   cached_live:      Boolean(req.header('x-anakin-key') && peekCacheFor(String(req.header('x-anakin-key')))),
   reshape_model:    'meta-llama/llama-4-scout-17b-16e-instruct (Groq)',
+  user_tenant:      Boolean(getTenantFor(anakinKey(req))),
   timestamp:        new Date().toISOString(),
 }))
 
 // =============================================================================
-// STEP 1 — Anakin submit (≤3s)
+// 🆕 ONBOARDING — persist / read the user's tenant overlay (per Anakin key)
+// =============================================================================
+app.post('/api/onboarding/save', (req, res) => {
+  const key = anakinKey(req)
+  if (!key) return res.status(400).json({ error: 'X-Anakin-Key header required to bind tenant' })
+  try {
+    const body = (req.body || {}) as any
+    const saved = setTenantFor(key, {
+      industry: body.industry,
+      region: body.region,
+      competitor_domains: body.competitor_domains || body.competitors,
+      pillars_enabled: body.pillars_enabled || body.pillars,
+      name: body.name,
+    })
+    // Any cached live dashboard is now stale.
+    invalidateCacheFor(key)
+    res.json({ ok: true, tenant: saved })
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: String(e?.message || e) })
+  }
+})
+
+app.get('/api/onboarding/get', (req, res) => {
+  const key = anakinKey(req)
+  const t = getTenantFor(key)
+  res.json({ ok: true, tenant: t, fallback: t ? null : DEMO_TENANT })
+})
+
+app.post('/api/onboarding/clear', (req, res) => {
+  const key = anakinKey(req)
+  if (key) { clearTenantFor(key); invalidateCacheFor(key) }
+  res.json({ ok: true })
+})
+
+// =============================================================================
+// STEP 1 — Anakin submit (≤3s) — now USER-TENANT-aware
 //   Docs: https://anakin.io/docs/api-reference/agentic-search/submit-search
 // =============================================================================
 app.post('/api/anakin/start', async (req, res) => {
   const key = anakinKey(req)
   if (!key) return res.status(400).json({ error: 'X-Anakin-Key header required' })
   try {
-    const tenant = DEMO_TENANT
+    // Optional inline tenant override on the request body — lets the dashboard
+    // start a fresh briefing the instant the user clicks "Save & go live"
+    // without an extra round-trip.
+    const inline = (req.body || {}) as any
+    if (inline && (inline.industry || inline.competitor_domains || inline.competitors)) {
+      setTenantFor(key, {
+        industry: inline.industry,
+        region: inline.region,
+        competitor_domains: inline.competitor_domains || inline.competitors,
+        pillars_enabled: inline.pillars_enabled || inline.pillars,
+      })
+    }
+    const tenant = tenantForRequest(req)
     const prompt = buildBriefingPrompt(tenant)
     const jobId = await anakinSubmit(key, prompt)
-    res.json({ ok: true, job_id: jobId, message: 'Anakin Agentic Search submitted.' })
+    res.json({ ok: true, job_id: jobId, tenant_used: tenant, message: 'Anakin Agentic Search submitted.' })
   } catch (e: any) {
     res.status(502).json({ ok: false, error: String(e?.message || e) })
   }
 })
 
 // =============================================================================
-// STEP 2 — Anakin single poll (≤2s, no server-side loop)
+// STEP 2 — Anakin single poll
 //   Docs: https://anakin.io/docs/api-reference/agentic-search/get-search-result
 // =============================================================================
 app.get('/api/anakin/poll/:jobId', async (req, res) => {
@@ -177,9 +247,7 @@ app.get('/api/anakin/poll/:jobId', async (req, res) => {
 })
 
 // =============================================================================
-// STEP 3 — Groq reshape (~8-15s, two parallel Groq calls).
-// Browser calls this once /api/anakin/poll returns status='completed'.
-// Replaces the old NVIDIA NIM reshape endpoint.
+// STEP 3 — Groq reshape — USER-TENANT-aware
 // =============================================================================
 async function reshapeHandler(req: Request, res: Response) {
   const key = anakinKey(req)
@@ -188,39 +256,36 @@ async function reshapeHandler(req: Request, res: Response) {
     const body: any = req.body || {}
     const raw = body.raw ?? peekRawFor(key)
     if (!raw) return res.status(409).json({ error: 'No Anakin raw output found. Poll must complete first.' })
-    const payload = await buildAndCachePayload(key, DEMO_TENANT, raw)
+    const tenant = tenantForRequest(req)
+    const payload = await buildAndCachePayload(key, tenant, raw)
     res.json(payload)
   } catch (e: any) {
-    // Fail-safe: keep the UI alive with demo data, but flag the error.
-    const demo = buildDemoPayload(DEMO_TENANT)
+    const tenant = tenantForRequest(req)
+    const demo = buildDemoPayload(tenant)
     ;(demo as any).source = 'demo-fallback'
     ;(demo as any).error = String(e?.message || e)
     res.status(200).json(demo)
   }
 }
 app.post('/api/groq/reshape',   reshapeHandler)
-// Backwards-compat alias.
-app.post('/api/nvidia/reshape', reshapeHandler)
+app.post('/api/nvidia/reshape', reshapeHandler)  // backwards-compat alias
 
 // =============================================================================
-// UNIFIED dashboard endpoint — always returns within ~1s.
-//   1. Serve warm cache if available.
-//   2. Otherwise serve the demo template tagged source='demo-warming'.
-//      Browser then drives /api/anakin/start → poll → /api/groq/reshape.
+// UNIFIED dashboard endpoint
 // =============================================================================
 app.get('/api/dashboard', async (req, res) => {
   try {
     const p = await payloadFor(req)
     res.json(p)
   } catch (e: any) {
-    const demo = buildDemoPayload(DEMO_TENANT)
+    const tenant = tenantForRequest(req)
+    const demo = buildDemoPayload(tenant)
     ;(demo as any).source = 'demo-fallback'
     ;(demo as any).error = String(e?.message || e)
     res.json(demo)
   }
 })
 
-// Manual cache bust (called after key save / clear)
 app.post('/api/dashboard/refresh', (req, res) => {
   const key = anakinKey(req)
   if (key) invalidateCacheFor(key)
@@ -228,11 +293,9 @@ app.post('/api/dashboard/refresh', (req, res) => {
 })
 
 // =============================================================================
-// LEGACY endpoints — all derive from the unified payload.
-// Once the warm cache is populated by /api/groq/reshape, every one of these
-// returns dynamic live data.
+// LEGACY endpoints — all derive from the unified, tenant-aware payload.
 // =============================================================================
-app.get('/api/tenant/demo', (_req, res) => res.json(DEMO_TENANT))
+app.get('/api/tenant/demo', (req, res) => res.json(tenantForRequest(req)))
 
 app.get('/api/briefing/today', async (req, res) => {
   const p = await payloadFor(req)
@@ -250,7 +313,6 @@ app.get('/api/charts/wordcloud',        async (req, res) => res.json((await payl
 app.get('/api/charts/feature-matrix',   async (req, res) => res.json((await payloadFor(req)).competitor.feature_matrix))
 app.get('/api/charts/policy-regions',   async (req, res) => res.json((await payloadFor(req)).policy.regions))
 app.get('/api/charts/globe-dots',       async (req, res) => {
-  // Derived from live policy.regions when available.
   const p = await payloadFor(req)
   const dots = (p.policy?.regions || []).map(r => ({
     lat: r.lat, lng: r.lng, size: r.activity / 100,
@@ -263,6 +325,48 @@ app.get('/api/charts/globe-dots',       async (req, res) => {
 app.get('/api/policy/active',     async (req, res) => res.json((await payloadFor(req)).policy.active_regulations))
 app.get('/api/competitor/events', async (req, res) => res.json((await payloadFor(req)).competitor.events))
 app.get('/api/sentiment/events',  async (req, res) => res.json((await payloadFor(req)).sentiment.events))
+
+// =============================================================================
+// 🆕 COMPETITOR SCRAPE — Anakin /v1/crawl integration
+// Docs:
+//   https://anakin.io/docs/api-reference/crawl/submit-crawl-job
+//   https://anakin.io/docs/api-reference/crawl/get-crawl-result
+// =============================================================================
+app.post('/api/competitor/scrape', async (req, res) => {
+  const key = anakinKey(req)
+  if (!key) return res.status(400).json({ error: 'X-Anakin-Key header required' })
+  const body = (req.body || {}) as any
+  const tenant = tenantForRequest(req)
+  // Default to the FIRST competitor the user picked in onboarding.
+  const target: string | undefined =
+    body.url ||
+    (tenant.competitor_domains?.[0] ? `https://${tenant.competitor_domains[0]}/pricing` : undefined)
+  if (!target) return res.status(400).json({ error: 'No competitor URL configured' })
+  try {
+    const out = await anakinCrawlAndWait(key, target, {
+      maxPages: Math.min(Number(body.maxPages || 3), 5),
+      includePatterns: body.includePatterns || ['/pricing*', '/plans*', '/features*'],
+      useBrowser: Boolean(body.useBrowser),
+      maxWaitMs: 22_000,
+    })
+    res.json({
+      ok: true,
+      jobId: out.jobId,
+      status: out.status,
+      url: target,
+      totalPages: out.totalPages,
+      completedPages: out.completedPages,
+      results: (out.results || []).map(r => ({
+        url: r.url, status: r.status,
+        // truncate to keep response tight
+        markdown: r.markdown ? r.markdown.slice(0, 6000) : undefined,
+        error: r.error,
+      })),
+    })
+  } catch (e: any) {
+    res.status(502).json({ ok: false, error: String(e?.message || e) })
+  }
+})
 
 // =============================================================================
 // SEARCH INDEX (⌘K)
@@ -294,11 +398,11 @@ app.get('/api/search-index', async (req, res) => {
 })
 
 // =============================================================================
-// TRANSPARENCY (judge-bait — now reports the Groq pipeline)
+// TRANSPARENCY
 // =============================================================================
-app.get('/api/transparency', (_req, res) => {
-  const tenant = DEMO_TENANT
-  res.json({
+app.get('/api/transparency', (req, _res) => {
+  const tenant = tenantForRequest(req)
+  _res.json({
     daily_briefing: {
       endpoint: 'POST https://api.anakin.io/v1/agentic-search',
       system_prompt: DAILY_BRIEFING_SYSTEM_PROMPT,
@@ -314,12 +418,12 @@ app.get('/api/transparency', (_req, res) => {
     groq_reshape: {
       endpoint: 'POST https://api.groq.com/openai/v1/chat/completions',
       model:    'meta-llama/llama-4-scout-17b-16e-instruct',
-      docs:     'https://console.groq.com/docs',
-      strategy: 'Two parallel JSON-mode calls: (a) briefing core, (b) policy/competitor/sentiment pillars. Each ≤8192 completion tokens.',
+      strategy: 'Two parallel JSON-mode calls.',
     },
     competitor_scraper: {
       endpoint: 'POST https://api.anakin.io/v1/crawl',
-      prompt: COMPETITOR_SCRAPE_PROMPT('https://stripe.com/pricing'),
+      poll_endpoint: 'GET https://api.anakin.io/v1/crawl/{job_id}',
+      prompt: COMPETITOR_SCRAPE_PROMPT(`https://${tenant.competitor_domains?.[0] || 'example.com'}/pricing`),
     },
     ask_scoutt: {
       endpoint: 'POST https://api.groq.com/openai/v1/chat/completions',
@@ -331,12 +435,13 @@ app.get('/api/transparency', (_req, res) => {
 })
 
 // =============================================================================
-// ASK SCOUTT — now Groq-powered (replaces previous NVIDIA NIM path)
+// ASK SCOUTT
 // =============================================================================
 app.post('/api/ask', async (req, res) => {
   const { question } = (req.body || {}) as { question: string }
   const groqKey = process.env.GROQ_API_KEY
   const p = await payloadFor(req)
+  const tenant = tenantForRequest(req)
   const briefing = p.briefing
 
   const context = (briefing.events || []).map((e, i) =>
@@ -345,7 +450,7 @@ app.post('/api/ask', async (req, res) => {
   const systemPrompt = `You are SCOUTT, a Bloomberg-grade business intelligence assistant.
 Answer using ONLY the EVIDENCE below. Cite sources using bracket numbers [1] [2] that map to
 the evidence list. Tone: terse, decisive, boardroom-ready.
-EVIDENCE (today's briefing for ${DEMO_TENANT.industry} in ${DEMO_TENANT.region}):
+EVIDENCE (today's briefing for ${tenant.industry} in ${tenant.region}):
 ${context}`
 
   const citations = (briefing.events || []).slice(0, 3).map((e, i) => ({
@@ -354,7 +459,7 @@ ${context}`
 
   if (!groqKey) {
     return res.json({
-      answer: synthesizeMockAnswer(question, briefing.threat_level),
+      answer: synthesizeMockAnswer(question, briefing.threat_level, tenant),
       citations,
       model: 'mock (GROQ_API_KEY not configured)',
       credits_used: 0,
@@ -375,19 +480,21 @@ ${context}`
   }
 })
 
-function synthesizeMockAnswer(question: string, threat: number): string {
+function synthesizeMockAnswer(question: string, threat: number, tenant: any): string {
   const q = (question || '').toLowerCase()
-  if (q.includes('eu ai act') || q.includes('regulation'))
-    return `The EU AI Act Article 6 enforcement window opened today. Audit by end of week [1].`
-  if (q.includes('stripe') || q.includes('price'))
-    return `Stripe raised ACH fees from $0.80 to $0.90 — a 12.5% increase [2].`
+  const c0 = tenant?.competitor_domains?.[0] || 'your top competitor'
+  if (q.includes('regulation') || q.includes('compliance'))
+    return `Top-of-feed regulation in your ${tenant?.region || 'region'} just changed — audit by end of week [1].`
+  if (q.includes('price') || c0 && q.includes(c0.split('.')[0]))
+    return `${c0} adjusted pricing within the last 24h — review the diff in Competitor Pulse [2].`
   if (q.includes('churn') || q.includes('sentiment'))
-    return `Sentiment around fraud detection dropped 18 points week over week [4].`
-  return `Threat level ${threat}/100 with 4 high-impact events overnight. Ask me something specific.`
+    return `Sentiment around ${tenant?.industry || 'your category'} dropped this week [4].`
+  return `Threat level ${threat}/100 across ${tenant?.industry || 'your sector'}. Ask me something specific.`
 }
 
 // =============================================================================
-// SCENARIO — derives from cached payload only (0 Anakin/Groq calls)
+// 🆕 SCENARIO — now Groq-driven, falls back to local synth only if GROQ_API_KEY
+// is missing. Uses the user's CACHED LIVE briefing whenever it exists.
 // =============================================================================
 app.post('/api/scenario', async (req, res) => {
   try {
@@ -395,49 +502,86 @@ app.post('/api/scenario', async (req, res) => {
     if (!scenario || !String(scenario).trim()) return res.status(400).json({ error: 'Empty scenario' })
 
     const key = anakinKey(req)
+    const tenant = tenantForRequest(req)
     let p = key ? peekCacheFor(key) : null
     if (!p) p = await payloadFor(req)
-    const b = p.briefing
 
-    const s = String(scenario).toLowerCase()
-    const matchPolicy     = /ai act|gdpr|cfpb|regulation|compliance|fca|sec/i.test(s)
-    const matchCompetitor = /stripe|adyen|checkout|price|fee|launch|ach|bnpl/i.test(s)
-    const matchSentiment  = /sentiment|reddit|review|g2|complaint|churn/i.test(s)
-    const looseDelta = (s.includes('delay') || s.includes('drop') || s.includes('lower')) ? -1 : 1
+    const hasGroq = Boolean(process.env.GROQ_API_KEY)
 
-    const baseThreat = b.threat_level
-    const policyBump     = matchPolicy     ? 14 * looseDelta : 0
-    const competitorBump = matchCompetitor ?  9 * looseDelta : 0
-    const sentimentBump  = matchSentiment  ?  6 * looseDelta : 0
-    const newThreat = Math.max(15, Math.min(100, baseThreat + policyBump + competitorBump + sentimentBump))
+    if (hasGroq) {
+      try {
+        const out = await groqScenario({ scenario, tenant, payload: p })
+        return res.json({
+          scenario,
+          ...out,
+          credits_used: 1,
+          source: p.source,
+          mode: 'groq-live',
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        })
+      } catch (e: any) {
+        // fall through to offline synth
+        console.warn('Groq scenario failed, falling back:', e?.message)
+      }
+    }
 
-    const impacted = (b.events || []).filter(e =>
-      matchPolicy     ? e.pillar === 'policy' :
-      matchCompetitor ? e.pillar === 'competitor' :
-      matchSentiment  ? e.pillar === 'sentiment' : true,
-    ).slice(0, 5).map(e => ({
-      ...e, severity: Math.max(20, Math.min(100, e.severity + (looseDelta < 0 ? -10 : +6))),
-    }))
-
+    // ── Offline synthesis (last-resort) — still derived from the LIVE payload
+    // if cached, otherwise demo. Now also tenant-aware so it doesn't lock on
+    // stripe/adyen/checkout keywords.
+    const offline = synthScenarioOffline(scenario, p, tenant)
     res.json({
       scenario,
-      threat_level_before: baseThreat,
-      threat_level_after: newThreat,
-      delta_threats: Math.abs((matchPolicy ? 4 : 0) + (matchCompetitor ? 3 : 0) + (matchSentiment ? 2 : 0)) || 1,
-      delta_actions: Math.abs((matchPolicy ? 2 : 0) + (matchCompetitor ? 1 : 0)) || 1,
-      impacted_events: impacted,
-      narrative: buildScenarioNarrative(scenario, baseThreat, newThreat, impacted.length),
+      ...offline,
       credits_used: 0,
       source: p.source,
+      mode: hasGroq ? 'offline-fallback' : 'offline-no-groq',
     })
   } catch (e: any) {
     res.status(500).json({ error: String(e?.message || e) })
   }
 })
 
-function buildScenarioNarrative(scenario: string, before: number, after: number, hits: number): string {
-  const dir = after >= before ? 'rises' : 'falls'
-  return `Under the scenario "${String(scenario).slice(0, 80)}", projected threat level ${dir} from ${before} to ${after}. ${hits} existing events are materially affected.`
+function synthScenarioOffline(scenario: string, p: any, tenant: any) {
+  const b = p.briefing
+  const s = String(scenario).toLowerCase()
+  const compKeywords = (tenant?.competitor_domains || [])
+    .map((d: string) => d.split('.')[0].toLowerCase())
+  const matchPolicy     = /(regulat|complianc|policy|act\b|gdpr|cfpb|fca|sec\b)/i.test(s)
+  const matchCompetitor = compKeywords.some((k: string) => k && s.includes(k)) ||
+                          /(price|fee|launch|hire|funding)/i.test(s)
+  const matchSentiment  = /(sentiment|review|reddit|complaint|churn|g2\b)/i.test(s)
+  const dir = /(delay|drop|lower|cancel|fall|decreas)/i.test(s) ? -1 : 1
+
+  const baseThreat = b.threat_level
+  const policyBump     = matchPolicy     ? 14 * dir : 0
+  const competitorBump = matchCompetitor ?  9 * dir : 0
+  const sentimentBump  = matchSentiment  ?  6 * dir : 0
+  // Even when nothing matches, nudge by 3 so the gauge actually moves.
+  const noiseBump      = (matchPolicy || matchCompetitor || matchSentiment) ? 0 : 3 * dir
+  const newThreat = Math.max(15, Math.min(100,
+    baseThreat + policyBump + competitorBump + sentimentBump + noiseBump))
+
+  const pickedPillar = matchPolicy ? 'policy'
+                     : matchCompetitor ? 'competitor'
+                     : matchSentiment ? 'sentiment'
+                     : null
+
+  const impacted = (b.events || [])
+    .filter((e: any) => pickedPillar ? e.pillar === pickedPillar : true)
+    .slice(0, 5)
+    .map((e: any) => ({
+      title: e.title, pillar: e.pillar, source_url: e.source_url,
+      severity: Math.max(20, Math.min(100, e.severity + (dir < 0 ? -10 : +6))),
+    }))
+
+  return {
+    threat_level_before: baseThreat,
+    threat_level_after: newThreat,
+    delta_threats: Math.max(1, (matchPolicy ? 4 : 0) + (matchCompetitor ? 3 : 0) + (matchSentiment ? 2 : 0)),
+    delta_actions: Math.max(1, (matchPolicy ? 2 : 0) + (matchCompetitor ? 1 : 0)),
+    impacted_events: impacted,
+    narrative: `Under "${String(scenario).slice(0, 90)}", projected threat ${newThreat >= baseThreat ? 'rises' : 'falls'} from ${baseThreat} to ${newThreat}. ${impacted.length} ${tenant.industry} events are materially affected.`,
+  }
 }
 
 // =============================================================================

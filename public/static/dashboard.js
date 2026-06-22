@@ -1201,3 +1201,192 @@ if (document.readyState === 'loading') {
 } else {
   boot()
 }
+
+
+;(function patchSCOUTT() {
+  if (typeof window === 'undefined' || !window.SCOUTT) {
+    console.warn('[scoutt-patch] SCOUTT object not found — patch skipped')
+    return
+  }
+
+  // ── 1. SCOUTT.syncOnboarding() ────────────────────────────────────
+  SCOUTT.syncOnboarding = async function () {
+    if (!this.apiKey) return null
+    let saved = null
+    try { saved = JSON.parse(localStorage.getItem('scoutt_onboarding') || 'null') } catch {}
+    if (!saved) return null
+    const payload = {
+      industry: saved.industry || 'B2B SaaS Fintech',
+      region: saved.region || 'US',
+      competitor_domains: saved.competitors || saved.competitor_domains || [],
+      pillars_enabled: saved.pillars || saved.pillars_enabled || [],
+    }
+    if (!payload.competitor_domains.length) return null
+    try {
+      const r = await fetch('/api/onboarding/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Anakin-Key': this.apiKey },
+        body: JSON.stringify(payload),
+      })
+      return await r.json().catch(() => null)
+    } catch (e) {
+      console.warn('[scoutt-patch] syncOnboarding failed:', e)
+      return null
+    }
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────
+  const $ = (sel) => document.querySelector(sel)
+  function escapeHTML(s) {
+    return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]))
+  }
+
+  // ── 2. Override apikey-save (idempotent — only attach once) ───────
+  function rewireApiKeySave() {
+    const btn = document.getElementById('apikey-save')
+    if (!btn || btn.dataset.patched === '1') return
+    btn.dataset.patched = '1'
+
+    // Clone-and-replace removes ALL previous listeners installed by the
+    // original wireEvents(), so our handler is the single source of truth.
+    const fresh = btn.cloneNode(true)
+    btn.parentNode.replaceChild(fresh, btn)
+
+    fresh.addEventListener('click', async () => {
+      const input = document.getElementById('apikey-input')
+      const k = (input?.value || '').trim()
+      const status = document.getElementById('apikey-status')
+      const setStatus = (msg, ok) => {
+        if (!status) return
+        status.classList.remove('hidden', 'text-emerald-400', 'text-red-400')
+        status.classList.add(ok ? 'text-emerald-400' : 'text-red-400')
+        status.textContent = msg
+      }
+      if (!k) { setStatus('Paste a key first.', false); return }
+
+      try { localStorage.setItem('scoutt_anakin_key', k) } catch {}
+      SCOUTT.apiKey = k
+      if (typeof refreshKeyUI === 'function') refreshKeyUI()
+      setStatus('Key saved. Syncing your tenant…', true)
+
+      // 🔥 CRITICAL — push onboarding answers BEFORE invalidating the
+      //              dashboard cache and running the live pipeline, so
+      //              /api/anakin/start picks up the user's competitors.
+      try { await SCOUTT.syncOnboarding() } catch {}
+
+      try { await SCOUTT.post('/api/dashboard/refresh', {}) } catch {}
+
+      setStatus('Tenant synced. Launching live pipeline…', true)
+      try {
+        const live = await runLivePipeline()
+        if (live) {
+          STATE.payload = live
+          if (typeof renderAll === 'function') await renderAll(live)
+        }
+        if (live && live.source === 'anakin-live') {
+          setStatus('✓ Live Anakin → Groq llama-4-scout data flowing.', true)
+        } else {
+          setStatus('Live call did not complete — showing demo. Try again in 10s.', false)
+        }
+        setTimeout(() => {
+          if (typeof closeKeyModal === 'function') closeKeyModal()
+        }, 1500)
+      } catch (e) {
+        setStatus('Failed: ' + (e.message || e), false)
+      }
+    })
+  }
+
+  // ── 3. Override runScenario() to render Groq-live response ───────
+  window.runScenario = async function () {
+    const input = $('#scenario-input')
+    const scenario = (input?.value || '').trim()
+    if (!scenario) return
+    const btn = $('#scenario-run')
+    const err = $('#scenario-error')
+    const result = $('#scenario-result')
+    if (!btn) return
+    btn.disabled = true
+    btn.innerHTML = '<div class="w-4 h-4 border-2 border-ink-950 border-t-transparent rounded-full animate-spin inline-block"></div> Re-running…'
+    if (err) err.classList.add('hidden')
+    if (result) result.classList.add('hidden')
+
+    try {
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), 25_000)
+      const res = await fetch('/api/scenario', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...SCOUTT.headers() },
+        body: JSON.stringify({ scenario }),
+        signal: ctrl.signal,
+      })
+      clearTimeout(timer)
+      if (!res.ok) throw new Error('scenario ' + res.status)
+      const data = await res.json()
+
+      if (result) result.classList.remove('hidden')
+      const set = (id, v) => { const el = $(id); if (el) el.textContent = v }
+      set('#s-before',  data.threat_level_before)
+      set('#s-after',   data.threat_level_after)
+      set('#s-threats', '+' + (data.delta_threats || 0))
+      set('#s-actions', '+' + (data.delta_actions || 0))
+
+      // Narrative + provenance badge
+      const n = $('#s-narrative')
+      if (n) {
+        const badge = data.mode === 'groq-live'
+          ? '<span class="ml-2 inline-block text-[10px] mono uppercase px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">live · ' + escapeHTML(data.model || 'groq') + '</span>'
+          : '<span class="ml-2 inline-block text-[10px] mono uppercase px-1.5 py-0.5 rounded bg-gray-500/15 text-gray-300 border border-gray-500/30">' + escapeHTML(data.mode || 'offline') + '</span>'
+        n.innerHTML = escapeHTML(data.narrative || '') + badge
+      }
+
+      // Impacted events — with optional source URL chip
+      const ev = $('#s-events')
+      if (ev) {
+        ev.innerHTML = (data.impacted_events || []).map((e) => {
+          const link = e.source_url
+            ? `<a href="${escapeHTML(e.source_url)}" target="_blank" rel="noopener" class="text-[10px] text-policy hover:underline mono ml-2">↗ source</a>`
+            : ''
+          return `
+          <div class="card p-3 flex items-start gap-3">
+            <i class="fa-solid fa-arrow-trend-up text-action mt-1"></i>
+            <div class="flex-1">
+              <div class="text-sm font-medium">${escapeHTML(e.title)} ${link}</div>
+              <div class="text-xs text-gray-500">sev ${e.severity} • ${escapeHTML(e.pillar)}</div>
+            </div>
+          </div>`
+        }).join('')
+      }
+    } catch (e) {
+      if (err) {
+        err.classList.remove('hidden')
+        err.innerHTML = `<i class="fa-solid fa-triangle-exclamation mr-2"></i>Scenario failed: ${escapeHTML(e.message || String(e))}.`
+      } else if (typeof showToast === 'function') {
+        showToast('Scenario failed: ' + e.message, 'error')
+      }
+    } finally {
+      btn.disabled = false
+      btn.innerHTML = '<i class="fa-solid fa-play"></i> Run scenario'
+    }
+  }
+
+  // Apply the api-key-save rewiring after DOM is ready.
+  function wirePatch() {
+    rewireApiKeySave()
+    // If the user already had an API key in localStorage from a previous
+    // session, sync the (possibly newly-completed) onboarding to the server
+    // right now — so the dashboard's first fetch reflects their choices
+    // even before they re-open the API-key modal.
+    if (SCOUTT.apiKey) {
+      SCOUTT.syncOnboarding().catch(() => {})
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', wirePatch)
+  } else {
+    wirePatch()
+  }
+})()
+
