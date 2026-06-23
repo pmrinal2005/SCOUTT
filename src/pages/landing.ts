@@ -1,7 +1,7 @@
 // src/pages/landing.ts
 import { htmlShell } from './shell'
 
-const YOUTUBE_DEMO_URL = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' // <-- replace with your real demo URL
+const YOUTUBE_DEMO_URL = 'https://youtu.be/ptQ04qE8fq4' // <-- replace with your real demo URL
 
 export const landingPage = () =>
   htmlShell({
