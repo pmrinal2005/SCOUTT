@@ -1,4 +1,19 @@
-/* SCOUTT dashboard.js v8 — bulletproof boot, isolated renderers, demo+live both work */
+/* SCOUTT dashboard.js v9 — qwen/qwen3-32b pipeline, demo-warming skeleton, scenario accepts raw
+ *
+ * 🔥 v9 PATCH — fixes the two reported bugs:
+ *   1. Dashboard hardcoded after Anakin key set:
+ *      • When the server returns source=='demo-warming' (key set, pipeline not done)
+ *        we now render a clearly-marked LOADING SKELETON instead of the demo cards.
+ *        The user can no longer mistake demo content for live output.
+ *      • Live pipeline always runs after a key is saved; renderAll() only paints
+ *        live (anakin-live / anakin-direct) payloads, never demo or demo-warming.
+ *   2. Scenario simulator returns hardcoded data:
+ *      • runScenario() always forwards the cached Anakin raw + live payload + tenant.
+ *      • If the server responds 409 (no live yet), we trigger the pipeline once,
+ *        wait for raw, then re-run automatically (no infinite recursion).
+ *      • Server now routes through qwen/qwen3-32b — frontend just renders
+ *        whatever JSON it gets back.
+ */
 'use strict'
 
 const $  = (s, p = document) => p.querySelector(s)
@@ -244,8 +259,12 @@ async function fetchPayload(day = 0) {
     setLiveLoading(true, 'Generating your live briefing…',
       'Preparing Anakin Agentic Search…')
     runLivePipeline().then(live => { if (live) safeAsync('renderAll(live-bg)', () => renderAll(live)) })
+    // 🔥 v9 — return a skeleton payload IMMEDIATELY so renderAll paints the
+    // loading state. Do NOT fetch /api/dashboard which would return the
+    // literal demo template (source=demo-warming) and look identical to demo.
+    return makeSkeletonPayload()
   }
-  // Always also fetch /api/dashboard so we have SOMETHING to render immediately
+  // No key set OR a cached live exists — fall through to /api/dashboard.
   try {
     const data = await SCOUTT.fetch(`/api/dashboard?day=${day}`, { timeoutMs: 12000 })
     if (STATE.liveLocked && !isLiveSource(data.source) && STATE.payload && isLiveSource(STATE.payload.source)) {
@@ -262,7 +281,7 @@ async function fetchPayload(day = 0) {
 
 function makeSkeletonPayload() {
   return {
-    source: 'skeleton',
+    source: SCOUTT.hasKey ? 'demo-warming' : 'skeleton',
     generated_at_iso: new Date().toISOString(),
     briefing: {
       briefing_date: new Date().toISOString().slice(0, 10),
@@ -291,6 +310,15 @@ function makeSkeletonPayload() {
 async function renderAll(payload) {
   if (!payload) return
   LOG('renderAll start, source=', payload.source)
+  // 🔥 v9 — never render demo / demo-warming when the user has a key. Show
+  // a skeleton instead so the user can SEE the pipeline is in progress.
+  if (SCOUTT.hasKey && (payload.source === 'demo' || payload.source === 'demo-warming' || payload.source === 'skeleton')) {
+    safe('paintLoadingSkeleton', () => paintLoadingSkeleton(payload))
+    return
+  }
+  safe('clearLoadingSkeleton', () => clearLoadingSkeleton())
+  // Stamp the source badge in the banner so the operator can SEE if it's live.
+  safe('stampSourceBadge', () => stampSourceBadge(payload))
   safe('applyTimeGreeting',     () => applyTimeGreeting())
   safe('renderBanner',          () => renderBanner(payload))
   safe('renderTimeline',        () => renderTimeline(payload))
@@ -314,6 +342,66 @@ function renderBanner(p) {
   const th = $('#banner-threat'); if (th) th.textContent = b.threat_level ?? 0
   const sm = $('#banner-summary'); if (sm) sm.textContent = b.headline || b.summary || ''
 }
+
+// 🔥 v9 — visual indicator of payload source (live vs demo vs warming).
+function stampSourceBadge(p) {
+  const host = $('#banner-summary') || $('#dashboard-main')
+  if (!host) return
+  let badge = document.getElementById('scoutt-source-badge')
+  if (!badge) {
+    badge = document.createElement('span')
+    badge.id = 'scoutt-source-badge'
+    badge.className = 'ml-2 px-1.5 py-0.5 rounded mono text-[9px] uppercase border'
+    host.appendChild(badge)
+  }
+  const src = p?.source || 'unknown'
+  const model = p?.reshape_model || ''
+  if (src === 'anakin-live') {
+    badge.className = 'ml-2 px-1.5 py-0.5 rounded mono text-[9px] uppercase border bg-emerald-500/15 text-emerald-400 border-emerald-400/30'
+    badge.textContent = 'LIVE · qwen3-32b'
+  } else if (src === 'anakin-direct') {
+    badge.className = 'ml-2 px-1.5 py-0.5 rounded mono text-[9px] uppercase border bg-cyan-500/15 text-cyan-400 border-cyan-400/30'
+    badge.textContent = 'LIVE · direct mapper'
+  } else if (src === 'demo-warming') {
+    badge.className = 'ml-2 px-1.5 py-0.5 rounded mono text-[9px] uppercase border bg-amber-500/15 text-amber-400 border-amber-400/30'
+    badge.textContent = 'WARMING…'
+  } else {
+    badge.className = 'ml-2 px-1.5 py-0.5 rounded mono text-[9px] uppercase border bg-gray-500/15 text-gray-400 border-gray-400/30'
+    badge.textContent = 'DEMO'
+  }
+  if (model) badge.title = 'reshape_model: ' + model
+}
+
+// 🔥 v9 — wipe every dynamic region and paint a loading skeleton so the user
+// can't confuse demo content with real data.
+function paintLoadingSkeleton(p) {
+  const banner = $('#banner-summary')
+  if (banner) banner.textContent = SCOUTT.hasKey
+    ? 'Generating your live briefing via Anakin Agentic Search → qwen/qwen3-32b reshape…'
+    : 'Add your Anakin API key to generate a live briefing.'
+  const skel = (n = 1) => Array.from({ length: n }).map(() =>
+    '<div class="animate-pulse rounded bg-ink-800 h-3 my-2 w-3/4"></div>').join('')
+  const replace = (sel, html) => { const el = $(sel); if (el) el.innerHTML = html }
+  replace('#timeline-list', '<li class="text-xs text-gray-500">' + skel(7) + '</li>')
+  replace('#actions-list',  skel(3))
+  replace('#pulse-wheel-container',
+    '<div class="w-full h-full flex items-center justify-center text-gray-500 text-sm">' +
+    '<div class="animate-pulse">Awaiting live signals…</div></div>')
+  ;['#policy-events-list', '#competitor-events-list', '#sentiment-events-list',
+    '#active-regs-list', '#feature-matrix', '#word-cloud', '#quotes-list',
+    '#topic-bubbles'].forEach(sel => replace(sel, skel(3)))
+  // Stamp the badge
+  stampSourceBadge(p)
+  // KPIs → 0 placeholders
+  ;['threats', 'opps', 'actions-kpi', 'response'].forEach(k => {
+    const card = $('[data-kpi="' + k + '"]'); if (!card) return
+    const valEl = card.querySelector('.kpi-value'); if (valEl) valEl.textContent = '…'
+    const dEl = card.querySelector('.kpi-delta');   if (dEl)   dEl.textContent   = ''
+  })
+  const bt = $('#banner-threat'); if (bt) bt.textContent = '…'
+  const be = $('#banner-events'); if (be) be.textContent = '…'
+}
+function clearLoadingSkeleton() { /* renderAll downstream functions repaint everything */ }
 
 function renderTimeline(p) {
   const list = $('#timeline-list'); if (!list) return
@@ -854,7 +942,7 @@ async function refreshSearchIndex() {
   catch (_) { GLOBAL_INDEX = [] }
 }
 
-window.runScenario = async function () {
+window.runScenario = async function (recursionGuard) {
   const input = $('#scenario-input')
   const scenario = (input?.value || '').trim()
   if (!scenario) { showToast('Type a hypothetical to simulate.', 'error'); return }
@@ -862,33 +950,48 @@ window.runScenario = async function () {
   if (btn) {
     btn.disabled = true
     btn.dataset.origHtml = btn.dataset.origHtml || btn.innerHTML
-    btn.innerHTML = '<div class="w-4 h-4 border-2 border-ink-950 border-t-transparent rounded-full animate-spin inline-block"></div> Re-running…'
+    btn.innerHTML = '<div class="w-4 h-4 border-2 border-ink-950 border-t-transparent rounded-full animate-spin inline-block"></div> Asking qwen3-32b…'
   }
   if (err) err.classList.add('hidden')
   if (result) result.classList.add('hidden')
   const cachedLive = loadCachedLivePayload()
-  const payloadForScenario = (cachedLive && isLiveSource(cachedLive.source)) ? cachedLive : (STATE.payload || makeSkeletonPayload())
+  const payloadForScenario = (cachedLive && isLiveSource(cachedLive.source)) ? cachedLive : null
+  const cachedRaw = loadCachedRaw()
   try {
     const ctrl = new AbortController()
-    const timer = setTimeout(() => ctrl.abort(), 30_000)
+    const timer = setTimeout(() => ctrl.abort(), 45_000)
     const res = await fetch('/api/scenario', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...SCOUTT.headers() },
-      body: JSON.stringify({ scenario, cached_payload: payloadForScenario, raw: loadCachedRaw(), tenant: loadCachedTenant() }),
+      // 🔥 v9 — always forward cached_payload (if live), raw (always if we have it), tenant.
+      body: JSON.stringify({
+        scenario,
+        cached_payload: payloadForScenario,
+        raw: cachedRaw,
+        tenant: loadCachedTenant(),
+      }),
       signal: ctrl.signal,
     })
     clearTimeout(timer)
     if (res.status === 409) {
+      // Server says it has neither live payload NOR raw. Trigger pipeline ONCE.
       if (!SCOUTT.hasKey) {
-        showToast('Scenario unavailable — backend requires live data. Add API key to enable.', 'error')
+        showToast('Scenario unavailable — add your Anakin API key first.', 'error')
         resetScenarioBtn(btn); return
       }
-      showToast('Live data not synced — re-running pipeline.')
+      if (recursionGuard) {
+        if (err) { err.textContent = 'Live pipeline did not produce raw output — retry shortly.'; err.classList.remove('hidden') }
+        resetScenarioBtn(btn); return
+      }
+      showToast('Live data not synced yet — running Anakin pipeline first.')
       const fresh = await runLivePipeline()
-      if (fresh) return window.runScenario()
+      if (fresh) return window.runScenario(true)
       resetScenarioBtn(btn); return
     }
-    if (!res.ok) throw new Error('scenario ' + res.status)
+    if (!res.ok) {
+      let bodyTxt = ''; try { bodyTxt = await res.text() } catch (_) {}
+      throw new Error('scenario ' + res.status + (bodyTxt ? ' · ' + bodyTxt.slice(0, 200) : ''))
+    }
     const data = await res.json()
     if (result) result.classList.remove('hidden')
     const set = (id, v) => { const el = $(id); if (el) el.textContent = v }
@@ -899,9 +1002,9 @@ window.runScenario = async function () {
     const n = $('#s-narrative')
     if (n) {
       const badge = data.mode === 'groq-live'
-        ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-400/30">Groq · Live</span>'
-        : (data.mode === 'offline-fallback' || data.mode === 'offline-no-groq')
-        ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-amber-500/15 text-amber-400 border border-amber-400/30">Offline · Demo data</span>'
+        ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-400/30" title="' + escapeHTML(data.model || '') + '">qwen3-32b · LIVE</span>'
+        : (data.mode === 'offline-fallback' || data.mode === 'offline-no-groq' || data.mode === 'offline-from-raw')
+        ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-amber-500/15 text-amber-400 border border-amber-400/30" title="' + escapeHTML(data.model || '') + '">Offline · live events</span>'
         : ''
       n.innerHTML = escapeHTML(data.narrative || '') + badge
     }

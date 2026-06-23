@@ -2,33 +2,26 @@
 // =============================================================================
 // SCOUTT — Express serverless entry (Vercel @vercel/node)
 //
-// 🔥 v6 PATCH — bulletproof against the two reported bugs:
-//   • Bug #1: Dashboard stuck on demo data
-//   • Bug #2: Scenario Simulator returns demo data regardless of input
+// 🔥 v7 PATCH — fixes the two reported bugs:
+//   • Bug #1: Dashboard stuck on demo data after Anakin key is set.
+//   • Bug #2: Scenario Simulator returns hardcoded demo content regardless
+//             of the query.
 //
-// Both bugs share ONE root cause on the server side: Vercel serverless
-// lambdas are stateless across instances, so the in-memory raw/payload
-// cache populated by /api/groq/reshape on Lambda A was invisible to
-// /api/dashboard, /api/scenario, /api/charts/* on Lambda B. The browser
-// already shipped a `X-Scoutt-Cache` header with the rendered payload,
-// but Anakin payloads regularly exceed the 32 KB cap and were silently
-// dropped — causing the server to return demo, the scenario to consume
-// demo, etc.
+// Root causes & fixes (full diagnosis at the top of src/live-pipeline.ts).
 //
-// THIS REWRITE:
-//   1. Adds support for the new `X-Scoutt-Raw` request header. The
-//      browser persists the Anakin raw `generatedJson` in localStorage
-//      and forwards it on every call. The server can therefore rebuild
-//      the live payload on any cold lambda WITHOUT any in-memory state.
-//   2. /api/scenario now REFUSES to run against a non-live payload and
-//      returns 409 with `live_required: true` so the frontend can
-//      trigger the pipeline first. No more demo events leaking into
-//      simulator output.
-//   3. /api/groq/reshape always returns `source: anakin-direct` (or
-//      anakin-live) when raw is present — never demo-fallback.
-//   4. /api/onboarding/save accepts the onboarding payload without an
-//      Anakin key (it falls back to a deterministic session id) so we
-//      can persist Step-1-3 answers even before the user enters a key.
+// Key behavioural changes in this file:
+//   1. /api/groq/reshape → routes to qwen/qwen3-32b (via live-pipeline). On
+//      success it stamps `source: 'anakin-live'` and `reshape_model: 'qwen/qwen3-32b'`.
+//   2. /api/dashboard now exposes `source: 'demo-warming'` distinctly when
+//      the user has set a key but the pipeline hasn't completed — the
+//      frontend uses this to render a SKELETON instead of the literal demo.
+//   3. /api/scenario no longer hard-fails with 409 when reshape hasn't
+//      finished. It now ALSO accepts the raw Anakin payload (from
+//      X-Scoutt-Raw header or body) and lets qwen3-32b reason against it,
+//      so the simulator works the instant Anakin polling completes. Demo
+//      payloads still cannot reach the scenario route — that property is
+//      preserved by checking `(payload.source !== 'demo' && payload.source !== 'demo-warming')`
+//      OR the presence of raw.
 //
 // Anakin docs:
 //   https://anakin.io/docs/integrations
@@ -60,6 +53,7 @@ import {
   getDashboardPayload, invalidateCacheFor, peekCacheFor, peekRawFor,
   pushCacheFor, pushRawFor, buildBriefingPrompt, groqAsk, groqScenario,
   anakinCrawlAndWait, buildPayloadFromAnakinRaw,
+  GROQ_MODEL, // 🔥 v7 — qwen/qwen3-32b
 } from '../src/live-pipeline'
 
 import {
@@ -67,7 +61,7 @@ import {
 } from '../src/onboarding-store'
 
 const app = express()
-app.use(express.json({ limit: '6mb' })) // 🔥 raised so we can accept raw in body
+app.use(express.json({ limit: '6mb' }))
 app.use(express.urlencoded({ extended: true }))
 
 // ─── CORS ──────────────────────────────────────────────────────────────
@@ -80,7 +74,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next()
 })
 
-// ─── STATIC ASSETS (unchanged) ─────────────────────────────────────────
+// ─── STATIC ASSETS ─────────────────────────────────────────────────────
 const PUBLIC_DIR = path.join(process.cwd(), 'public')
 const STATIC_DIR = path.join(PUBLIC_DIR, 'static')
 const MIME: Record<string, string> = {
@@ -127,7 +121,7 @@ app.get('/threat-index', (_req, res) => { res.setHeader('Content-Type', 'text/ht
 app.get('/onboarding', (_req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.status(200).send(onboardingPage()) })
 
 // =============================================================================
-// HELPERS — every request resolves to USER's tenant + USER's live data.
+// HELPERS
 // =============================================================================
 function anakinKey(req: Request): string | null {
   return (req.header('x-anakin-key') as string) || process.env.ANAKIN_API_KEY || null
@@ -137,7 +131,6 @@ function parseDay(req: Request): number {
   return Number.isFinite(v) ? Math.max(0, Math.min(7, v)) : 0
 }
 
-/** Decode the `X-Scoutt-Tenant` header if present (URL-safe b64 JSON). */
 function readTenantHeader(req: Request): any | null {
   const hdr = req.header('x-scoutt-tenant')
   if (!hdr) return null
@@ -152,17 +145,13 @@ function readTenantHeader(req: Request): any | null {
 
 function tenantForRequest(req: Request) {
   const key = anakinKey(req)
-  // 🔥 v6 — accept tenant from header so cold lambdas without
-  // onboarding-store cache still get the user-specific tenant.
   const headerTenant = readTenantHeader(req)
   if (headerTenant && key) {
-    // sync into the per-key store so subsequent same-lambda calls are warm
     try { setTenantFor(key, headerTenant) } catch {}
   }
   return headerTenant || effectiveTenant(key)
 }
 
-/** Decode the `X-Scoutt-Cache` header (URL-safe base64 JSON). */
 function readClientCache(req: Request): DashboardPayload | null {
   const hdr = req.header('x-scoutt-cache')
   if (hdr) {
@@ -183,10 +172,6 @@ function readClientCache(req: Request): DashboardPayload | null {
   return null
 }
 
-/** 🔥 v6 — Decode the `X-Scoutt-Raw` header (URL-safe base64 JSON). The browser
- *  persists the Anakin raw generatedJson in localStorage and forwards it on
- *  every API call so cold lambdas can rebuild the live payload.
- */
 function readClientRaw(req: Request): any | null {
   const hdr = req.header('x-scoutt-raw')
   if (hdr) {
@@ -202,28 +187,16 @@ function readClientRaw(req: Request): any | null {
   return null
 }
 
-/** Resolve the payload — strict priority order, NEVER falls back to demo
- *  when a key + raw / cache is present.
- *
- *  1. Client-supplied cached LIVE payload     (X-Scoutt-Cache)
- *  2. Client-supplied raw Anakin generatedJson (X-Scoutt-Raw) → rebuild
- *  3. Server warm-cache live payload          (peekCacheFor)
- *  4. Server warm-cache raw → rebuild         (peekRawFor)
- *  5. demo-warming (key set but pipeline not done yet)
- *  6. demo (no key)
- */
 async function payloadFor(req: Request): Promise<DashboardPayload> {
   const key = anakinKey(req)
   const tenant = tenantForRequest(req)
   const day = parseDay(req)
 
-  // 1
   const clientCached = readClientCache(req)
   if (clientCached) {
     if (key) pushCacheFor(key, clientCached)
     return clientCached
   }
-  // 2
   const clientRaw = readClientRaw(req)
   if (clientRaw && key) {
     const p = buildPayloadFromAnakinRaw(clientRaw, tenant)
@@ -232,7 +205,6 @@ async function payloadFor(req: Request): Promise<DashboardPayload> {
     pushCacheFor(key, p)
     return p
   }
-  // 3 / 4 / 5 / 6 inside getDashboardPayload
   return getDashboardPayload({ anakinKey: key, tenant, day, forcedRaw: clientRaw })
 }
 
@@ -246,7 +218,8 @@ app.get('/api/health', (req, res) => res.status(200).json({
   groq:              Boolean(process.env.GROQ_API_KEY),
   elevenlabs:        Boolean(process.env.ELEVENLABS_API_KEY),
   cached_live:       Boolean(req.header('x-anakin-key') && peekCacheFor(String(req.header('x-anakin-key')))),
-  reshape_model:     'meta-llama/llama-4-scout-17b-16e-instruct (Groq) + Anakin-direct fallback',
+  reshape_model:     GROQ_MODEL,                                  // 🔥 qwen/qwen3-32b
+  scenario_model:    GROQ_MODEL,
   user_tenant:       Boolean(getTenantFor(anakinKey(req))) || Boolean(readTenantHeader(req)),
   client_cache_hdr:  Boolean(req.header('x-scoutt-cache')),
   client_raw_hdr:    Boolean(req.header('x-scoutt-raw')),
@@ -255,12 +228,9 @@ app.get('/api/health', (req, res) => res.status(200).json({
 }))
 
 // =============================================================================
-// ONBOARDING — persist the user's tenant overlay
+// ONBOARDING
 // =============================================================================
 app.post('/api/onboarding/save', (req, res) => {
-  // 🔥 v6 — key is optional on first save (frontend may save Step 1-3 answers
-  // before the user enters their API key). We then re-persist with the key
-  // present on the next /api/anakin/start call.
   const key = anakinKey(req) || `pending-${Buffer.from(JSON.stringify(req.body || {})).toString('base64').slice(0, 16)}`
   try {
     const body = (req.body || {}) as any
@@ -293,13 +263,13 @@ app.post('/api/onboarding/clear', (req, res) => {
 
 // =============================================================================
 // STEP 1 — Anakin submit
+//   POST https://api.anakin.io/v1/agentic-search
 // =============================================================================
 app.post('/api/anakin/start', async (req, res) => {
   const key = anakinKey(req)
   if (!key) return res.status(400).json({ error: 'X-Anakin-Key header required' })
   try {
     const inline = (req.body || {}) as any
-    // Accept inline tenant override (also used by frontend to sync onboarding answers)
     if (inline && (inline.industry || inline.competitor_domains || inline.competitors)) {
       setTenantFor(key, {
         industry: inline.industry,
@@ -319,6 +289,7 @@ app.post('/api/anakin/start', async (req, res) => {
 
 // =============================================================================
 // STEP 2 — Anakin single poll
+//   GET https://api.anakin.io/v1/agentic-search/{job_id}
 // =============================================================================
 app.get('/api/anakin/poll/:jobId', async (req, res) => {
   const key = anakinKey(req)
@@ -327,6 +298,8 @@ app.get('/api/anakin/poll/:jobId', async (req, res) => {
   if (!jobId) return res.status(400).json({ error: 'job_id required' })
   try {
     const out = await anakinPollOnce(key, jobId)
+    // 🔥 v7 — surface the raw so the frontend can persist it and forward
+    // X-Scoutt-Raw on subsequent calls.
     res.json({ ok: true, ...out })
   } catch (e: any) {
     res.status(502).json({ ok: false, status: 'unknown', error: String(e?.message || e) })
@@ -334,14 +307,14 @@ app.get('/api/anakin/poll/:jobId', async (req, res) => {
 })
 
 // =============================================================================
-// STEP 3 — Reshape — NEVER returns demo when raw is present.
+// STEP 3 — Reshape via qwen/qwen3-32b — NEVER returns demo when raw is present.
+//   Anakin raw  ──>  Groq qwen/qwen3-32b  ──>  structured DashboardPayload
 // =============================================================================
 async function reshapeHandler(req: Request, res: Response) {
   const key = anakinKey(req)
   if (!key) return res.status(400).json({ error: 'X-Anakin-Key header required' })
   try {
     const body: any = req.body || {}
-    // 🔥 accept raw from body OR header OR warm cache.
     const raw = body.raw ?? readClientRaw(req) ?? peekRawFor(key)
     if (!raw) {
       return res.status(409).json({
@@ -351,13 +324,12 @@ async function reshapeHandler(req: Request, res: Response) {
     }
     const tenant = tenantForRequest(req)
     const payload = await buildAndCachePayload(key, tenant, raw)
-    // Defensive: never emit demo source here.
     if ((payload as any).source !== 'anakin-live' && (payload as any).source !== 'anakin-direct') {
       ;(payload as any).source = 'anakin-direct'
     }
+    ;(payload as any).reshape_model = (payload as any).reshape_model || GROQ_MODEL
     res.json(payload)
   } catch (e: any) {
-    // Even if buildAndCachePayload threw, build a direct payload as a floor.
     try {
       const k = anakinKey(req) || ''
       const raw = (req.body || {} as any).raw ?? readClientRaw(req) ?? peekRawFor(k)
@@ -365,17 +337,17 @@ async function reshapeHandler(req: Request, res: Response) {
       if (raw) {
         const direct = buildPayloadFromAnakinRaw(raw, tenant)
         ;(direct as any).reshape_error = String(e?.message || e)
+        ;(direct as any).reshape_model = `${GROQ_MODEL} (failed — fell to direct mapper)`
         ;(direct as any).source = 'anakin-direct'
         pushCacheFor(k, direct)
         return res.json(direct)
       }
-    } catch {/* fall through */}
-    // Absolute floor — only if there is genuinely no raw.
+    } catch {}
     res.status(500).json({ error: String(e?.message || e), live_required: true })
   }
 }
 app.post('/api/groq/reshape',   reshapeHandler)
-app.post('/api/nvidia/reshape', reshapeHandler)  // backwards-compat alias
+app.post('/api/nvidia/reshape', reshapeHandler) // back-compat alias
 
 // =============================================================================
 // UNIFIED dashboard endpoint
@@ -443,21 +415,11 @@ app.get('/api/competitor/events', async (req, res) => res.json((await payloadFor
 app.get('/api/sentiment/events',  async (req, res) => res.json((await payloadFor(req)).sentiment.events))
 
 // =============================================================================
-// 🔥 SCENARIO SIMULATOR — v6 — STRICT LIVE-ONLY
-// =============================================================================
-//
-// Behaviour:
-//   • If no Anakin key → 400 "Anakin key required".
-//   • If no live/direct payload available (client cache OR raw OR warm
-//     cache) → 409 with `live_required: true`. Frontend must run the
-//     pipeline first and retry.
-//   • If Groq present → groqScenario() (which itself refuses non-live).
-//   • If Groq absent → tenant-aware offline analyser (still operates on
-//     the LIVE briefing, NEVER the demo template).
-//
-//   This kills the bug where typing "chatgpt" returned PSD3/Stripe/Adyen
-//   (demo events) — those are demo titles, and we now refuse to serve
-//   the scenario route with a demo payload.
+// 🔥 SCENARIO SIMULATOR — v7 — qwen/qwen3-32b
+//   Accepts ANY free-text query and runs it through Groq qwen3-32b against
+//   the live briefing OR — if reshape hasn't completed — the raw Anakin
+//   payload directly. NEVER serves a demo response. NEVER throws 409 when
+//   raw is available.
 // =============================================================================
 app.post('/api/scenario', async (req, res) => {
   try {
@@ -474,7 +436,7 @@ app.post('/api/scenario', async (req, res) => {
     }
     const tenant = tenantForRequest(req)
 
-    // Resolve a LIVE payload — strict.
+    // 1. Resolve a LIVE payload if available (strict).
     let p: DashboardPayload | null = readClientCache(req)
     if (!p) {
       const clientRaw = readClientRaw(req)
@@ -494,47 +456,78 @@ app.post('/api/scenario', async (req, res) => {
         pushCacheFor(key, p)
       }
     }
-    const src = p ? (p as any).source : null
-    const isLive = src === 'anakin-live' || src === 'anakin-direct'
 
-    if (!isLive) {
+    // 2. Also try to obtain a raw Anakin payload (for qwen3-32b context).
+    const rawAnakin: any =
+      readClientRaw(req) ||
+      peekRawFor(key)    ||
+      (p ? null : null)
+
+    // 3. Hard gate: must have EITHER a live payload OR raw Anakin output.
+    //    We allow raw-only so the simulator works the second Anakin finishes
+    //    polling, even before reshape completes.
+    const src = p ? (p as any).source : null
+    const hasLivePayload = src === 'anakin-live' || src === 'anakin-direct'
+    if (!hasLivePayload && !rawAnakin) {
       return res.status(409).json({
-        error: 'Live briefing not available yet. The Anakin pipeline must complete before running a scenario.',
+        error: 'Live briefing not available yet. Wait for the Anakin pipeline to complete (poll) before running a scenario.',
         live_required: true,
         source: src || 'none',
       })
     }
 
+    // 4. Run through Groq qwen/qwen3-32b.
     const hasGroq = Boolean(process.env.GROQ_API_KEY)
     if (hasGroq) {
       try {
-        const out = await groqScenario({ scenario, tenant, payload: p! })
+        const out = await groqScenario({
+          scenario,
+          tenant,
+          payload: hasLivePayload ? p : null,
+          rawAnakin: rawAnakin || null,
+        })
         return res.json({
           scenario, ...out,
           credits_used: 1,
-          source: src, is_live: true,
+          source: src || 'anakin-raw',
+          is_live: true,
           mode: 'groq-live',
-          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          model: GROQ_MODEL,                                    // 🔥 qwen/qwen3-32b
         })
       } catch (e: any) {
-        console.warn('Groq scenario failed, falling back to offline:', e?.message)
+        console.warn('Groq qwen3-32b scenario failed, falling back to offline:', e?.message)
       }
     }
-    const offline = synthScenarioOffline(scenario, p!, tenant)
-    res.json({
+
+    // 5. Offline fallback — only runs against LIVE payload events.
+    if (hasLivePayload && p) {
+      const offline = synthScenarioOffline(scenario, p, tenant)
+      return res.json({
+        scenario, ...offline,
+        credits_used: 0,
+        source: src, is_live: true,
+        mode: hasGroq ? 'offline-fallback' : 'offline-no-groq',
+        model: hasGroq ? `${GROQ_MODEL} (failed — fell to offline)` : 'offline (no GROQ_API_KEY)',
+      })
+    }
+
+    // 6. Absolute floor — derive synthetic from raw + tenant.
+    const synth = buildPayloadFromAnakinRaw(rawAnakin, tenant)
+    ;(synth as any).source = 'anakin-direct'
+    const offline = synthScenarioOffline(scenario, synth, tenant)
+    return res.json({
       scenario, ...offline,
-      credits_used: 0,
-      source: src, is_live: true,
-      mode: hasGroq ? 'offline-fallback' : 'offline-no-groq',
+      credits_used: 0, source: 'anakin-direct', is_live: true,
+      mode: 'offline-from-raw',
+      model: 'offline (groq unavailable)',
     })
   } catch (e: any) {
     res.status(500).json({ error: String(e?.message || e) })
   }
 })
 
-// Offline scenario synthesiser — pure JS heuristic, OPERATES ONLY ON THE LIVE
-// briefing events passed in. It can never invent or include demo titles
-// because it strictly maps from `payload.briefing.events`.
+// Offline scenario synthesiser — pure JS heuristic, operates ONLY on the
+// LIVE briefing events. Never references the demo template.
 function synthScenarioOffline(
   scenario: string, payload: DashboardPayload, tenant: any,
 ): {
@@ -546,27 +539,22 @@ function synthScenarioOffline(
   const events: any[] = (payload.briefing?.events || []).slice()
   const before = Number(payload.briefing?.threat_level ?? 60)
 
-  // Score each event by keyword overlap with the scenario.
   const scored = events.map(e => {
     const hay = `${e.title} ${e.summary} ${(e.tags || []).join(' ')}`.toLowerCase()
     let score = 0
     s.split(/\s+/).filter(w => w.length >= 3).forEach(w => {
       if (hay.includes(w)) score += 2
     })
-    // pillar-wide nudges
     if (/regulat|policy|complian|act|law|gdpr|psd|directive/.test(s) && e.pillar === 'policy') score += 3
     if (/competitor|pric|launch|funding|hire|layoff/.test(s) && e.pillar === 'competitor') score += 3
     if (/sentiment|review|reddit|social|backlash|trust/.test(s) && e.pillar === 'sentiment') score += 3
     return { e, score }
   }).sort((a, b) => b.score - a.score)
 
-  // Pick up to 6 highest-scoring events; if none score, take top-3 anyway.
   const picks = (scored.filter(x => x.score > 0).slice(0, 6).length
     ? scored.filter(x => x.score > 0).slice(0, 6)
     : scored.slice(0, 3))
 
-  // Decide direction: positive vibes ("ai", "growth", "opportunity") reduce
-  // threat; negative ("breach", "fine", "ban") increase.
   const pos = /\b(ai|growth|opportunity|partnership|win|tailwind|adopt)\b/i.test(s)
   const neg = /\b(breach|fine|ban|crash|recession|fraud|outage|sanction|lawsuit|hack)\b/i.test(s)
   const direction = neg ? +1 : pos ? -1 : 0
@@ -596,7 +584,7 @@ function synthScenarioOffline(
 }
 
 // =============================================================================
-// COMPETITOR SCRAPE — Anakin /v1/crawl (unchanged)
+// COMPETITOR SCRAPE — Anakin /v1/crawl
 // =============================================================================
 app.post('/api/competitor/scrape', async (req, res) => {
   const key = anakinKey(req)
@@ -677,8 +665,8 @@ app.get('/api/transparency', (req, res) => {
     },
     groq_reshape: {
       endpoint: 'POST https://api.groq.com/openai/v1/chat/completions',
-      model:    'meta-llama/llama-4-scout-17b-16e-instruct',
-      strategy: 'Anakin-direct mapper builds floor; Groq merges on top when available.',
+      model:    GROQ_MODEL,                                  // 🔥 qwen/qwen3-32b
+      strategy: 'Anakin-direct mapper builds floor; qwen3-32b reshape merges on top when available.',
     },
     competitor_scraper: {
       endpoint: 'POST https://api.anakin.io/v1/crawl',
@@ -687,18 +675,18 @@ app.get('/api/transparency', (req, res) => {
     },
     ask_scoutt: {
       endpoint: 'POST https://api.groq.com/openai/v1/chat/completions',
-      model:    'meta-llama/llama-4-scout-17b-16e-instruct',
+      model:    GROQ_MODEL,
     },
     scenario_simulator: {
       endpoint: 'POST /api/scenario',
-      model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-      strict_mode: 'LIVE_ONLY — refuses to run against demo or demo-warming payloads.',
+      model: GROQ_MODEL,
+      strict_mode: 'Accepts either live briefing OR raw Anakin payload. Refuses demo.',
     },
   })
 })
 
 // =============================================================================
-// ACTION DRAFTS (unchanged)
+// ACTION DRAFTS
 // =============================================================================
 app.post('/api/action/draft', async (req, res) => {
   const body = (req.body || {}) as any

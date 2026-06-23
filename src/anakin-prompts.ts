@@ -1,5 +1,5 @@
 // =====================================================================
-// SCOUTT — Anakin prompts + Groq llama-4-scout reshape prompts
+// SCOUTT — Anakin prompts + Groq qwen/qwen3-32b reshape prompts
 // Docs:
 //   https://anakin.io/docs/api-reference
 //   https://anakin.io/docs/api-reference/agentic-search/submit-search
@@ -7,10 +7,11 @@
 //   https://anakin.io/docs/api-reference/crawl/submit-crawl-job
 //   https://anakin.io/docs/api-reference/crawl/get-crawl-result
 //
-// 🔥 EXTENDED: added SCENARIO_SYSTEM_PROMPT + scenarioUserPrompt(...) so
-// the Scenario Simulator now runs through Groq llama-4-scout against the
-// user's CACHED LIVE briefing instead of the old regex-based demo math.
-// Everything else preserved verbatim for backwards compatibility.
+// 🔥 v7 — Scenario prompt now also accepts the raw Anakin payload as
+//        context (in addition to / instead of the reshaped briefing) so
+//        the simulator works even before reshape completes. Also handles
+//        ANY user query — competitor names, regulation names, free-text
+//        "what if…" — instead of refusing.
 // =====================================================================
 
 export const DAILY_BRIEFING_SYSTEM_PROMPT = `You are SCOUTT — a Bloomberg-Terminal-grade business
@@ -25,11 +26,11 @@ export const dailyBriefingUserPrompt = (tenant: {
   competitor_domains: string[]
   pillars_enabled: string[]
 }) => `Produce TODAY's comprehensive intelligence dossier for a ${tenant.industry} business
-operating in ${tenant.region}. Competitors: ${tenant.competitor_domains.join(', ')}.
-Pillars: ${tenant.pillars_enabled.join(', ')}.
+operating in ${tenant.region}. Competitors: ${(tenant.competitor_domains || []).join(', ')}.
+Pillars: ${(tenant.pillars_enabled || []).join(', ')}.
 
 CRITICAL: every COMPETITOR event MUST be about one of THESE EXACT competitor domains:
-${tenant.competitor_domains.map(d => `  • ${d}`).join('\n')}
+${(tenant.competitor_domains || []).map(d => `  • ${d}`).join('\n')}
 Do NOT substitute "industry leaders" or "major players" — only these specific companies.
 Every source_url for a competitor event MUST live on one of those domains (or directly
 reference a news article about that specific company).
@@ -39,9 +40,9 @@ In the last 24-72 hours, find and synthesize the following — RETURN ONE JSON O
 1. POLICY: regulations, enforcement, agency guidance, bills in ${tenant.region} affecting
    ${tenant.industry}. Include regulator name, effective date, source URL.
 
-2. COMPETITOR: public moves by ${tenant.competitor_domains.join(', ')} — pricing changes
-   (with exact before/after values when known), feature launches, hires, funding, layoffs.
-   Include source URL and observed timestamp.
+2. COMPETITOR: public moves by ${(tenant.competitor_domains || []).join(', ')} — pricing
+   changes (with exact before/after values when known), feature launches, hires, funding,
+   layoffs. Include source URL and observed timestamp.
 
 3. SENTIMENT: review-site, social, forum signal around ${tenant.industry} and the listed
    competitors. Include 3-5 verbatim quotes with URLs and sentiment delta vs prior week.
@@ -103,13 +104,13 @@ export const ASK_FRESH_SEARCH_PROMPT = (question: string, industry: string) =>
 Return 3-5 evidence snippets with source URLs. No opinion — just sourced facts.`
 
 // =====================================================================
-// GROQ llama-4-scout-17b RESHAPE PROMPTS (briefing + pillars)
+// GROQ qwen/qwen3-32b RESHAPE PROMPTS (briefing + pillars)
 // =====================================================================
 
 export const RESHAPE_SYSTEM_PROMPT = `You are SCOUTT's data normaliser. Take a raw
 Anakin Agentic-Search output JSON plus a tenant profile and reshape it into the EXACT
 JSON shape requested by the user. Rules:
-  • Output ONLY a single valid JSON object — no markdown fences, no commentary.
+  • Output ONLY a single valid JSON object — no markdown fences, no commentary, no <think>.
   • Use real URLs ONLY from the raw source. NEVER invent URLs.
   • EVERY competitor event MUST reference a domain from the tenant's competitor_domains list
     (or news about that specific company). Never substitute generic "industry leaders".
@@ -268,28 +269,37 @@ REQUIREMENTS:
 }
 
 // =====================================================================
-// 🆕 SCENARIO SIMULATOR PROMPTS (Groq llama-4-scout)
-// Runs the user's free-text "what if…" against their cached briefing.
+// 🔥 v7 — SCENARIO SIMULATOR PROMPTS (Groq qwen/qwen3-32b)
+//   Runs the user's free-text "what if…" against either:
+//     • their cached LIVE briefing (preferred), OR
+//     • the raw Anakin payload (if reshape hasn't completed), OR
+//     • just the tenant context (last-resort — still produces useful answer).
 // =====================================================================
 
-export const SCENARIO_SYSTEM_PROMPT = `You are SCOUTT's Scenario Simulator. Given:
-  • the tenant's industry / region / competitors,
-  • today's full cached briefing (events, threat level, actions),
-  • a free-text hypothetical from the operator,
-your job is to project how today's intelligence changes UNDER THAT HYPOTHETICAL.
+export const SCENARIO_SYSTEM_PROMPT = `You are SCOUTT's Scenario Simulator. The operator
+will give you ANY free-text query — a competitor name, a regulation, a hypothetical
+("what if…"), or a single keyword. Your job is to project how the tenant's threat
+landscape changes under that scenario.
+
 Rules:
-  • Output ONLY a single valid JSON object — no markdown fences, no commentary.
+  • Output ONLY a single valid JSON object — no markdown fences, no commentary, no <think>.
   • Re-score severity for every event you mark as impacted (0-100).
   • Re-compute the projected threat level (0-100) — both before AND after.
-  • Pick 3-6 of the briefing's REAL events that this scenario actually moves.
-    Use the SAME titles and source URLs from the briefing — do NOT invent new ones.
-  • Write a 1-2 sentence boardroom-ready narrative.
-  • Be decisive: ambiguous scenarios still get a directional projection.`
+  • If a CURRENT_BRIEFING is provided, pick 3-6 of its REAL events that this scenario
+    actually moves. Use the SAME titles and source URLs from the briefing.
+  • If a RAW_ANAKIN payload is provided instead (no reshape yet), pull titles/URLs from
+    its structured_data items (developments / events / results / findings / articles).
+  • If neither is provided, synthesise 3 plausible events tied to the tenant's industry,
+    region, and competitors — DO NOT invent generic ones unrelated to the tenant.
+  • Always answer the query — never refuse, never say "insufficient data".
+  • Write a 1-2 sentence boardroom-ready narrative that names a specific competitor
+    or regulator relevant to the tenant.`
 
 export const scenarioUserPrompt = (opts: {
   scenario: string
   tenant: any
-  payload: any
+  payload?: any
+  rawAnakin?: any
 }) => {
   const events = (opts.payload?.briefing?.events || []).slice(0, 12).map((e: any, i: number) => ({
     idx: i,
@@ -299,44 +309,60 @@ export const scenarioUserPrompt = (opts: {
     severity: e.severity,
     source_url: e.source_url,
   }))
+  const hasBriefing = events.length > 0
+  const rawSnippet = opts.rawAnakin
+    ? JSON.stringify(opts.rawAnakin).slice(0, 6000)
+    : 'null'
+
   return `TENANT:
-${JSON.stringify({ industry: opts.tenant?.industry, region: opts.tenant?.region, competitors: opts.tenant?.competitor_domains })}
+${JSON.stringify({
+  industry: opts.tenant?.industry || 'B2B SaaS',
+  region:   opts.tenant?.region   || 'US',
+  competitors: opts.tenant?.competitor_domains || [],
+})}
 
 CURRENT_BRIEFING:
-  threat_level: ${opts.payload?.briefing?.threat_level ?? 60}
+  ${hasBriefing ? `threat_level: ${opts.payload?.briefing?.threat_level ?? 60}
   headline: ${opts.payload?.briefing?.headline ?? ''}
-  events: ${JSON.stringify(events)}
+  events: ${JSON.stringify(events)}` : '(no reshaped briefing available — fall back to RAW_ANAKIN)'}
 
-USER_HYPOTHETICAL:
+RAW_ANAKIN (truncated, used only if CURRENT_BRIEFING is empty):
+${rawSnippet}
+
+USER_QUERY:
   "${String(opts.scenario).slice(0, 600)}"
 
-Return ONLY this JSON (no other keys, no markdown):
+Return ONLY this JSON (no other keys, no markdown, no <think>):
 {
   "threat_level_before": ${opts.payload?.briefing?.threat_level ?? 60},
   "threat_level_after":  0-100,
   "delta_threats": int (count of events whose severity moved meaningfully),
   "delta_actions": int (count of operator actions that would need re-prioritising, 0-5),
-  "narrative": "1-2 sentence boardroom-grade analysis tying the scenario to specific events",
+  "narrative": "1-2 sentence boardroom-grade analysis tying the query to specific events or context. MUST name a real competitor or regulator from the tenant.",
   "impacted_events": [
-    { "title": "exact title from briefing", "pillar": "policy|competitor|sentiment",
-      "severity": 0-100, "source_url": "https://..." }
+    { "title": "exact title (from briefing if available, else from raw, else synthesised)",
+      "pillar": "policy|competitor|sentiment",
+      "severity": 0-100,
+      "source_url": "https://..." }
   ]
 }
 
 REQUIREMENTS:
-  • impacted_events: 3-6 items, every title MUST exist verbatim in the briefing events above.
-  • If the scenario is benign or unrelated, threat_level_after should drift toward
-    threat_level_before but never be identical (operators want a clear directional read).
-  • narrative MUST mention at least one specific competitor or regulator from the tenant context.`
+  • impacted_events: 3-6 items.
+  • If CURRENT_BRIEFING.events exists, every title MUST exist verbatim in it.
+  • Otherwise pull titles from RAW_ANAKIN, or synthesise tenant-specific ones.
+  • threat_level_after must differ from threat_level_before by at least 3 (operators
+    want a clear directional read).
+  • narrative MUST mention at least one competitor or regulator from the tenant context.`
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────
 
 function slug(domain: string): string {
-  return domain.replace(/^https?:\/\//, '').replace(/[^a-z0-9]/gi, '').toLowerCase().slice(0, 12) || 'comp'
+  return String(domain).replace(/^https?:\/\//, '').replace(/[^a-z0-9]/gi, '').toLowerCase().slice(0, 12) || 'comp'
 }
 function prettyDomain(domain: string): string {
-  const d = domain.replace(/^https?:\/\//, '').replace(/^www\./, '')
+  const d = String(domain).replace(/^https?:\/\//, '').replace(/^www\./, '')
   const root = d.split('.')[0] || d
   return root.charAt(0).toUpperCase() + root.slice(1)
 }

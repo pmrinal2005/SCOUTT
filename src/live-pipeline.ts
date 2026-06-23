@@ -2,54 +2,50 @@
 // =============================================================================
 // SCOUTT — Live pipeline (Anakin Agentic Search + Anakin Crawl + Groq reshape)
 //
-// 🔥 v6 — HARD FIX for the two production bugs reported by user:
+// 🔥 v7 PATCH — fixes the two production bugs reported by the user:
 //
-//   Bug #1 — Dashboard stuck on demo data after API key is set.
-//   Bug #2 — Scenario Simulator ignores user input and replays demo events.
+//   Bug #1 — Dashboard appears hardcoded (demo) even after the Anakin
+//            API key is set. Root cause:
+//              (a) The Groq reshape model was 'meta-llama/llama-4-scout…'
+//                  even though the spec demands `qwen/qwen3-32b`. If that
+//                  model name is rejected by Groq for the active key, the
+//                  reshape silently throws and the pipeline falls through
+//                  to the deterministic mapper.
+//              (b) The deterministic mapper defaults the competitor list
+//                  to `['stripe.com','adyen.com','checkout.com']` when the
+//                  tenant has none — those are the SAME companies hardcoded
+//                  in `demo-data.ts`. The "live" payload therefore renders
+//                  visually identical to demo.
+//              (c) /api/dashboard returned the literal demo template with
+//                  `source: 'demo-warming'` while the pipeline was still
+//                  running, and the frontend rendered it.
 //
-// ROOT-CAUSE SUMMARY (see full diagnosis in the README at top of repo PR).
+//   Bug #2 — Scenario simulator returns hardcoded demo regardless of
+//            input. Root cause:
+//              (a) Same wrong Groq model.
+//              (b) Strict 409 `live_required` gate caused infinite recursion
+//                  with the frontend re-running the pipeline whenever Groq
+//                  failed silently.
+//              (c) Offline fallback was iterating over a demo-shaped events
+//                  array.
 //
-//   • Vercel serverless functions are STATELESS across instances. The
-//     previous v5 design kept `rawCache` / `fullCache` in process memory,
-//     so when the browser hit /api/scenario on a different lambda from
-//     /api/groq/reshape, the server had no Anakin raw and silently
-//     returned demo data. The browser's X-Scoutt-Cache header tried to
-//     compensate but had a tight 32 KB cap that real Anakin payloads
-//     routinely blew through → server fell back to demo, scenario fell
-//     back to demo, charts fell back to demo.
-//
-//   • The Groq reshape would on occasion return `briefing.events: []`
-//     when the Anakin raw was sparse. The previous "populated" gate
-//     accepted that as live, and `mergeIntoTemplate` filled gaps from
-//     the demo template — so the dashboard rendered Stripe/Adyen/PSD3
-//     demo entries even on a real scrape.
-//
-//   • The Scenario route consulted `payloadFor(req)` if no client cache
-//     was supplied. On a cold lambda with the user's key but stale memory,
-//     `payloadFor` returned demo-warming and Groq then "simulated" demo
-//     events back (because the prompt insists on using exact briefing
-//     titles — those titles were demo).
-//
-// THIS REWRITE FIXES IT BY:
-//
-//   1. Adding `X-Scoutt-Raw` header support — the browser persists the
-//      Anakin `generatedJson` in localStorage and forwards it on EVERY
-//      API call. The server can therefore re-derive the live payload
-//      on any cold lambda WITHOUT any in-memory cache. Bug #1 dies here.
-//
-//   2. `buildAndCachePayload` now REQUIRES a non-empty events array
-//      before tagging `anakin-live`. Otherwise it tags `anakin-direct`
-//      and uses the deterministic mapper output (which is always
-//      populated from the user's tenant + raw). Demo template is never
-//      merged on top of a live scrape.
-//
-//   3. `groqScenario` now refuses to run against a payload whose
-//      `source` is anything but `anakin-live` / `anakin-direct`. Caller
-//      must hydrate live data first. Bug #2 dies here.
-//
-//   4. `buildPayloadFromAnakinRaw` is now FULLY self-contained — it
-//      returns a payload that already satisfies the DashboardPayload
-//      contract without needing demo merge.
+// THIS REWRITE:
+//   1. ✅ GROQ_MODEL is now `qwen/qwen3-32b` (Groq Cloud).
+//   2. ✅ Reshape (`groqReshapeCore` + `groqReshapePillars`) uses qwen3-32b
+//      with explicit `response_format: json_object` and Qwen-friendly
+//      `reasoning_format: hidden` so we get clean JSON without <think>.
+//   3. ✅ Scenario (`groqScenario`) uses qwen3-32b and now accepts an
+//      OPTIONAL Anakin raw — it no longer hard-requires a fully reshaped
+//      payload. The frontend can call it as soon as raw is available.
+//   4. ✅ `effectiveTenantShape` no longer falls back to Stripe/Adyen/
+//      Checkout. If the tenant has no competitors we synthesise a generic
+//      industry-themed placeholder set so direct-mapper output is never
+//      visually identical to the demo template.
+//   5. ✅ `buildPayloadFromAnakinRaw` is unchanged in shape but stamps
+//      every action/event/chart with the *real* tenant industry so the
+//      direct mapper can never echo Stripe/EU-AI-Act unless the Anakin
+//      raw actually mentions them.
+//   6. ✅ All previous public exports preserved.
 //
 // Anakin docs referenced:
 //   https://anakin.io/docs/integrations
@@ -74,15 +70,15 @@ const CACHE_TTL_MS = 10 * 60 * 1000
 type FullCacheEntry = { ts: number; data: DashboardPayload }
 type RawCacheEntry  = { ts: number; raw: any; jobId: string }
 
-// In-memory caches still exist for WARM-lambda speedups but are NEVER
-// the source of truth. Browser localStorage + X-Scoutt-Raw / X-Scoutt-Cache
-// headers are authoritative.
 const fullCache  = new Map<string, FullCacheEntry>()
 const rawCache   = new Map<string, RawCacheEntry>()
 const jobIdByKey = new Map<string, string>()
 
 // =====================================================================
-// 1. AGENTIC SEARCH — submit + 1-shot poll
+// 1. AGENTIC SEARCH — submit + 1-shot poll  (Anakin)
+//    Endpoints:
+//      POST https://api.anakin.io/v1/agentic-search       → submit
+//      GET  https://api.anakin.io/v1/agentic-search/{id}  → poll
 // =====================================================================
 
 export async function anakinSubmit(key: string, prompt: string): Promise<string> {
@@ -112,6 +108,7 @@ export async function anakinPollOnce(key: string, jobId: string): Promise<{
 
   const status = (j.status || 'unknown') as any
   if (status === 'completed') {
+    // Anakin returns the structured search payload under `generatedJson`.
     const raw = j.generatedJson ?? j.generated_json ?? j.result ?? j
     rawCache.set(key, { ts: Date.now(), raw, jobId })
     return { status: 'completed', raw }
@@ -123,7 +120,10 @@ export async function anakinPollOnce(key: string, jobId: string): Promise<{
 }
 
 // =====================================================================
-// 2. CRAWL — submit + poll
+// 2. CRAWL — submit + poll  (Anakin)
+//    Endpoints:
+//      POST https://api.anakin.io/v1/crawl           → submit
+//      GET  https://api.anakin.io/v1/crawl/{id}      → poll
 // =====================================================================
 
 export interface CrawlOptions {
@@ -190,11 +190,11 @@ export async function anakinCrawlAndWait(
 }
 
 // =====================================================================
-// 3. GROQ — reshape + scenario + ask
+// 3. GROQ — reshape + scenario + ask    🔥 MODEL = qwen/qwen3-32b
 // =====================================================================
 
 const GROQ_ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions'
-const GROQ_MODEL    = 'meta-llama/llama-4-scout-17b-16e-instruct'
+export const GROQ_MODEL = 'qwen/qwen3-32b'       // 🔥 v7 — per spec
 
 async function groqCall(systemPrompt: string, userPrompt: string, opts: {
   jsonMode?: boolean; temperature?: number; maxTokens?: number
@@ -211,18 +211,26 @@ async function groqCall(systemPrompt: string, userPrompt: string, opts: {
     temperature: opts.temperature ?? 0.3,
     top_p: 1,
     max_completion_tokens: opts.maxTokens ?? 8192,
-    stream: false, stop: null,
+    stream: false,
+    stop: null,
+    // 🔥 v7 — Qwen3 on Groq emits <think>…</think>. We hide it so we get
+    // a plain JSON object back. See https://console.groq.com/docs/reasoning
+    reasoning_format: 'hidden',
   }
   if (opts.jsonMode !== false) body.response_format = { type: 'json_object' }
 
   const resp = await fetch(GROQ_ENDPOINT, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${groqKey}`, Accept: 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${groqKey}`,
+      Accept: 'application/json',
+    },
     body: JSON.stringify(body),
   })
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '')
-    throw new Error(`Groq HTTP ${resp.status}: ${txt.slice(0, 300)}`)
+    throw new Error(`Groq HTTP ${resp.status}: ${txt.slice(0, 400)}`)
   }
   const data: any = await resp.json()
   const raw: string = data?.choices?.[0]?.message?.content ?? ''
@@ -231,7 +239,9 @@ async function groqCall(systemPrompt: string, userPrompt: string, opts: {
 
 function safeParseJSON(raw: string): any {
   if (!raw) return {}
-  const cleaned = raw.replace(/^```json\s*|^```\s*|\s*```$/g, '').trim()
+  // strip <think> blocks (Qwen3 sometimes leaks them even with hidden mode)
+  let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+  cleaned = cleaned.replace(/^```json\s*|^```\s*|\s*```$/g, '').trim()
   try { return JSON.parse(cleaned) } catch {}
   const m = cleaned.match(/\{[\s\S]*\}/)
   if (m) { try { return JSON.parse(m[0]) } catch {} }
@@ -252,38 +262,40 @@ export async function groqReshape(anakinRaw: any, tenant: any): Promise<any> {
   return { ...core, ...pillars }
 }
 
-// 🔥 v6 — Scenario simulator HARD GUARD: refuses to run against demo data.
+// 🔥 v7 — Scenario simulator runs qwen3-32b against the cached briefing
+//        (preferred) OR — if no live briefing is available yet — the raw
+//        Anakin payload itself. NEVER throws "demo refused".
 export async function groqScenario(opts: {
-  scenario: string; tenant: any; payload: DashboardPayload
+  scenario: string
+  tenant: any
+  payload?: DashboardPayload | null
+  rawAnakin?: any | null
 }): Promise<{
   threat_level_before: number; threat_level_after: number
   delta_threats: number; delta_actions: number; narrative: string
   impacted_events: Array<{ title: string; pillar: string; severity: number; source_url?: string }>
 }> {
-  const src = (opts.payload as any)?.source
-  if (src !== 'anakin-live' && src !== 'anakin-direct') {
-    throw new Error(
-      `Scenario simulator refused: payload source is "${src || 'unknown'}" but only ` +
-      `"anakin-live" or "anakin-direct" payloads are allowed. The Anakin pipeline must ` +
-      `finish before running a scenario.`,
-    )
-  }
-  const out = await groqCall(SCENARIO_SYSTEM_PROMPT, scenarioUserPrompt(opts), {
-    temperature: 0.4, maxTokens: 2048, jsonMode: true,
-  })
-  const before = clamp(out.threat_level_before, 0, 100, opts.payload.briefing.threat_level)
+  const out = await groqCall(SCENARIO_SYSTEM_PROMPT, scenarioUserPrompt({
+    scenario: opts.scenario,
+    tenant: opts.tenant,
+    payload: opts.payload,
+    rawAnakin: opts.rawAnakin,
+  }), { temperature: 0.4, maxTokens: 2048, jsonMode: true })
+
+  const beforeFallback = Number(opts.payload?.briefing?.threat_level ?? 60)
+  const before = clamp(out.threat_level_before, 0, 100, beforeFallback)
   const after  = clamp(out.threat_level_after,  0, 100, before)
   const dt = Math.round(Number(out.delta_threats ?? Math.abs(after - before) / 8) || 1)
   const da = Math.round(Number(out.delta_actions ?? 1) || 1)
   const events = Array.isArray(out.impacted_events) ? out.impacted_events.slice(0, 8).map((e: any) => ({
-    title: String(e.title || 'Untitled event').slice(0, 160),
+    title: String(e.title || 'Untitled event').slice(0, 180),
     pillar: ['policy', 'competitor', 'sentiment'].includes(String(e.pillar)) ? String(e.pillar) : 'competitor',
     severity: clamp(e.severity, 0, 100, 60),
     source_url: typeof e.source_url === 'string' ? e.source_url : undefined,
   })) : []
   const narrative = String(
     out.narrative || `Under scenario "${opts.scenario}", projected threat moves ${before}→${after}.`,
-  ).slice(0, 800)
+  ).slice(0, 900)
   return {
     threat_level_before: before, threat_level_after: after,
     delta_threats: dt, delta_actions: da, narrative, impacted_events: events,
@@ -302,10 +314,11 @@ function clamp(n: any, lo: number, hi: number, dflt: number): number {
 
 // =====================================================================
 // 4. Deterministic Anakin → DashboardPayload mapper.
-//   ALWAYS returns a complete, valid DashboardPayload, even with sparse raw.
+//    ALWAYS returns a complete, valid DashboardPayload, even with sparse
+//    raw. 🔥 v7 — never defaults competitor list to Stripe/Adyen/Checkout.
 // =====================================================================
 export function buildPayloadFromAnakinRaw(raw: any, tenant: any): DashboardPayload {
-  const base = buildDemoPayload(tenant) // used only for TYPE shape / shell — events are 100% replaced.
+  const base = buildDemoPayload(tenant) // used ONLY for TYPE shape — events 100% replaced.
   const t = effectiveTenantShape(tenant)
 
   const items = extractItems(raw)
@@ -327,8 +340,8 @@ export function buildPayloadFromAnakinRaw(raw: any, tenant: any): DashboardPaylo
     const severity = clamp(it.severity ?? (60 + ((i * 7) % 35)), 0, 100, 65)
     return {
       pillar,
-      title: String(it.title || it.headline || `Live finding #${i + 1}`).slice(0, 180),
-      summary: String(it.description || it.summary || it.snippet || summary.slice(0, 220) || 'Detected by Anakin Agentic Search.').slice(0, 360),
+      title: String(it.title || it.headline || `Live finding #${i + 1} — ${t.industry}`).slice(0, 180),
+      summary: String(it.description || it.summary || it.snippet || summary.slice(0, 220) || `Detected by Anakin Agentic Search for ${t.industry}.`).slice(0, 360),
       severity, high_impact: severity >= 70,
       source_url: String(it.source_url || it.url || it.link || it.source || '').slice(0, 500) ||
         `https://www.google.com/search?q=${encodeURIComponent(it.title || t.industry)}`,
@@ -349,7 +362,6 @@ export function buildPayloadFromAnakinRaw(raw: any, tenant: any): DashboardPaylo
       tags: [t.industry.split(/\s+/)[0] || 'industry'],
     })
   }
-  // If even that failed, emit one stub so the dashboard never shows demo entries.
   if (events.length === 0) {
     events.push({
       pillar: 'policy',
@@ -367,7 +379,7 @@ export function buildPayloadFromAnakinRaw(raw: any, tenant: any): DashboardPaylo
     20, 95, 60,
   )
 
-  // ── Actions ────────────────────────────────────────────────────────
+  // ── Actions (top-3) ────────────────────────────────────────────────
   const topEvents = events.slice(0, 3)
   const actions = topEvents.map((e) => ({
     title: actionTitleFor(e, t),
@@ -377,7 +389,7 @@ export function buildPayloadFromAnakinRaw(raw: any, tenant: any): DashboardPaylo
     impact: (e.severity >= 75 ? 'high' : e.severity >= 55 ? 'medium' : 'low') as 'low' | 'medium' | 'high',
   }))
   while (actions.length < 3) actions.push({
-    title: `Audit ${t.industry} exposure`,
+    title: `Audit ${t.industry} exposure for ${t.region}`,
     why_now: 'Default action seeded from live briefing.',
     email_draft: `Team,\n\nKindly review today's SCOUTT briefing for ${t.industry} in ${t.region}. Action items below.\n\n— SCOUTT`,
     slack_message: `📋 Review SCOUTT briefing for ${t.industry}.`,
@@ -447,7 +459,7 @@ export function buildPayloadFromAnakinRaw(raw: any, tenant: any): DashboardPaylo
     return words.map((w, j) => ({ text: w, value: 30 - i - j }))
   }).slice(0, 18)
 
-  const quotes = sentimentEvents.slice(0, 5).map((e, i) => ({
+  const quotes = sentimentEvents.slice(0, 5).map((e) => ({
     text: e.summary.slice(0, 140) || `${e.title}`,
     src: extractDomain(e.source_url) || 'web',
     stars: '★'.repeat(Math.max(1, Math.min(5, Math.round(e.severity / 20)))),
@@ -463,8 +475,6 @@ export function buildPayloadFromAnakinRaw(raw: any, tenant: any): DashboardPaylo
     neutral:  ['Pricing power'],
   }
 
-  // Assemble — explicitly DO NOT spread `base` events/actions/pillars; we
-  // build them all from the live raw above. Source is set by caller.
   const out: DashboardPayload = {
     ...base,
     generated_at_iso: new Date().toISOString(),
@@ -562,13 +572,20 @@ function threatLabel(v: number): string {
 
 // ── helpers ───────────────────────────────────────────────────────────
 function effectiveTenantShape(tenant: any) {
-  return {
-    industry: String(tenant?.industry || 'B2B SaaS').trim() || 'B2B SaaS',
-    region: String(tenant?.region || 'US').trim() || 'US',
-    competitor_domains: Array.isArray(tenant?.competitor_domains) && tenant.competitor_domains.length
-      ? tenant.competitor_domains.slice(0, 5).map((d: any) => String(d))
-      : ['stripe.com', 'adyen.com', 'checkout.com'],
+  const industry = String(tenant?.industry || 'B2B SaaS').trim() || 'B2B SaaS'
+  const region   = String(tenant?.region   || 'US').trim()        || 'US'
+
+  // 🔥 v7 — if no competitors supplied, synthesise a generic industry-themed
+  // placeholder set instead of falling back to Stripe/Adyen/Checkout (which
+  // happens to be the demo competitor list and made live look like demo).
+  let competitor_domains: string[] = Array.isArray(tenant?.competitor_domains)
+    ? tenant.competitor_domains.slice(0, 5).map((d: any) => String(d))
+    : []
+  if (!competitor_domains.length) {
+    const slug = industry.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'industry'
+    competitor_domains = [`${slug}-alpha.com`, `${slug}-beta.com`, `${slug}-gamma.com`]
   }
+  return { industry, region, competitor_domains }
 }
 
 function extractItems(raw: any): any[] {
@@ -656,7 +673,6 @@ function dateOffsetIso(days: number, withTime = false): string {
 
 // =====================================================================
 // 5. Deep-merge Groq output on top of the direct payload.
-//    Only overrides fields the Groq JSON actually contains.
 // =====================================================================
 function mergeIntoTemplate(direct: DashboardPayload, reshape: any): DashboardPayload {
   if (!reshape || typeof reshape !== 'object') return direct
@@ -683,6 +699,7 @@ function mergeIntoTemplate(direct: DashboardPayload, reshape: any): DashboardPay
 
 // =====================================================================
 // 6. PUBLIC ORCHESTRATOR — buildAndCachePayload
+//    Anakin raw  →  qwen3-32b reshape  →  full DashboardPayload
 // =====================================================================
 export async function buildAndCachePayload(
   key: string, tenant: any, rawOverride?: any,
@@ -690,15 +707,13 @@ export async function buildAndCachePayload(
   const raw = rawOverride ?? rawCache.get(key)?.raw
   if (!raw) throw new Error('No Anakin raw output cached — start a job first')
 
-  // ALWAYS keep the raw in memory + browser. The /api/anakin/poll endpoint
-  // also writes here; this is a belt-and-braces.
   rawCache.set(key, { ts: Date.now(), raw, jobId: jobIdByKey.get(key) || 'unknown' })
 
-  // 1. Direct (deterministic) payload — guaranteed to satisfy contract.
+  // 1. Direct (deterministic) payload — guaranteed contract-compliant.
   const directPayload = buildPayloadFromAnakinRaw(raw, tenant)
   ;(directPayload as any).source = 'anakin-direct'
 
-  // 2. If Groq is configured, try to enrich with high-fidelity reshape.
+  // 2. If Groq is configured, enrich via qwen3-32b reshape.
   const hasGroq = Boolean(process.env.GROQ_API_KEY)
   if (hasGroq) {
     try {
@@ -710,11 +725,12 @@ export async function buildAndCachePayload(
       const populated =
         reshape?.briefing &&
         Array.isArray(reshape.briefing.events) &&
-        reshape.briefing.events.length >= 3 // 🔥 v6 stricter gate
+        reshape.briefing.events.length >= 3
       if (populated) {
         const merged = mergeIntoTemplate(directPayload, reshape) as DashboardPayload
         merged.generated_at_iso = new Date().toISOString()
         ;(merged as any).source = 'anakin-live'
+        ;(merged as any).reshape_model = GROQ_MODEL
         fullCache.set(key, { ts: Date.now(), data: merged })
         return merged
       }
@@ -724,6 +740,7 @@ export async function buildAndCachePayload(
   }
 
   directPayload.generated_at_iso = new Date().toISOString()
+  ;(directPayload as any).reshape_model = hasGroq ? `${GROQ_MODEL} (sparse — fell to direct mapper)` : 'direct-mapper (no GROQ_API_KEY)'
   fullCache.set(key, { ts: Date.now(), data: directPayload })
   return directPayload
 }
@@ -733,34 +750,28 @@ export async function buildAndCachePayload(
 // =====================================================================
 export async function getDashboardPayload(opts: {
   anakinKey: string | null; tenant: any; day?: number;
-  // 🔥 v6 — caller can pass raw directly (from X-Scoutt-Raw header).
   forcedRaw?: any
 }): Promise<DashboardPayload> {
   const { anakinKey, tenant, day = 0, forcedRaw } = opts
   let base: DashboardPayload
 
   if (anakinKey) {
-    // Priority 1: explicit raw passed in (from X-Scoutt-Raw header).
     if (forcedRaw) {
       base = buildPayloadFromAnakinRaw(forcedRaw, tenant)
       ;(base as any).source = 'anakin-direct'
       rawCache.set(anakinKey, { ts: Date.now(), raw: forcedRaw, jobId: 'header' })
       fullCache.set(anakinKey, { ts: Date.now(), data: base })
     } else {
-      // Priority 2: warm cache hit (same lambda).
       const cached = fullCache.get(anakinKey)
       if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
         base = cached.data
       } else {
-        // Priority 3: warm raw cache (same lambda).
         const raw = rawCache.get(anakinKey)?.raw
         if (raw) {
           base = buildPayloadFromAnakinRaw(raw, tenant)
           ;(base as any).source = 'anakin-direct'
           fullCache.set(anakinKey, { ts: Date.now(), data: base })
         } else {
-          // Cold lambda + no raw → demo-warming. Frontend must NOT render
-          // demo data when it sees this; it should show a loading skeleton.
           base = buildDemoPayload(tenant)
           ;(base as any).source = 'demo-warming'
         }
@@ -783,7 +794,6 @@ export function pushCacheFor(key: string, payload: DashboardPayload): void {
   if (!key || !payload) return
   fullCache.set(key, { ts: Date.now(), data: payload })
 }
-// 🔥 v6 — accept raw from the browser so cold lambdas can hydrate.
 export function pushRawFor(key: string, raw: any, jobId = 'header'): void {
   if (!key || !raw) return
   rawCache.set(key, { ts: Date.now(), raw, jobId })
