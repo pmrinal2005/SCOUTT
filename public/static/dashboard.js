@@ -1,6 +1,20 @@
-/* SCOUTT dashboard.js v9 — qwen/qwen3-32b pipeline, demo-warming skeleton, scenario accepts raw
+/* SCOUTT dashboard.js v10 — Groq llama-4-scout pipeline
  *
- * 🔥 v9 PATCH — fixes the two reported bugs:
+ * 🔥 v10 PATCH — three fixes vs v9:
+ *   A. Threat-Level Meter no longer renders a Chart.js sparkline canvas.
+ *      Root cause of the "graph below threat-meter expanding to infinite
+ *      height and destroying the layout" bug: the spark <canvas> sat inside
+ *      a parent with no explicit height while Chart.js was configured
+ *      `maintainAspectRatio:false` — the resize-observer loop expanded the
+ *      canvas indefinitely on every reflow. Per the product spec we now
+ *      drop the sparkline entirely; the gauge SVG remains.
+ *   B. Scenario simulator forwards the user's prompt to /api/scenario,
+ *      which routes straight to Groq llama-4-scout. The old 409 "live
+ *      required" retry loop is gone — the API never returns 409 anymore.
+ *   C. Transparency drawer renders the Anakin response AND the live Groq
+ *      reshape JSON AND the last Groq scenario response.
+ *
+ * Legacy v9 PATCH — fixes the two reported bugs:
  *   1. Dashboard hardcoded after Anakin key set:
  *      • When the server returns source=='demo-warming' (key set, pipeline not done)
  *        we now render a clearly-marked LOADING SKELETON instead of the demo cards.
@@ -358,7 +372,7 @@ function stampSourceBadge(p) {
   const model = p?.reshape_model || ''
   if (src === 'anakin-live') {
     badge.className = 'ml-2 px-1.5 py-0.5 rounded mono text-[9px] uppercase border bg-emerald-500/15 text-emerald-400 border-emerald-400/30'
-    badge.textContent = 'LIVE · llama-3.3-70b'
+    badge.textContent = 'LIVE · llama-4-scout'
   } else if (src === 'anakin-direct') {
     badge.className = 'ml-2 px-1.5 py-0.5 rounded mono text-[9px] uppercase border bg-cyan-500/15 text-cyan-400 border-cyan-400/30'
     badge.textContent = 'LIVE · direct mapper'
@@ -377,7 +391,7 @@ function stampSourceBadge(p) {
 function paintLoadingSkeleton(p) {
   const banner = $('#banner-summary')
   if (banner) banner.textContent = SCOUTT.hasKey
-    ? 'Generating your live briefing via Anakin Agentic Search → NVIDIA meta/llama-3.3-70b-instruct reshape…'
+    ? 'Generating your live briefing via Anakin Agentic Search → Groq meta-llama/llama-4-scout-17b-16e-instruct reshape…'
     : 'Add your Anakin API key to generate a live briefing.'
   const skel = (n = 1) => Array.from({ length: n }).map(() =>
     '<div class="animate-pulse rounded bg-ink-800 h-3 my-2 w-3/4"></div>').join('')
@@ -576,34 +590,22 @@ function renderThreatMeter(p) {
   const needleAng = Math.PI * (1 + v / 100)
   const nx = CX + Math.cos(needleAng) * (R - 4)
   const ny = CY + Math.sin(needleAng) * (R - 4)
+  // 🔥 v10 — the previous <canvas id="threat-spark"> sparkline was removed
+  // entirely. It was the source of the runaway-height graph that destroyed
+  // the Command Center layout (its parent had no fixed height and Chart.js
+  // was using maintainAspectRatio:false, causing an infinite resize loop).
+  // Per the product spec, no chart is rendered below the gauge anymore.
+  void spark // intentionally unused — sparkline_14d kept on payload for other uses
   wrap.innerHTML = `
-    <div class="flex flex-col items-center">
-      <svg viewBox="0 0 ${W} ${H}" class="w-full">
+    <div class="flex flex-col items-center" style="max-height:200px;overflow:hidden;">
+      <svg viewBox="0 0 ${W} ${H}" class="w-full" style="max-height:170px;">
         ${arc(0, 40, '#10b981')}${arc(40, 70, '#f97316')}${arc(70, 100, '#ec4899')}
         <line x1="${CX}" y1="${CY}" x2="${nx}" y2="${ny}" stroke="#06b6d4" stroke-width="3" stroke-linecap="round" />
         <circle cx="${CX}" cy="${CY}" r="6" fill="#06b6d4" />
         <text x="${CX}" y="${CY - 30}" text-anchor="middle" font-family="JetBrains Mono" font-size="26" font-weight="700" fill="#e7eaf3">${v}</text>
         <text x="${CX}" y="${CY - 10}" text-anchor="middle" font-family="JetBrains Mono" font-size="9" fill="#5a607a">${escapeHTML(label).toUpperCase()}</text>
       </svg>
-      <canvas id="threat-spark" height="60" class="w-full"></canvas>
     </div>`
-  if (spark.length) {
-    makeChart('threat-spark', {
-      type: 'line',
-      data: { labels: spark.map((_, i) => i),
-        datasets: [{
-          data: spark, borderColor: '#06b6d4', borderWidth: 2, tension: 0.4,
-          pointRadius: 0, fill: true,
-          backgroundColor: ctx => {
-            const g = ctx.chart.ctx.createLinearGradient(0, 0, 0, 60)
-            g.addColorStop(0, 'rgba(6,182,212,0.45)'); g.addColorStop(1, 'rgba(6,182,212,0)'); return g
-          },
-        }] },
-      options: { responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false }, tooltip: { enabled: false } },
-        scales: { x: { display: false }, y: { display: false } } },
-    })
-  }
 }
 function labelForThreat(v) {
   if (v >= 80) return 'Severe'
@@ -950,7 +952,7 @@ window.runScenario = async function (recursionGuard) {
   if (btn) {
     btn.disabled = true
     btn.dataset.origHtml = btn.dataset.origHtml || btn.innerHTML
-    btn.innerHTML = '<div class="w-4 h-4 border-2 border-ink-950 border-t-transparent rounded-full animate-spin inline-block"></div> Asking NVIDIA llama-3.3-70b…'
+    btn.innerHTML = '<div class="w-4 h-4 border-2 border-ink-950 border-t-transparent rounded-full animate-spin inline-block"></div> Asking Groq llama-4-scout…'
   }
   if (err) err.classList.add('hidden')
   if (result) result.classList.add('hidden')
@@ -973,21 +975,10 @@ window.runScenario = async function (recursionGuard) {
       signal: ctrl.signal,
     })
     clearTimeout(timer)
-    if (res.status === 409) {
-      // Server says it has neither live payload NOR raw. Trigger pipeline ONCE.
-      if (!SCOUTT.hasKey) {
-        showToast('Scenario unavailable — add your Anakin API key first.', 'error')
-        resetScenarioBtn(btn); return
-      }
-      if (recursionGuard) {
-        if (err) { err.textContent = 'Live pipeline did not produce raw output — retry shortly.'; err.classList.remove('hidden') }
-        resetScenarioBtn(btn); return
-      }
-      showToast('Live data not synced yet — running Anakin pipeline first.')
-      const fresh = await runLivePipeline()
-      if (fresh) return window.runScenario(true)
-      resetScenarioBtn(btn); return
-    }
+    // 🔥 v10 — /api/scenario now ALWAYS routes to Groq and never returns 409.
+    // The previous 409 → runLivePipeline() recursion path has been removed;
+    // Groq answers based on the user query + tenant context, optionally
+    // enriched with whatever live data is cached. No retry loop needed.
     if (!res.ok) {
       let bodyTxt = ''; try { bodyTxt = await res.text() } catch (_) {}
       throw new Error('scenario ' + res.status + (bodyTxt ? ' · ' + bodyTxt.slice(0, 200) : ''))
@@ -1001,10 +992,10 @@ window.runScenario = async function (recursionGuard) {
     set('#s-actions', '+' + (data.delta_actions || 0))
     const n = $('#s-narrative')
     if (n) {
-      const isLiveMode = data.mode === 'nvidia-live' || data.mode === 'groq-live'
-      const isOfflineMode = data.mode === 'offline-fallback' || data.mode === 'offline-no-groq' || data.mode === 'offline-no-nvidia' || data.mode === 'offline-from-raw'
+      const isLiveMode = data.mode === 'groq-live'
+      const isOfflineMode = data.mode === 'offline-fallback' || data.mode === 'offline-from-raw'
       const badge = isLiveMode
-        ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-400/30" title="' + escapeHTML(data.model || '') + '">llama-3.3-70b · LIVE</span>'
+        ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-400/30" title="' + escapeHTML(data.model || '') + '">llama-4-scout · LIVE</span>'
         : isOfflineMode
         ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-amber-500/15 text-amber-400 border border-amber-400/30" title="' + escapeHTML(data.model || '') + '">Offline · live events</span>'
         : ''
@@ -1110,6 +1101,17 @@ async function openTransparency() {
     const liveRaw = t?.anakin_live_response || loadCachedRaw()
     const hasLiveRaw = liveRaw && typeof liveRaw === 'object' && Object.keys(liveRaw).length > 0
     const rawPretty = hasLiveRaw ? JSON.stringify(liveRaw, null, 2) : ''
+
+    // 🔥 v10 — Groq reshape response (raw JSON)
+    const groqReshape = t?.groq_reshape_response || null
+    const hasGroqReshape = groqReshape && typeof groqReshape === 'object' && Object.keys(groqReshape).length > 0
+    const reshapePretty = hasGroqReshape ? JSON.stringify(groqReshape, null, 2) : ''
+
+    // 🔥 v10 — Last Groq scenario response (raw JSON)
+    const groqScenarioResp = t?.groq_scenario_response || null
+    const hasGroqScenario = groqScenarioResp && typeof groqScenarioResp === 'object' && groqScenarioResp.response
+    const scenarioPretty = hasGroqScenario ? JSON.stringify(groqScenarioResp.response, null, 2) : ''
+
     const sourceBadge = t?.source === 'anakin-live' || t?.source === 'anakin-direct'
       ? '<span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-400/30">LIVE</span>'
       : '<span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-amber-500/15 text-amber-400 border border-amber-400/30">' + escapeHTML(t?.source || 'unknown') + '</span>'
@@ -1129,18 +1131,39 @@ async function openTransparency() {
 
           <div class="rounded-lg border border-ink-700 bg-ink-950/60 p-3">
             <div class="flex items-center justify-between mb-2">
-              <div class="text-[10px] mono uppercase text-policy">🟢 Live Anakin Response</div>
+              <div class="text-[10px] mono uppercase text-policy">🟢 Live Anakin Response (raw)</div>
               ${hasLiveRaw ? '<button id="copy-anakin-raw" type="button" class="text-[10px] mono uppercase text-gray-400 hover:text-policy">copy</button>' : ''}
             </div>
             ${hasLiveRaw
-              ? '<pre class="text-[11px] mono bg-ink-900 border border-ink-700 rounded p-2 overflow-auto max-h-[420px]" id="anakin-raw-pre">' + escapeHTML(rawPretty) + '</pre>'
+              ? '<pre class="text-[11px] mono bg-ink-900 border border-ink-700 rounded p-2 overflow-auto max-h-[300px]" id="anakin-raw-pre">' + escapeHTML(rawPretty) + '</pre>'
               : '<div class="text-xs text-gray-500">No live Anakin response cached yet. Run a briefing first — once Anakin polling completes, the raw JSON will appear here.</div>'
             }
           </div>
 
+          <div class="rounded-lg border border-emerald-400/30 bg-emerald-500/5 p-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-[10px] mono uppercase text-emerald-400">🟢 Groq llama-4-scout Reshape Response (structured JSON)</div>
+              ${hasGroqReshape ? '<button id="copy-groq-reshape" type="button" class="text-[10px] mono uppercase text-gray-400 hover:text-emerald-400">copy</button>' : ''}
+            </div>
+            ${hasGroqReshape
+              ? '<pre class="text-[11px] mono bg-ink-900 border border-ink-700 rounded p-2 overflow-auto max-h-[300px]" id="groq-reshape-pre">' + escapeHTML(reshapePretty) + '</pre>'
+              : '<div class="text-xs text-gray-500">No Groq reshape response cached yet. The structured JSON projected into every dashboard tile will appear here after the pipeline completes.</div>'
+            }
+          </div>
+
+          ${hasGroqScenario ? `
+          <div class="rounded-lg border border-action/40 bg-action/5 p-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-[10px] mono uppercase text-action">🟡 Last Groq Scenario Response</div>
+              <button id="copy-groq-scenario" type="button" class="text-[10px] mono uppercase text-gray-400 hover:text-action">copy</button>
+            </div>
+            <div class="text-[11px] mono text-gray-400 mb-2">Query: ${escapeHTML(groqScenarioResp.query || '')}</div>
+            <pre class="text-[11px] mono bg-ink-900 border border-ink-700 rounded p-2 overflow-auto max-h-[260px]" id="groq-scenario-pre">${escapeHTML(scenarioPretty)}</pre>
+          </div>` : ''}
+
           <div>
             <div class="text-[10px] mono uppercase text-gray-500 mb-1">Reshape model</div>
-            <div class="mono text-xs text-gray-300">${escapeHTML(t?.reshape_provider || 'nvidia-nim')} — ${escapeHTML(t?.reshape_model || 'meta/llama-3.3-70b-instruct')}</div>
+            <div class="mono text-xs text-gray-300">${escapeHTML(t?.reshape_provider || 'groq')} — ${escapeHTML(t?.reshape_model || 'meta-llama/llama-4-scout-17b-16e-instruct')}</div>
           </div>
 
           <div>
@@ -1153,16 +1176,22 @@ async function openTransparency() {
             <pre class="text-[11px] mono bg-ink-900 border border-ink-700 rounded p-2 overflow-auto">${escapeHTML(JSON.stringify(t?.tenant || {}, null, 2))}</pre>
           </div>
         </div>`
-      const copyBtn = document.getElementById('copy-anakin-raw')
-      if (copyBtn && hasLiveRaw) {
-        copyBtn.addEventListener('click', () => {
+      // Wire up all copy buttons
+      const wireCopy = (btnId, text) => {
+        const b = document.getElementById(btnId)
+        if (!b || !text) return
+        b.addEventListener('click', () => {
           try {
-            navigator.clipboard.writeText(rawPretty)
-            copyBtn.textContent = 'copied!'
-            setTimeout(() => { copyBtn.textContent = 'copy' }, 1500)
+            navigator.clipboard.writeText(text)
+            const orig = b.textContent
+            b.textContent = 'copied!'
+            setTimeout(() => { b.textContent = orig }, 1500)
           } catch (_) {}
         })
       }
+      wireCopy('copy-anakin-raw',    rawPretty)
+      wireCopy('copy-groq-reshape',  reshapePretty)
+      wireCopy('copy-groq-scenario', scenarioPretty)
     }
   } catch (e) {
     if (body) body.innerHTML = `<div class="text-xs text-red-400">Could not load transparency: ${escapeHTML(e.message)}</div>`

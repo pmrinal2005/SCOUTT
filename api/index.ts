@@ -53,6 +53,7 @@ import {
   getDashboardPayload, invalidateCacheFor, peekCacheFor, peekRawFor,
   pushCacheFor, pushRawFor, buildBriefingPrompt, groqAsk, groqScenario,
   anakinCrawlAndWait, buildPayloadFromAnakinRaw,
+  peekReshapeFor, pushScenarioFor, peekScenarioFor,
   NVIDIA_MODEL, GROQ_MODEL,
 } from '../src/live-pipeline'
 
@@ -215,12 +216,12 @@ app.get('/api/health', (req, res) => res.status(200).json({
   status: 'ok',
   anakin_user_key:   Boolean(req.header('x-anakin-key')),
   anakin_env_key:    Boolean(process.env.ANAKIN_API_KEY),
-  nvidia:            Boolean(process.env.NVIDIA_API_KEY || process.env.GROQ_API_KEY),
+  groq:              Boolean(process.env.GROQ_API_KEY || process.env.NVIDIA_API_KEY),
   elevenlabs:        Boolean(process.env.ELEVENLABS_API_KEY),
   cached_live:       Boolean(req.header('x-anakin-key') && peekCacheFor(String(req.header('x-anakin-key')))),
-  reshape_model:     NVIDIA_MODEL,
-  reshape_provider:  'nvidia-nim',
-  scenario_model:    NVIDIA_MODEL,
+  reshape_model:     GROQ_MODEL,
+  reshape_provider:  'groq',
+  scenario_model:    GROQ_MODEL,
   user_tenant:       Boolean(getTenantFor(anakinKey(req))) || Boolean(readTenantHeader(req)),
   client_cache_hdr:  Boolean(req.header('x-scoutt-cache')),
   client_raw_hdr:    Boolean(req.header('x-scoutt-raw')),
@@ -422,107 +423,93 @@ app.get('/api/sentiment/events',  async (req, res) => res.json((await payloadFor
 //   payload directly. NEVER serves a demo response. NEVER throws 409 when
 //   raw is available.
 // =============================================================================
+// =============================================================================
+// SCENARIO — always routes to Groq meta-llama/llama-4-scout-17b-16e-instruct.
+//
+// 🔥 v10 PATCH — per spec, any user query in the Scenario tab MUST go
+//                directly to Groq and the model's response renders as the
+//                answer. We no longer gate on Anakin key or on having a
+//                cached live payload. If a live payload / raw Anakin
+//                exists, we forward it as additional context. Otherwise
+//                the model answers purely from tenant + query.
+//
+// Offline heuristic (`synthScenarioOffline`) is kept ONLY as a last-resort
+// safety net if Groq itself returns an error — it never runs while Groq
+// is reachable, eliminating the "hardcoded narrative" bug.
+// =============================================================================
 app.post('/api/scenario', async (req, res) => {
   try {
     const body = (req.body || {}) as any
     const scenario = String(body.scenario || '').trim()
     if (!scenario) return res.status(400).json({ error: 'Empty scenario' })
 
-    const key = anakinKey(req)
-    if (!key) {
-      return res.status(400).json({
-        error: 'Anakin API key required to run the Scenario Simulator.',
-        live_required: true,
-      })
-    }
+    const key = anakinKey(req) || 'public'
     const tenant = tenantForRequest(req)
 
-    // 1. Resolve a LIVE payload if available (strict).
-    let p: DashboardPayload | null = readClientCache(req)
-    if (!p) {
-      const clientRaw = readClientRaw(req)
-      if (clientRaw) {
-        p = buildPayloadFromAnakinRaw(clientRaw, tenant)
-        ;(p as any).source = 'anakin-direct'
-        pushRawFor(key, clientRaw)
-        pushCacheFor(key, p)
-      }
-    }
-    if (!p) p = peekCacheFor(key)
-    if (!p) {
-      const raw = peekRawFor(key)
-      if (raw) {
-        p = buildPayloadFromAnakinRaw(raw, tenant)
-        ;(p as any).source = 'anakin-direct'
-        pushCacheFor(key, p)
-      }
-    }
-
-    // 2. Also try to obtain a raw Anakin payload (for qwen3-32b context).
+    // OPTIONAL context — we forward whatever live data we have to Groq, but
+    // never block the call on its absence.
+    let livePayload: DashboardPayload | null =
+      readClientCache(req) ||
+      (anakinKey(req) ? peekCacheFor(anakinKey(req) as string) : null)
     const rawAnakin: any =
       readClientRaw(req) ||
-      peekRawFor(key)    ||
-      (p ? null : null)
+      (anakinKey(req) ? peekRawFor(anakinKey(req) as string) : null)
 
-    // 3. Hard gate: must have EITHER a live payload OR raw Anakin output.
-    //    We allow raw-only so the simulator works the second Anakin finishes
-    //    polling, even before reshape completes.
-    const src = p ? (p as any).source : null
-    const hasLivePayload = src === 'anakin-live' || src === 'anakin-direct'
-    if (!hasLivePayload && !rawAnakin) {
-      return res.status(409).json({
-        error: 'Live briefing not available yet. Wait for the Anakin pipeline to complete (poll) before running a scenario.',
-        live_required: true,
-        source: src || 'none',
+    // If we have raw but no reshape, derive a direct payload for richer context.
+    if (!livePayload && rawAnakin) {
+      livePayload = buildPayloadFromAnakinRaw(rawAnakin, tenant)
+      ;(livePayload as any).source = 'anakin-direct'
+    }
+
+    const hasGroq = Boolean(process.env.GROQ_API_KEY || process.env.NVIDIA_API_KEY)
+    if (!hasGroq) {
+      return res.status(503).json({
+        error: 'GROQ_API_KEY not configured on the server. Cannot run the Scenario Simulator.',
       })
     }
 
-    // 4. Run through Groq qwen/qwen3-32b.
-    const hasNvidia = Boolean(process.env.NVIDIA_API_KEY || process.env.GROQ_API_KEY)
-    if (hasNvidia) {
-      try {
-        const out = await groqScenario({
-          scenario,
-          tenant,
-          payload: hasLivePayload ? p : null,
-          rawAnakin: rawAnakin || null,
-        })
-        return res.json({
-          scenario, ...out,
-          credits_used: 1,
-          source: src || 'anakin-raw',
-          is_live: true,
-          mode: 'nvidia-live',
-          provider: 'nvidia-nim',
-          model: NVIDIA_MODEL,
-        })
-      } catch (e: any) {
-        console.warn('NVIDIA llama-3.3-70b scenario failed, falling back to offline:', e?.message)
-      }
-    }
+    try {
+      const out = await groqScenario({
+        scenario,
+        tenant,
+        payload: livePayload,
+        rawAnakin: rawAnakin || null,
+      })
 
-    // 5. Offline fallback — only runs against LIVE payload events.
-    if (hasLivePayload && p) {
-      const offline = synthScenarioOffline(scenario, p, tenant)
+      // Cache the raw Groq response so /api/transparency can show it.
+      pushScenarioFor(key, scenario, out.raw_response ?? out)
+
+      const src = livePayload ? (livePayload as any).source : (rawAnakin ? 'anakin-raw' : 'tenant-only')
       return res.json({
-        scenario, ...offline,
-        credits_used: 0,
-        source: src, is_live: true,
-        mode: hasNvidia ? 'offline-fallback' : 'offline-no-nvidia',
-        model: hasNvidia ? `${NVIDIA_MODEL} (failed — fell to offline)` : 'offline (no NVIDIA_API_KEY)',
+        scenario, ...out,
+        credits_used: 1,
+        source: src,
+        is_live: Boolean(livePayload || rawAnakin),
+        mode: 'groq-live',
+        provider: 'groq',
+        model: GROQ_MODEL,
+      })
+    } catch (e: any) {
+      console.warn('Groq llama-4-scout scenario failed:', e?.message)
+      // Final safety net — only triggered when Groq itself is unreachable.
+      if (livePayload) {
+        const offline = synthScenarioOffline(scenario, livePayload, tenant)
+        return res.json({
+          scenario, ...offline,
+          credits_used: 0,
+          source: (livePayload as any).source,
+          is_live: true,
+          mode: 'offline-fallback',
+          model: `${GROQ_MODEL} (failed: ${String(e?.message || e).slice(0, 120)})`,
+          provider: 'groq',
+        })
+      }
+      return res.status(502).json({
+        error: 'Groq call failed and no live payload available for offline fallback.',
+        detail: String(e?.message || e),
+        model: GROQ_MODEL,
       })
     }
-
-    // 6. Absolute floor — derive synthetic from raw + tenant.
-    const synth = buildPayloadFromAnakinRaw(rawAnakin, tenant)
-    ;(synth as any).source = 'anakin-direct'
-    const offline = synthScenarioOffline(scenario, synth, tenant)
-    return res.json({
-      scenario, ...offline,
-      credits_used: 0, source: 'anakin-direct', is_live: true,
-      mode: 'offline-from-raw',
-      model: 'offline (nvidia unavailable)',
-    })
   } catch (e: any) {
     res.status(500).json({ error: String(e?.message || e) })
   }
@@ -680,16 +667,16 @@ app.get('/api/transparency', async (req, res) => {
         endpoint: 'GET https://api.anakin.io/v1/agentic-search/{job_id}',
         poll_interval_ms: 8000,
       },
-      step_3_nvidia_reshape: {
-        endpoint: 'POST https://integrate.api.nvidia.com/v1/chat/completions',
-        provider: 'nvidia-nim',
-        model: NVIDIA_MODEL,
-        strategy: 'Anakin agentic-search raw → NVIDIA NIM reshape → structured DashboardPayload.',
+      step_3_groq_reshape: {
+        endpoint: 'POST https://api.groq.com/openai/v1/chat/completions',
+        provider: 'groq',
+        model: GROQ_MODEL,
+        strategy: 'Anakin agentic-search raw → Groq llama-4-scout reshape → structured DashboardPayload.',
       },
       step_4_scenario: {
-        endpoint: 'POST /api/scenario → NVIDIA NIM',
-        provider: 'nvidia-nim',
-        model: NVIDIA_MODEL,
+        endpoint: 'POST /api/scenario → Groq llama-4-scout',
+        provider: 'groq',
+        model: GROQ_MODEL,
       },
       competitor_scraper: {
         endpoint: 'POST https://api.anakin.io/v1/crawl',
@@ -698,11 +685,17 @@ app.get('/api/transparency', async (req, res) => {
       },
     },
     tenant,
-    reshape_model: cachedPayload?.reshape_model || NVIDIA_MODEL,
-    reshape_provider: cachedPayload?.reshape_provider || 'nvidia-nim',
-    // 🔥 THIS is what the user wants to see: the LIVE Anakin response
+    reshape_model: cachedPayload?.reshape_model || GROQ_MODEL,
+    reshape_provider: cachedPayload?.reshape_provider || 'groq',
+    // 🔥 v10 — the LIVE Anakin response (raw) AND the Groq reshape response
+    //          (raw JSON) AND the last scenario response — all surfaced so
+    //          the "How we know this" drawer can render the full evidence trail.
     anakin_live_response: rawAnakin || null,
     anakin_live_response_present: Boolean(rawAnakin),
+    groq_reshape_response: key ? peekReshapeFor(key) : null,
+    groq_reshape_response_present: Boolean(key && peekReshapeFor(key)),
+    groq_scenario_response: key ? peekScenarioFor(key) : null,
+    groq_scenario_response_present: Boolean(key && peekScenarioFor(key)),
   })
 })
 

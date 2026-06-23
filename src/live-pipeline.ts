@@ -2,6 +2,12 @@
 // =============================================================================
 // SCOUTT — Live pipeline (Anakin Agentic Search + Anakin Crawl + Groq reshape)
 //
+// 🔥 v10 PATCH — switched reshape + scenario engine to **Groq SDK** with
+//                `meta-llama/llama-4-scout-17b-16e-instruct` per product spec.
+//                Removed all NVIDIA NIM code paths and the Gemini dep.
+//                Added `peekReshapeFor` / `peekScenarioFor` so the
+//                transparency drawer can render the actual Groq response.
+//
 // 🔥 v7 PATCH — fixes the two production bugs reported by the user:
 //
 //   Bug #1 — Dashboard appears hardcoded (demo) even after the Anakin
@@ -67,12 +73,17 @@ import { buildDemoPayload, ageDownPayload, type DashboardPayload } from './demo-
 
 const CACHE_TTL_MS = 10 * 60 * 1000
 
-type FullCacheEntry = { ts: number; data: DashboardPayload }
-type RawCacheEntry  = { ts: number; raw: any; jobId: string }
+type FullCacheEntry     = { ts: number; data: DashboardPayload }
+type RawCacheEntry      = { ts: number; raw: any; jobId: string }
+type ReshapeCacheEntry  = { ts: number; response: any }
+type ScenarioCacheEntry = { ts: number; query: string; response: any }
 
-const fullCache  = new Map<string, FullCacheEntry>()
-const rawCache   = new Map<string, RawCacheEntry>()
-const jobIdByKey = new Map<string, string>()
+const fullCache     = new Map<string, FullCacheEntry>()
+const rawCache      = new Map<string, RawCacheEntry>()
+const jobIdByKey    = new Map<string, string>()
+// 🔥 v10 — last raw Groq JSON for each key, surfaced via /api/transparency.
+const reshapeCache  = new Map<string, ReshapeCacheEntry>()
+const scenarioCache = new Map<string, ScenarioCacheEntry>()
 
 // =====================================================================
 // 1. AGENTIC SEARCH — submit + 1-shot poll  (Anakin)
@@ -190,54 +201,61 @@ export async function anakinCrawlAndWait(
 }
 
 // =====================================================================
-// 3. NVIDIA NIM — reshape + scenario + ask    🔥 MODEL = meta/llama-3.3-70b-instruct
-//    Endpoint: https://integrate.api.nvidia.com/v1/chat/completions
-//    Auth:     Bearer $NVIDIA_API_KEY
+// 3. GROQ — reshape + scenario + ask    🔥 MODEL = meta-llama/llama-4-scout-17b-16e-instruct
+//    Endpoint: https://api.groq.com/openai/v1/chat/completions
+//    Auth:     Bearer $GROQ_API_KEY
+//
+//    Note: Groq exposes an OpenAI-compatible REST API. We hit it directly
+//    with `fetch` so we don't need the `groq-sdk` dependency on Vercel.
+//    The behaviour is identical to the `groq-sdk` snippet the product
+//    spec references — same endpoint, same model name, same JSON contract.
 // =====================================================================
 
-const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions'
-export const NVIDIA_MODEL = 'meta/llama-3.3-70b-instruct'
-// Back-compat alias — api/index.ts still imports GROQ_MODEL.
-export const GROQ_MODEL = NVIDIA_MODEL
+const GROQ_ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions'
+export const GROQ_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct'
+// Back-compat alias — kept so any caller still referencing NVIDIA_MODEL
+// (e.g. transparency UI) keeps compiling.
+export const NVIDIA_MODEL = GROQ_MODEL
 
-async function nvidiaCall(systemPrompt: string, userPrompt: string, opts: {
+async function groqCall(systemPrompt: string, userPrompt: string, opts: {
   jsonMode?: boolean; temperature?: number; maxTokens?: number
 } = {}): Promise<any> {
-  const nvKey = process.env.NVIDIA_API_KEY || process.env.GROQ_API_KEY
-  if (!nvKey) throw new Error('NVIDIA_API_KEY not set — cannot call NVIDIA NIM')
+  const groqKey = process.env.GROQ_API_KEY || process.env.NVIDIA_API_KEY
+  if (!groqKey) throw new Error('GROQ_API_KEY not set — cannot call Groq')
 
   const body: any = {
-    model: NVIDIA_MODEL,
+    model: GROQ_MODEL,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user',   content: userPrompt },
     ],
     temperature: opts.temperature ?? 0.2,
-    top_p: 0.7,
-    max_tokens: opts.maxTokens ?? 4096,
+    top_p: 1,
+    max_completion_tokens: opts.maxTokens ?? 4096,
     stream: false,
   }
+  // Groq supports `response_format: { type: 'json_object' }` for llama-4-scout.
   if (opts.jsonMode !== false) body.response_format = { type: 'json_object' }
 
-  const resp = await fetch(NVIDIA_ENDPOINT, {
+  const resp = await fetch(GROQ_ENDPOINT, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${nvKey}`,
+      Authorization: `Bearer ${groqKey}`,
       Accept: 'application/json',
     },
     body: JSON.stringify(body),
   })
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '')
-    throw new Error(`NVIDIA HTTP ${resp.status}: ${txt.slice(0, 400)}`)
+    throw new Error(`Groq HTTP ${resp.status}: ${txt.slice(0, 400)}`)
   }
   const data: any = await resp.json()
   const raw: string = data?.choices?.[0]?.message?.content ?? ''
   return opts.jsonMode === false ? raw : safeParseJSON(raw)
 }
 // Back-compat alias
-const groqCall = nvidiaCall
+const nvidiaCall = groqCall
 
 function safeParseJSON(raw: string): any {
   if (!raw) return {}
@@ -250,10 +268,10 @@ function safeParseJSON(raw: string): any {
 }
 
 export async function groqReshapeCore(anakinRaw: any, tenant: any): Promise<any> {
-  return nvidiaCall(RESHAPE_SYSTEM_PROMPT, reshapeCorePrompt(anakinRaw, tenant))
+  return groqCall(RESHAPE_SYSTEM_PROMPT, reshapeCorePrompt(anakinRaw, tenant))
 }
 export async function groqReshapePillars(anakinRaw: any, tenant: any): Promise<any> {
-  return nvidiaCall(RESHAPE_SYSTEM_PROMPT, reshapePillarsPrompt(anakinRaw, tenant))
+  return groqCall(RESHAPE_SYSTEM_PROMPT, reshapePillarsPrompt(anakinRaw, tenant))
 }
 export async function groqReshape(anakinRaw: any, tenant: any): Promise<any> {
   const [core, pillars] = await Promise.all([
@@ -275,8 +293,9 @@ export async function groqScenario(opts: {
   threat_level_before: number; threat_level_after: number
   delta_threats: number; delta_actions: number; narrative: string
   impacted_events: Array<{ title: string; pillar: string; severity: number; source_url?: string }>
+  raw_response?: any
 }> {
-  const out = await nvidiaCall(SCENARIO_SYSTEM_PROMPT, scenarioUserPrompt({
+  const out = await groqCall(SCENARIO_SYSTEM_PROMPT, scenarioUserPrompt({
     scenario: opts.scenario,
     tenant: opts.tenant,
     payload: opts.payload,
@@ -300,11 +319,12 @@ export async function groqScenario(opts: {
   return {
     threat_level_before: before, threat_level_after: after,
     delta_threats: dt, delta_actions: da, narrative, impacted_events: events,
+    raw_response: out, // 🔥 v10 — surface raw Groq JSON for transparency drawer
   }
 }
 
 export async function groqAsk(systemPrompt: string, userQuestion: string): Promise<string> {
-  return nvidiaCall(systemPrompt, userQuestion, { temperature: 0.4, maxTokens: 1024, jsonMode: false })
+  return groqCall(systemPrompt, userQuestion, { temperature: 0.4, maxTokens: 1024, jsonMode: false })
 }
 
 function clamp(n: any, lo: number, hi: number, dflt: number): number {
@@ -714,15 +734,17 @@ export async function buildAndCachePayload(
   const directPayload = buildPayloadFromAnakinRaw(raw, tenant)
   ;(directPayload as any).source = 'anakin-direct'
 
-  // 2. If NVIDIA NIM is configured, enrich via meta/llama-3.3-70b-instruct reshape.
-  const hasNvidia = Boolean(process.env.NVIDIA_API_KEY || process.env.GROQ_API_KEY)
-  if (hasNvidia) {
+  // 2. If Groq is configured, enrich via meta-llama/llama-4-scout-17b-16e-instruct reshape.
+  const hasGroq = Boolean(process.env.GROQ_API_KEY || process.env.NVIDIA_API_KEY)
+  if (hasGroq) {
     try {
       const [core, pillars] = await Promise.all([
-        groqReshapeCore(raw, tenant).catch(e => { console.warn('NVIDIA core failed:', e?.message); return {} }),
-        groqReshapePillars(raw, tenant).catch(e => { console.warn('NVIDIA pillars failed:', e?.message); return {} }),
+        groqReshapeCore(raw, tenant).catch(e => { console.warn('Groq core failed:', e?.message); return {} }),
+        groqReshapePillars(raw, tenant).catch(e => { console.warn('Groq pillars failed:', e?.message); return {} }),
       ])
       const reshape = { ...core, ...pillars }
+      // 🔥 v10 — stash the raw Groq response so /api/transparency can show it.
+      reshapeCache.set(key, { ts: Date.now(), response: reshape })
       const populated =
         reshape?.briefing &&
         Array.isArray(reshape.briefing.events) &&
@@ -731,21 +753,35 @@ export async function buildAndCachePayload(
         const merged = mergeIntoTemplate(directPayload, reshape) as DashboardPayload
         merged.generated_at_iso = new Date().toISOString()
         ;(merged as any).source = 'anakin-live'
-        ;(merged as any).reshape_model = NVIDIA_MODEL
-        ;(merged as any).reshape_provider = 'nvidia-nim'
+        ;(merged as any).reshape_model = GROQ_MODEL
+        ;(merged as any).reshape_provider = 'groq'
         fullCache.set(key, { ts: Date.now(), data: merged })
         return merged
       }
     } catch (e: any) {
-      console.warn('NVIDIA reshape pipeline crashed:', e?.message)
+      console.warn('Groq reshape pipeline crashed:', e?.message)
     }
   }
 
   directPayload.generated_at_iso = new Date().toISOString()
-  ;(directPayload as any).reshape_model = hasNvidia ? `${NVIDIA_MODEL} (sparse — fell to direct mapper)` : 'direct-mapper (no NVIDIA_API_KEY)'
-  ;(directPayload as any).reshape_provider = hasNvidia ? 'nvidia-nim' : 'direct'
+  ;(directPayload as any).reshape_model = hasGroq ? `${GROQ_MODEL} (sparse — fell to direct mapper)` : 'direct-mapper (no GROQ_API_KEY)'
+  ;(directPayload as any).reshape_provider = hasGroq ? 'groq' : 'direct'
   fullCache.set(key, { ts: Date.now(), data: directPayload })
   return directPayload
+}
+
+// 🔥 v10 — public accessors for the most recent Groq raw JSON so the
+//          transparency drawer can render the live reshape + scenario response.
+export function peekReshapeFor(key: string): any | null {
+  return reshapeCache.get(key)?.response ?? null
+}
+export function pushScenarioFor(key: string, query: string, response: any): void {
+  if (!key || !response) return
+  scenarioCache.set(key, { ts: Date.now(), query, response })
+}
+export function peekScenarioFor(key: string): { query: string; response: any } | null {
+  const v = scenarioCache.get(key)
+  return v ? { query: v.query, response: v.response } : null
 }
 
 // =====================================================================
