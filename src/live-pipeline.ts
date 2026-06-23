@@ -190,56 +190,57 @@ export async function anakinCrawlAndWait(
 }
 
 // =====================================================================
-// 3. GROQ — reshape + scenario + ask    🔥 MODEL = qwen/qwen3-32b
+// 3. NVIDIA NIM — reshape + scenario + ask    🔥 MODEL = meta/llama-3.3-70b-instruct
+//    Endpoint: https://integrate.api.nvidia.com/v1/chat/completions
+//    Auth:     Bearer $NVIDIA_API_KEY
 // =====================================================================
 
-const GROQ_ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions'
-export const GROQ_MODEL = 'qwen/qwen3-32b'       // 🔥 v7 — per spec
+const NVIDIA_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions'
+export const NVIDIA_MODEL = 'meta/llama-3.3-70b-instruct'
+// Back-compat alias — api/index.ts still imports GROQ_MODEL.
+export const GROQ_MODEL = NVIDIA_MODEL
 
-async function groqCall(systemPrompt: string, userPrompt: string, opts: {
+async function nvidiaCall(systemPrompt: string, userPrompt: string, opts: {
   jsonMode?: boolean; temperature?: number; maxTokens?: number
 } = {}): Promise<any> {
-  const groqKey = process.env.GROQ_API_KEY
-  if (!groqKey) throw new Error('GROQ_API_KEY not set — cannot call Groq')
+  const nvKey = process.env.NVIDIA_API_KEY || process.env.GROQ_API_KEY
+  if (!nvKey) throw new Error('NVIDIA_API_KEY not set — cannot call NVIDIA NIM')
 
   const body: any = {
-    model: GROQ_MODEL,
+    model: NVIDIA_MODEL,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user',   content: userPrompt },
     ],
-    temperature: opts.temperature ?? 0.3,
-    top_p: 1,
-    max_completion_tokens: opts.maxTokens ?? 8192,
+    temperature: opts.temperature ?? 0.2,
+    top_p: 0.7,
+    max_tokens: opts.maxTokens ?? 4096,
     stream: false,
-    stop: null,
-    // 🔥 v7 — Qwen3 on Groq emits <think>…</think>. We hide it so we get
-    // a plain JSON object back. See https://console.groq.com/docs/reasoning
-    reasoning_format: 'hidden',
   }
   if (opts.jsonMode !== false) body.response_format = { type: 'json_object' }
 
-  const resp = await fetch(GROQ_ENDPOINT, {
+  const resp = await fetch(NVIDIA_ENDPOINT, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${groqKey}`,
+      Authorization: `Bearer ${nvKey}`,
       Accept: 'application/json',
     },
     body: JSON.stringify(body),
   })
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '')
-    throw new Error(`Groq HTTP ${resp.status}: ${txt.slice(0, 400)}`)
+    throw new Error(`NVIDIA HTTP ${resp.status}: ${txt.slice(0, 400)}`)
   }
   const data: any = await resp.json()
   const raw: string = data?.choices?.[0]?.message?.content ?? ''
   return opts.jsonMode === false ? raw : safeParseJSON(raw)
 }
+// Back-compat alias
+const groqCall = nvidiaCall
 
 function safeParseJSON(raw: string): any {
   if (!raw) return {}
-  // strip <think> blocks (Qwen3 sometimes leaks them even with hidden mode)
   let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
   cleaned = cleaned.replace(/^```json\s*|^```\s*|\s*```$/g, '').trim()
   try { return JSON.parse(cleaned) } catch {}
@@ -249,15 +250,15 @@ function safeParseJSON(raw: string): any {
 }
 
 export async function groqReshapeCore(anakinRaw: any, tenant: any): Promise<any> {
-  return groqCall(RESHAPE_SYSTEM_PROMPT, reshapeCorePrompt(anakinRaw, tenant))
+  return nvidiaCall(RESHAPE_SYSTEM_PROMPT, reshapeCorePrompt(anakinRaw, tenant))
 }
 export async function groqReshapePillars(anakinRaw: any, tenant: any): Promise<any> {
-  return groqCall(RESHAPE_SYSTEM_PROMPT, reshapePillarsPrompt(anakinRaw, tenant))
+  return nvidiaCall(RESHAPE_SYSTEM_PROMPT, reshapePillarsPrompt(anakinRaw, tenant))
 }
 export async function groqReshape(anakinRaw: any, tenant: any): Promise<any> {
   const [core, pillars] = await Promise.all([
-    groqReshapeCore(anakinRaw, tenant).catch(e => { console.warn('Groq core failed:', e?.message); return {} }),
-    groqReshapePillars(anakinRaw, tenant).catch(e => { console.warn('Groq pillars failed:', e?.message); return {} }),
+    groqReshapeCore(anakinRaw, tenant).catch(e => { console.warn('NVIDIA core failed:', e?.message); return {} }),
+    groqReshapePillars(anakinRaw, tenant).catch(e => { console.warn('NVIDIA pillars failed:', e?.message); return {} }),
   ])
   return { ...core, ...pillars }
 }
@@ -275,7 +276,7 @@ export async function groqScenario(opts: {
   delta_threats: number; delta_actions: number; narrative: string
   impacted_events: Array<{ title: string; pillar: string; severity: number; source_url?: string }>
 }> {
-  const out = await groqCall(SCENARIO_SYSTEM_PROMPT, scenarioUserPrompt({
+  const out = await nvidiaCall(SCENARIO_SYSTEM_PROMPT, scenarioUserPrompt({
     scenario: opts.scenario,
     tenant: opts.tenant,
     payload: opts.payload,
@@ -303,7 +304,7 @@ export async function groqScenario(opts: {
 }
 
 export async function groqAsk(systemPrompt: string, userQuestion: string): Promise<string> {
-  return groqCall(systemPrompt, userQuestion, { temperature: 0.4, maxTokens: 1024, jsonMode: false })
+  return nvidiaCall(systemPrompt, userQuestion, { temperature: 0.4, maxTokens: 1024, jsonMode: false })
 }
 
 function clamp(n: any, lo: number, hi: number, dflt: number): number {
@@ -713,13 +714,13 @@ export async function buildAndCachePayload(
   const directPayload = buildPayloadFromAnakinRaw(raw, tenant)
   ;(directPayload as any).source = 'anakin-direct'
 
-  // 2. If Groq is configured, enrich via qwen3-32b reshape.
-  const hasGroq = Boolean(process.env.GROQ_API_KEY)
-  if (hasGroq) {
+  // 2. If NVIDIA NIM is configured, enrich via meta/llama-3.3-70b-instruct reshape.
+  const hasNvidia = Boolean(process.env.NVIDIA_API_KEY || process.env.GROQ_API_KEY)
+  if (hasNvidia) {
     try {
       const [core, pillars] = await Promise.all([
-        groqReshapeCore(raw, tenant).catch(e => { console.warn('Groq core failed:', e?.message); return {} }),
-        groqReshapePillars(raw, tenant).catch(e => { console.warn('Groq pillars failed:', e?.message); return {} }),
+        groqReshapeCore(raw, tenant).catch(e => { console.warn('NVIDIA core failed:', e?.message); return {} }),
+        groqReshapePillars(raw, tenant).catch(e => { console.warn('NVIDIA pillars failed:', e?.message); return {} }),
       ])
       const reshape = { ...core, ...pillars }
       const populated =
@@ -730,17 +731,19 @@ export async function buildAndCachePayload(
         const merged = mergeIntoTemplate(directPayload, reshape) as DashboardPayload
         merged.generated_at_iso = new Date().toISOString()
         ;(merged as any).source = 'anakin-live'
-        ;(merged as any).reshape_model = GROQ_MODEL
+        ;(merged as any).reshape_model = NVIDIA_MODEL
+        ;(merged as any).reshape_provider = 'nvidia-nim'
         fullCache.set(key, { ts: Date.now(), data: merged })
         return merged
       }
     } catch (e: any) {
-      console.warn('Groq reshape pipeline crashed:', e?.message)
+      console.warn('NVIDIA reshape pipeline crashed:', e?.message)
     }
   }
 
   directPayload.generated_at_iso = new Date().toISOString()
-  ;(directPayload as any).reshape_model = hasGroq ? `${GROQ_MODEL} (sparse — fell to direct mapper)` : 'direct-mapper (no GROQ_API_KEY)'
+  ;(directPayload as any).reshape_model = hasNvidia ? `${NVIDIA_MODEL} (sparse — fell to direct mapper)` : 'direct-mapper (no NVIDIA_API_KEY)'
+  ;(directPayload as any).reshape_provider = hasNvidia ? 'nvidia-nim' : 'direct'
   fullCache.set(key, { ts: Date.now(), data: directPayload })
   return directPayload
 }

@@ -442,7 +442,7 @@ function apiKeyModal() {
       </div>
       <button id="apikey-close" type="button" class="text-gray-400 hover:text-white text-xl cursor-pointer"><i class="fa-solid fa-xmark"></i></button>
     </div>
-    <p class="text-sm text-gray-400 mb-4">Paste your Anakin API key to switch from demo data to a live Anakin Agentic Search → Groq <code class="mono text-policy">llama-4-scout-17b-16e-instruct</code> reshape pipeline. Every card in every tab becomes dynamic.</p>
+    <p class="text-sm text-gray-400 mb-4">Paste your Anakin API key to switch from demo data to a live Anakin Agentic Search → NVIDIA NIM <code class="mono text-policy">meta/llama-3.3-70b-instruct</code> reshape pipeline. Every card in every tab becomes dynamic.</p>
     <label class="block text-xs mono uppercase text-gray-500 mb-1">Anakin API Key</label>
     <input id="apikey-input" type="password" placeholder="anakin-live-…" class="w-full bg-ink-900 border border-ink-600 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-policy mono" autocomplete="off" />
     <div class="mt-3 text-[11px] text-gray-500 leading-relaxed">

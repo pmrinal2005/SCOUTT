@@ -225,8 +225,8 @@ async function runLivePipeline() {
     if (!raw) throw new Error('Anakin polling exceeded 5 minutes')
     saveCachedRaw(raw)
     setLiveLoading(true, 'Generating your live briefing…',
-      'Step 3/3 — Reshaping payload via Groq…')
-    const payload = await SCOUTT.post('/api/groq/reshape', { raw }, { timeoutMs: 45000 })
+      'Step 3/3 — Reshaping payload via NVIDIA NIM (meta/llama-3.3-70b-instruct)…')
+    const payload = await SCOUTT.post('/api/nvidia/reshape', { raw }, { timeoutMs: 60000 })
     if (!payload || !payload.briefing) throw new Error('Reshape returned empty payload')
     if (!isLiveSource(payload.source)) {
       WARN('Unexpected non-live source from reshape:', payload.source)
@@ -358,7 +358,7 @@ function stampSourceBadge(p) {
   const model = p?.reshape_model || ''
   if (src === 'anakin-live') {
     badge.className = 'ml-2 px-1.5 py-0.5 rounded mono text-[9px] uppercase border bg-emerald-500/15 text-emerald-400 border-emerald-400/30'
-    badge.textContent = 'LIVE · qwen3-32b'
+    badge.textContent = 'LIVE · llama-3.3-70b'
   } else if (src === 'anakin-direct') {
     badge.className = 'ml-2 px-1.5 py-0.5 rounded mono text-[9px] uppercase border bg-cyan-500/15 text-cyan-400 border-cyan-400/30'
     badge.textContent = 'LIVE · direct mapper'
@@ -377,7 +377,7 @@ function stampSourceBadge(p) {
 function paintLoadingSkeleton(p) {
   const banner = $('#banner-summary')
   if (banner) banner.textContent = SCOUTT.hasKey
-    ? 'Generating your live briefing via Anakin Agentic Search → qwen/qwen3-32b reshape…'
+    ? 'Generating your live briefing via Anakin Agentic Search → NVIDIA meta/llama-3.3-70b-instruct reshape…'
     : 'Add your Anakin API key to generate a live briefing.'
   const skel = (n = 1) => Array.from({ length: n }).map(() =>
     '<div class="animate-pulse rounded bg-ink-800 h-3 my-2 w-3/4"></div>').join('')
@@ -950,7 +950,7 @@ window.runScenario = async function (recursionGuard) {
   if (btn) {
     btn.disabled = true
     btn.dataset.origHtml = btn.dataset.origHtml || btn.innerHTML
-    btn.innerHTML = '<div class="w-4 h-4 border-2 border-ink-950 border-t-transparent rounded-full animate-spin inline-block"></div> Asking qwen3-32b…'
+    btn.innerHTML = '<div class="w-4 h-4 border-2 border-ink-950 border-t-transparent rounded-full animate-spin inline-block"></div> Asking NVIDIA llama-3.3-70b…'
   }
   if (err) err.classList.add('hidden')
   if (result) result.classList.add('hidden')
@@ -1001,9 +1001,11 @@ window.runScenario = async function (recursionGuard) {
     set('#s-actions', '+' + (data.delta_actions || 0))
     const n = $('#s-narrative')
     if (n) {
-      const badge = data.mode === 'groq-live'
-        ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-400/30" title="' + escapeHTML(data.model || '') + '">qwen3-32b · LIVE</span>'
-        : (data.mode === 'offline-fallback' || data.mode === 'offline-no-groq' || data.mode === 'offline-from-raw')
+      const isLiveMode = data.mode === 'nvidia-live' || data.mode === 'groq-live'
+      const isOfflineMode = data.mode === 'offline-fallback' || data.mode === 'offline-no-groq' || data.mode === 'offline-no-nvidia' || data.mode === 'offline-from-raw'
+      const badge = isLiveMode
+        ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-400/30" title="' + escapeHTML(data.model || '') + '">llama-3.3-70b · LIVE</span>'
+        : isOfflineMode
         ? ' <span class="ml-1 px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-amber-500/15 text-amber-400 border border-amber-400/30" title="' + escapeHTML(data.model || '') + '">Offline · live events</span>'
         : ''
       n.innerHTML = escapeHTML(data.narrative || '') + badge
@@ -1105,13 +1107,62 @@ async function openTransparency() {
   if (body) body.innerHTML = '<div class="text-xs text-gray-500">Loading transparency report…</div>'
   try {
     const t = await SCOUTT.fetch('/api/transparency', { timeoutMs: 8000 })
+    const liveRaw = t?.anakin_live_response || loadCachedRaw()
+    const hasLiveRaw = liveRaw && typeof liveRaw === 'object' && Object.keys(liveRaw).length > 0
+    const rawPretty = hasLiveRaw ? JSON.stringify(liveRaw, null, 2) : ''
+    const sourceBadge = t?.source === 'anakin-live' || t?.source === 'anakin-direct'
+      ? '<span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-400/30">LIVE</span>'
+      : '<span class="px-1.5 py-0.5 rounded mono text-[9px] uppercase bg-amber-500/15 text-amber-400 border border-amber-400/30">' + escapeHTML(t?.source || 'unknown') + '</span>'
     if (body) {
       body.innerHTML = `
-        <div class="space-y-3 text-sm">
-          <div><div class="text-[10px] mono uppercase text-gray-500">Source</div><div>${escapeHTML(t?.source || 'unknown')}</div></div>
-          <div><div class="text-[10px] mono uppercase text-gray-500">Generated</div><div class="mono text-xs">${escapeHTML(t?.generated_at || '')}</div></div>
-          <div><div class="text-[10px] mono uppercase text-gray-500">Pipeline</div><pre class="text-[11px] mono bg-ink-900 border border-ink-700 rounded p-2 overflow-auto">${escapeHTML(JSON.stringify(t || {}, null, 2))}</pre></div>
+        <div class="space-y-4 text-sm">
+          <div class="flex items-center justify-between">
+            <div>
+              <div class="text-[10px] mono uppercase text-gray-500">Source</div>
+              <div class="mt-1">${sourceBadge}</div>
+            </div>
+            <div class="text-right">
+              <div class="text-[10px] mono uppercase text-gray-500">Generated</div>
+              <div class="mono text-[11px] text-gray-300">${escapeHTML(t?.generated_at || '')}</div>
+            </div>
+          </div>
+
+          <div class="rounded-lg border border-ink-700 bg-ink-950/60 p-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-[10px] mono uppercase text-policy">🟢 Live Anakin Response</div>
+              ${hasLiveRaw ? '<button id="copy-anakin-raw" type="button" class="text-[10px] mono uppercase text-gray-400 hover:text-policy">copy</button>' : ''}
+            </div>
+            ${hasLiveRaw
+              ? '<pre class="text-[11px] mono bg-ink-900 border border-ink-700 rounded p-2 overflow-auto max-h-[420px]" id="anakin-raw-pre">' + escapeHTML(rawPretty) + '</pre>'
+              : '<div class="text-xs text-gray-500">No live Anakin response cached yet. Run a briefing first — once Anakin polling completes, the raw JSON will appear here.</div>'
+            }
+          </div>
+
+          <div>
+            <div class="text-[10px] mono uppercase text-gray-500 mb-1">Reshape model</div>
+            <div class="mono text-xs text-gray-300">${escapeHTML(t?.reshape_provider || 'nvidia-nim')} — ${escapeHTML(t?.reshape_model || 'meta/llama-3.3-70b-instruct')}</div>
+          </div>
+
+          <div>
+            <div class="text-[10px] mono uppercase text-gray-500 mb-1">Pipeline</div>
+            <pre class="text-[11px] mono bg-ink-900 border border-ink-700 rounded p-2 overflow-auto max-h-[280px]">${escapeHTML(JSON.stringify(t?.pipeline || {}, null, 2))}</pre>
+          </div>
+
+          <div>
+            <div class="text-[10px] mono uppercase text-gray-500 mb-1">Tenant</div>
+            <pre class="text-[11px] mono bg-ink-900 border border-ink-700 rounded p-2 overflow-auto">${escapeHTML(JSON.stringify(t?.tenant || {}, null, 2))}</pre>
+          </div>
         </div>`
+      const copyBtn = document.getElementById('copy-anakin-raw')
+      if (copyBtn && hasLiveRaw) {
+        copyBtn.addEventListener('click', () => {
+          try {
+            navigator.clipboard.writeText(rawPretty)
+            copyBtn.textContent = 'copied!'
+            setTimeout(() => { copyBtn.textContent = 'copy' }, 1500)
+          } catch (_) {}
+        })
+      }
     }
   } catch (e) {
     if (body) body.innerHTML = `<div class="text-xs text-red-400">Could not load transparency: ${escapeHTML(e.message)}</div>`

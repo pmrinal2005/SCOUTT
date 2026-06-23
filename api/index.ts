@@ -53,7 +53,7 @@ import {
   getDashboardPayload, invalidateCacheFor, peekCacheFor, peekRawFor,
   pushCacheFor, pushRawFor, buildBriefingPrompt, groqAsk, groqScenario,
   anakinCrawlAndWait, buildPayloadFromAnakinRaw,
-  GROQ_MODEL, // 🔥 v7 — qwen/qwen3-32b
+  NVIDIA_MODEL, GROQ_MODEL,
 } from '../src/live-pipeline'
 
 import {
@@ -215,11 +215,12 @@ app.get('/api/health', (req, res) => res.status(200).json({
   status: 'ok',
   anakin_user_key:   Boolean(req.header('x-anakin-key')),
   anakin_env_key:    Boolean(process.env.ANAKIN_API_KEY),
-  groq:              Boolean(process.env.GROQ_API_KEY),
+  nvidia:            Boolean(process.env.NVIDIA_API_KEY || process.env.GROQ_API_KEY),
   elevenlabs:        Boolean(process.env.ELEVENLABS_API_KEY),
   cached_live:       Boolean(req.header('x-anakin-key') && peekCacheFor(String(req.header('x-anakin-key')))),
-  reshape_model:     GROQ_MODEL,                                  // 🔥 qwen/qwen3-32b
-  scenario_model:    GROQ_MODEL,
+  reshape_model:     NVIDIA_MODEL,
+  reshape_provider:  'nvidia-nim',
+  scenario_model:    NVIDIA_MODEL,
   user_tenant:       Boolean(getTenantFor(anakinKey(req))) || Boolean(readTenantHeader(req)),
   client_cache_hdr:  Boolean(req.header('x-scoutt-cache')),
   client_raw_hdr:    Boolean(req.header('x-scoutt-raw')),
@@ -477,8 +478,8 @@ app.post('/api/scenario', async (req, res) => {
     }
 
     // 4. Run through Groq qwen/qwen3-32b.
-    const hasGroq = Boolean(process.env.GROQ_API_KEY)
-    if (hasGroq) {
+    const hasNvidia = Boolean(process.env.NVIDIA_API_KEY || process.env.GROQ_API_KEY)
+    if (hasNvidia) {
       try {
         const out = await groqScenario({
           scenario,
@@ -491,11 +492,12 @@ app.post('/api/scenario', async (req, res) => {
           credits_used: 1,
           source: src || 'anakin-raw',
           is_live: true,
-          mode: 'groq-live',
-          model: GROQ_MODEL,                                    // 🔥 qwen/qwen3-32b
+          mode: 'nvidia-live',
+          provider: 'nvidia-nim',
+          model: NVIDIA_MODEL,
         })
       } catch (e: any) {
-        console.warn('Groq qwen3-32b scenario failed, falling back to offline:', e?.message)
+        console.warn('NVIDIA llama-3.3-70b scenario failed, falling back to offline:', e?.message)
       }
     }
 
@@ -506,8 +508,8 @@ app.post('/api/scenario', async (req, res) => {
         scenario, ...offline,
         credits_used: 0,
         source: src, is_live: true,
-        mode: hasGroq ? 'offline-fallback' : 'offline-no-groq',
-        model: hasGroq ? `${GROQ_MODEL} (failed — fell to offline)` : 'offline (no GROQ_API_KEY)',
+        mode: hasNvidia ? 'offline-fallback' : 'offline-no-nvidia',
+        model: hasNvidia ? `${NVIDIA_MODEL} (failed — fell to offline)` : 'offline (no NVIDIA_API_KEY)',
       })
     }
 
@@ -519,7 +521,7 @@ app.post('/api/scenario', async (req, res) => {
       scenario, ...offline,
       credits_used: 0, source: 'anakin-direct', is_live: true,
       mode: 'offline-from-raw',
-      model: 'offline (groq unavailable)',
+      model: 'offline (nvidia unavailable)',
     })
   } catch (e: any) {
     res.status(500).json({ error: String(e?.message || e) })
@@ -646,42 +648,61 @@ app.get('/api/search-index', async (req, res) => {
 })
 
 // =============================================================================
-// TRANSPARENCY
+// TRANSPARENCY — shows the LIVE raw Anakin response + pipeline metadata
+// (used by the "How we know this" drawer in the header).
 // =============================================================================
-app.get('/api/transparency', (req, res) => {
+app.get('/api/transparency', async (req, res) => {
   const tenant = tenantForRequest(req)
+  const key = anakinKey(req)
+
+  // Pull whatever live state we currently have. Order: client header > cache > none.
+  const rawAnakin: any = readClientRaw(req) || (key ? peekRawFor(key) : null)
+  const cachedPayload: any = readClientCache(req) || (key ? peekCacheFor(key) : null)
+  const source = cachedPayload?.source || (rawAnakin ? 'anakin-raw' : (key ? 'awaiting-anakin' : 'demo'))
+
   res.json({
-    daily_briefing: {
-      endpoint: 'POST https://api.anakin.io/v1/agentic-search',
-      system_prompt: DAILY_BRIEFING_SYSTEM_PROMPT,
-      user_prompt: dailyBriefingUserPrompt({
-        industry: tenant.industry, region: tenant.region,
-        competitor_domains: tenant.competitor_domains,
-        pillars_enabled: tenant.pillars_enabled,
-      }),
-      json_schema: BRIEFING_JSON_SCHEMA,
-      poll_endpoint: 'GET https://api.anakin.io/v1/agentic-search/{job_id}',
-      poll_interval_ms: 8000,
+    source,
+    generated_at: cachedPayload?.generated_at_iso || new Date().toISOString(),
+    has_anakin_key: Boolean(key),
+    has_nvidia_key: Boolean(process.env.NVIDIA_API_KEY || process.env.GROQ_API_KEY),
+    pipeline: {
+      step_1_anakin_submit: {
+        endpoint: 'POST https://api.anakin.io/v1/agentic-search',
+        system_prompt: DAILY_BRIEFING_SYSTEM_PROMPT,
+        user_prompt: dailyBriefingUserPrompt({
+          industry: tenant.industry, region: tenant.region,
+          competitor_domains: tenant.competitor_domains,
+          pillars_enabled: tenant.pillars_enabled,
+        }),
+        json_schema: BRIEFING_JSON_SCHEMA,
+      },
+      step_2_anakin_poll: {
+        endpoint: 'GET https://api.anakin.io/v1/agentic-search/{job_id}',
+        poll_interval_ms: 8000,
+      },
+      step_3_nvidia_reshape: {
+        endpoint: 'POST https://integrate.api.nvidia.com/v1/chat/completions',
+        provider: 'nvidia-nim',
+        model: NVIDIA_MODEL,
+        strategy: 'Anakin agentic-search raw → NVIDIA NIM reshape → structured DashboardPayload.',
+      },
+      step_4_scenario: {
+        endpoint: 'POST /api/scenario → NVIDIA NIM',
+        provider: 'nvidia-nim',
+        model: NVIDIA_MODEL,
+      },
+      competitor_scraper: {
+        endpoint: 'POST https://api.anakin.io/v1/crawl',
+        poll_endpoint: 'GET https://api.anakin.io/v1/crawl/{job_id}',
+        prompt: COMPETITOR_SCRAPE_PROMPT(`https://${tenant.competitor_domains?.[0] || 'example.com'}/pricing`),
+      },
     },
-    groq_reshape: {
-      endpoint: 'POST https://api.groq.com/openai/v1/chat/completions',
-      model:    GROQ_MODEL,                                  // 🔥 qwen/qwen3-32b
-      strategy: 'Anakin-direct mapper builds floor; qwen3-32b reshape merges on top when available.',
-    },
-    competitor_scraper: {
-      endpoint: 'POST https://api.anakin.io/v1/crawl',
-      poll_endpoint: 'GET https://api.anakin.io/v1/crawl/{job_id}',
-      prompt: COMPETITOR_SCRAPE_PROMPT(`https://${tenant.competitor_domains?.[0] || 'example.com'}/pricing`),
-    },
-    ask_scoutt: {
-      endpoint: 'POST https://api.groq.com/openai/v1/chat/completions',
-      model:    GROQ_MODEL,
-    },
-    scenario_simulator: {
-      endpoint: 'POST /api/scenario',
-      model: GROQ_MODEL,
-      strict_mode: 'Accepts either live briefing OR raw Anakin payload. Refuses demo.',
-    },
+    tenant,
+    reshape_model: cachedPayload?.reshape_model || NVIDIA_MODEL,
+    reshape_provider: cachedPayload?.reshape_provider || 'nvidia-nim',
+    // 🔥 THIS is what the user wants to see: the LIVE Anakin response
+    anakin_live_response: rawAnakin || null,
+    anakin_live_response_present: Boolean(rawAnakin),
   })
 })
 
